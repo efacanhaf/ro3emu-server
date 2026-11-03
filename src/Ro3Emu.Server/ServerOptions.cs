@@ -319,8 +319,11 @@ public sealed class OpenContentOptions
     /// buttons; a function joins this list together with its backend. Novice Challenge (90, activity 112) is left out
     /// (owner, 2026-10-11): its 15 random event texts are "Event Text..."/"Option A" filler and the first node's
     /// dialogues 9901-9904 do not exist, so the original never finished it.
+    /// 80 Auto-Battle (the skill window's "Auto-Battle Skill Order" tab): condition 2000072 is [1002,30] and [4004,105170],
+    /// and 105170 "Return to the Real World" belongs to the older story route (root 999999), unreachable from the current
+    /// main story 10101010 (none of its 202 reachable tasks), so no new character could ever open it (owner, 2026-11-03).
     /// </summary>
-    public long[] Functions { get; set; } = [7201, 70122, 41, 1000000, 96, 69, 14];
+    public long[] Functions { get; set; } = [7201, 70122, 41, 1000000, 96, 69, 14, 80];
 
     /// <summary>
     /// NewActivityConfig rows whose own open condition is a level the cap never reaches (e.g. 112 Novice Challenge).
