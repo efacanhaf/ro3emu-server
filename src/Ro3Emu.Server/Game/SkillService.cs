@@ -168,6 +168,9 @@ public sealed class SkillService
         int initial = InTree(p.Career, group) ? Initial(p, group) : 0;
         if (_data.Row("SkillConfig", NormalAttack(p.Career)) is { } atk && GameData.Int(atk, "_iSkillID") == group)
             initial = Math.Max(1, initial);
+        // The career's queue command ("Fila", JobConfig._iQueueSkillId) is innate: no points, learned from level 1, so a cast of it
+        // is never answered "not learned" even when the role's saved skills do not list it (an imported role).
+        if (QueueGroup(p.Career) == group) initial = Math.Max(1, initial);
         int saved = Math.Max(p.Skills.GetValueOrDefault(group), p.GrantedSkills.GetValueOrDefault(group));
         foreach (var (old, replacement) in Replacements(p.Career))
             if (replacement == group) saved = Math.Max(saved, p.Skills.GetValueOrDefault(old));
