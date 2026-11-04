@@ -17,6 +17,9 @@ public sealed record ActiveBuff(long Guid, int ConfigId, long ExpireMs, int Dura
 /// </summary>
 public sealed partial class BuffService : IGameTicker
 {
+    /// <summary>The duration given to a buff that is permanent in the game (renewed on every scene load); the client shows no timer for it.</summary>
+    public const int PermanentMs = 86_400_000;
+
     public const uint BuffUpdate = 31104, BuffRemove = 31105, WidgetUpdate = 31130, WidgetRemove = 31131;
     public const uint WorldTreeRevive = 31331, ClientRemoveBuff = 31332, BuffEffectCd = 31333, EnergyNotify = 31334;
     private const uint AoiAttrChange = 31048;
@@ -478,8 +481,9 @@ public sealed partial class BuffService : IGameTicker
 
     private static BuffInfo Wire(ActiveBuff buff) => new()
     {
-        BuffGuid = buff.Guid, ConfigId = buff.ConfigId, ExpireTime = buff.IsPassive ? 0 : buff.ExpireMs,
-        Duration = buff.DurationMs, PileCount = buff.PileCount, IsTotalTime = true, SourceId = buff.SourceId,
+        // A passive or a "permanent" buff (a day-long renewed one, PermanentMs: Union, Prayer of Gratitude) shows no timer.
+        BuffGuid = buff.Guid, ConfigId = buff.ConfigId, ExpireTime = buff.IsPassive || buff.DurationMs >= PermanentMs ? 0 : buff.ExpireMs,
+        Duration = buff.DurationMs >= PermanentMs ? 0 : buff.DurationMs, PileCount = buff.PileCount, IsTotalTime = true, SourceId = buff.SourceId,
     };
 
     public void Tick(GameTime time)

@@ -33,7 +33,7 @@ public sealed class PassiveSkills : IGameTicker
     private const int AttrMaxSp = 102; // CharacterService stats: 101 Max HP, 102 Max SP, 2000 HP, 2001 SP
     private const int AttrMaxHp = 101, AttrHp = 2000, AttrSp = 2001;
     // "Permanent" for the Prayer of Gratitude shield: a day, renewed on every scene load (inferred).
-    private const int PermanentMs = 86_400_000;
+    private const int PermanentMs = BuffService.PermanentMs;
 
     private readonly GameData _data;
     private readonly CombatService _combat;

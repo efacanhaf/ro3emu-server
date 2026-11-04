@@ -289,7 +289,9 @@ public sealed partial class CombatService
             return ErrorCodes.SkillDistance;
         float height = GameData.Int(row, "_iHeightRange") / 100f;
         if (height > 0 && MathF.Abs(origin.Y - targetPosition.Y) > height) return ErrorCodes.SkillHeight;
-        if (GameData.Int(row, "_iPassBlock") == 2 && _worldData.Map(s.SceneEntry)?.Nav is { } nav
+        // A leap (Twilight) jumps over what is in the way: only the landing point has to be standable (checked when it lands).
+        if (GameData.Int(row, "_iPassBlock") == 2 && !(Displacements.TryGetValue(Script(row), out var leap) && leap.Kind == DisplaceKind.CasterToPoint)
+            && _worldData.Map(s.SceneEntry)?.Nav is { } nav
             && !nav.CanWalk(origin.X, origin.Y, origin.Z, targetPosition.X, targetPosition.Z)
             && (release != 1 || monster == null
                 || BlockedMonsterEndpointAllowed?.Invoke(s, monster, origin, targetPosition) != true))

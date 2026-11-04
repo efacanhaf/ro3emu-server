@@ -424,8 +424,10 @@ public sealed partial class CombatService
             ["RetreatingShadowsS1"] = (DisplaceKind.CasterBack, 0),
             ["WolvesDash"] = (DisplaceKind.CasterForward, 0),
             // Twilight (Royal Guard): "Leap to a selected area within ${2} meters" - the caster lands on the chosen point, the
-            // area hit is around it. The reach is the row's _kRange (6 m), not a description value.
+            // area hit is around it. The reach is _iDistanceMax (15 m, "within ${2} meters"); _kRange (6 m) is the radius of the
+            // area hit around the landing point.
             ["HesperusLit"] = (DisplaceKind.CasterToPoint, -2),
+            ["HesperusLits1"] = (DisplaceKind.CasterToPoint, -2),
             ["HighspeedSlide"] = (DisplaceKind.CasterForward, 0),
             ["HighspeedSlideMecha"] = (DisplaceKind.CasterForward, 0),
             ["PinpointAttack"] = (DisplaceKind.CasterForward, 3),
@@ -465,8 +467,10 @@ public sealed partial class CombatService
     {
         if (!Displacements.TryGetValue(Script(row), out var rule)) return null;
         var (effect, ms) = MovementEffect(GameData.Int(row, "_iScriptShow"));
+        // A season mode row (HesperusLits1, show 111632) has no movement effect of its own: the base skill's show carries it.
+        if (effect == 0 && rule.Kind == DisplaceKind.CasterToPoint) (effect, ms) = MovementEffect(GameData.Int(row, "_iSkillID"));
         if (effect == 0) return null;
-        float distance = rule.DescIndex == -2 ? (float)(Numbers(row, "_kRange").FirstOrDefault(0) / 100)
+        float distance = rule.DescIndex == -2 ? (float)(GameData.Int(row, "_iDistanceMax") / 100.0)
             : rule.DescIndex < 0 ? 1 // (inferred) "pulling them in front of you": 1 m ahead of the caster
             : (float)Numbers(row, "_kDescData").ElementAtOrDefault(rule.DescIndex);
         return distance > 0 ? (rule.Kind, distance, effect, ms) : null;
@@ -488,6 +492,14 @@ public sealed partial class CombatService
             if (length > move.Distance) { dx *= move.Distance / length; dz *= move.Distance / length; }
         }
         var end = WalkableEnd(s.SceneEntry, s.Position, dx, dz);
+        // A leap does not walk the way: it lands on the chosen point whenever that point is standable (obstacles in between
+        // are jumped), and only falls back to the last walkable step when it is not.
+        if (move.Kind == DisplaceKind.CasterToPoint && _worldData.Map(s.SceneEntry)?.Nav is { } leapNav)
+        {
+            float lx = s.Position.X + dx, lz = s.Position.Z + dz;
+            if (leapNav.WalkHeight(lx, lz, s.Position.Y) is { } landY && MathF.Abs(landY - s.Position.Y) <= 3f)
+                end = new Vec3 { X = lx, Y = landY, Z = lz };
+        }
         var start = s.Position.Clone();
         await ToPlayerAndViewersAsync(s, SkillMove, new SkillStartMoveNotify
         {

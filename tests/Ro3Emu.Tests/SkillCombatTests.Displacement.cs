@@ -32,7 +32,9 @@ public sealed partial class SkillCombatTests
         // Every displacement rule meets a skill whose show has its effect and whose description has the distance.
         foreach (var (script, _) in CombatService.Displacements)
             Assert.Contains(skills, r => Script(r) == script
-                && Combat.MovementEffect(GameData.Int(r, "_iScriptShow")).Id != 0);
+                && (Combat.MovementEffect(GameData.Int(r, "_iScriptShow")).Id != 0
+                    // a season mode row (Twilight's HesperusLits1) has no effect of its own: its skill group's show carries it
+                    || Combat.MovementEffect(GameData.Int(r, "_iSkillID")).Id != 0));
         // The skills the old reading moved (Stasis, Choral, VolleyArrows, ShieldsProtection...) are no rules.
         var unlocked = skills.Where(r => GameData.Int(r, "_bMovement") == 1).Select(r => Script(r)).ToHashSet();
         Assert.True(unlocked.Count > 40);
