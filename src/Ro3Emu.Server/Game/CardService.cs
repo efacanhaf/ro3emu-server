@@ -275,9 +275,13 @@ public sealed partial class CardService
         var row = _data.Table("EquipGridConfig").Values.FirstOrDefault(r => GameData.Int(r, "_iEquipGridType") == grid && GameData.Int(r, "_iGridCategory") is 1 or 3);
         if (row.ValueKind != JsonValueKind.Object) return ErrorCodes.EquipSlot; // (inferred) bad grid.
         if (!row.TryGetProperty($"_kSocketOpen{socket}", out var cond) || GameData.Number(cond) is not { } id || id <= 0) return ErrorCodes.SlotSealed;
-        if (grid is 1 or 2 && session.Items.All(i => i.Grid != grid)) return ErrorCodes.EquipSlot; // (inferred) no worn weapon.
+        if (grid is 1 or 2 && !WeaponWorn(session, grid)) return ErrorCodes.EquipSlot; // (inferred) no worn weapon.
         return _functions.ConditionMet(session, (long)id) ? 0 : ErrorCodes.SlotSealed;
     }
+
+    private bool WeaponWorn(GameSession session, int grid) =>
+        session.Items.Any(i => i.Grid == grid)
+        || (grid == 2 && session.Items.Any(i => i.Grid == 1 && Ro3Emu.Server.Data.Config.ItemConfig.Get(_data, i.Entry) is { EquipPart: 1 }));
 
     private long Part(int entry) => _data.Row("ItemConfig", entry) is { } row ? GameData.Int(row, "_iCardPart") : 0;
 
