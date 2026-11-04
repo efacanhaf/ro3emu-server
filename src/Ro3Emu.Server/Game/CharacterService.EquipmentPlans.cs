@@ -13,6 +13,20 @@ public sealed partial class CharacterService
     public const int EquipmentPlanCount = 3;
     private const int EquipmentPlanNameLimit = 8;
 
+    /// <summary>
+    /// Writes the worn gear into a plan the way the official server saves it: a two-handed weapon (part 1) occupies BOTH
+    /// weapon grids, so its guid is listed in grid 1 and in grid 2 (Eduardo: "a arma de duas mãos ocupa os dois").
+    /// </summary>
+    private void WritePlanGrids(DBEquipPlan plan, IEnumerable<InvItem> worn)
+    {
+        plan.ItemsEquipGrid.Clear();
+        foreach (var item in worn)
+        {
+            plan.ItemsEquipGrid[item.Grid] = item.Guid;
+            if (item.Grid == 1 && PartOf(item.Entry) == 1) plan.ItemsEquipGrid[2] = item.Guid;
+        }
+    }
+
     /// <summary>Stage 31413's validated grid move for a Genre composite; caller persists all owners together.</summary>
     internal int StageEquipmentPlan(DBEquipInfo state, List<InvItem> stagedItems, int index, bool replaceCurrent = false)
     {
@@ -40,8 +54,7 @@ public sealed partial class CharacterService
         if (!replaceCurrent || index != state.CurrentEquipPlan)
         {
             var old = state.EquipPlans[state.CurrentEquipPlan];
-            old.ItemsEquipGrid.Clear();
-            foreach (var item in stagedItems.Where(i => i.Grid > 0 && i.Pack == 2 && i.Grid <= 8)) old.ItemsEquipGrid[item.Grid] = item.Guid;
+            WritePlanGrids(old, stagedItems.Where(i => i.Grid > 0 && i.Pack == 2 && i.Grid <= 8));
         }
         long sort = stagedItems.Where(i => i.Pack == 2).Select(i => i.Sort).DefaultIfEmpty().Max();
         foreach (var item in outgoing) { item.Grid = 0; item.Sort = ++sort; }
@@ -66,11 +79,10 @@ public sealed partial class CharacterService
     }
 
     /// <summary>31400 edits the selected plan; other plans retain references to the same instances (inferred).</summary>
-    private static void RememberEquipment(GameSession session)
+    private void RememberEquipment(GameSession session)
     {
         var plan = session.EquipmentPlans.EquipPlans[session.EquipmentPlans.CurrentEquipPlan];
-        plan.ItemsEquipGrid.Clear();
-        foreach (var item in Equipped(session)) plan.ItemsEquipGrid[item.Grid] = item.Guid;
+        WritePlanGrids(plan, Equipped(session));
     }
 
     /// <summary>Consumed/deleted instances leave all plans; a plan never owns a second copy (inferred invariant).</summary>
@@ -108,12 +120,13 @@ public sealed partial class CharacterService
         var incoming = new Dictionary<long, (InvItem Item, int Grid)>();
         if (result == 0)
         {
-            foreach (var (grid, guid) in target!.ItemsEquipGrid)
+            foreach (var (grid, guid) in target!.ItemsEquipGrid.OrderBy(g => g.Key))   // grid 1 before its two-handed repeat in 2
             {
                 var item = session.Items.FirstOrDefault(i => i.Guid == guid);
                 if (item == null) { result = ErrorCodes.ItemMissing; break; }
                 if (!IsEquipment(item.Entry)) { result = ErrorCodes.NotEquipment; break; }
                 if (item.Grid < 0 || item.Pack != 2 || item.Stack != 1) { result = ErrorCodes.EquipNotInBag; break; }
+                if (grid == 2 && PartOf(item.Entry) == 1 && incoming.TryGetValue(guid, out var seen) && seen.Grid == 1) continue;   // the same two-hander
                 if (!GridsFor(PartOf(item.Entry)).Contains(grid) || !incoming.TryAdd(guid, (item, grid)))
                 { result = ErrorCodes.EquipSlot; break; }
             }
@@ -132,8 +145,7 @@ public sealed partial class CharacterService
                 var next = state.Clone();
                 var staged = session.Items.Select(i => i.Clone()).ToList();
                 var oldPlan = next.EquipPlans[next.CurrentEquipPlan];
-                oldPlan.ItemsEquipGrid.Clear();
-                foreach (var worn in Equipped(session)) oldPlan.ItemsEquipGrid[worn.Grid] = worn.Guid;
+                WritePlanGrids(oldPlan, Equipped(session));
                 foreach (var old in outgoing)
                 {
                     var moved = staged.Single(i => i.Guid == old.Guid);

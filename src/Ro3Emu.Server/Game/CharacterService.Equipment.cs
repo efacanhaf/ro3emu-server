@@ -212,8 +212,7 @@ public sealed partial class CharacterService
 
         var plans = session.EquipmentPlans.Clone();
         var active = plans.EquipPlans[plans.CurrentEquipPlan];
-        active.ItemsEquipGrid.Clear();
-        foreach (var worn in staged.Where(i => i.Grid > 0 && i.Pack == 2 && i.Grid <= 8)) active.ItemsEquipGrid[worn.Grid] = worn.Guid;
+        WritePlanGrids(active, staged.Where(i => i.Grid > 0 && i.Pack == 2 && i.Grid <= 8));
         await CommitCharacterAsync(session, "equip", nextItems: staged,
             blobs: new Dictionary<string, byte[]> { ["equip_plans"] = plans.ToByteArray() },
             apply: () => session.EquipmentPlans = plans);
