@@ -212,7 +212,18 @@ sends it the way it already sends a card-granted skill:
 Both are projections of data the role owns; no combat rule changes. Verified live on the reference
 replica: the "Fila" tab appears, its queue shows Bloqueio Nv.5 / Escudo Reflexo Nv.1 / Canto Santo Nv.10
 (the official screenshot), the skills the active plan does not assign read "Não aprendida" (Providência,
-Escudo Luz, Escudada...), and `skillWheel.whellSkills[7].skillConfigId = 1160001` like the official.
+Escudo Luz, Encolher...), and `skillWheel.whellSkills[7].skillConfigId = 1160001` like the official.
+
+**The five plans keep their own assignments, and the points are the official's.** `SkillService.Build` used
+to rewrite the active plan with every tree group (level or initial) and to recompute `skillPoints` for all
+five plans. The official save has five different loadouts — 35 / 36 / 27 / 9 / 9 assignments, sums 169 / 169
+/ 129 / 9 / 9 — and only the active one carries remaining points (rank 5: 40); the two untouched plans carry
+no `skillPoints` entries at all. The rebuild now writes the active plan from `role.skills` and leaves the
+other four alone, and recomputes only the active plan's budget (`JobLvConfig._iSkillPoint` earned per rank
+minus what that plan spent), so the client shows the same spent/left numbers as the official. `skillList`
+also stopped carrying the career chain's normal attacks (the official's 53 groups have no 10000, the novice
+attack; the current attack travels as `currentAtkSkillId`), which is what made the copy list Encolher at
+Nv.1 while the official paints it unlearned.
 
 **Wheel modes (the enhanced skill variants).** `SkillConfig` holds the same skill in several `_iMode`
 rows: mode 0 is the base (1160710, damage 21000) and modes 1/5 are the enhanced variants the client puts

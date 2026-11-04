@@ -145,7 +145,7 @@ public sealed class SkillGrowthTests : IAsyncLifetime
         Assert.True(fresh.SyncAllMark);
         Assert.Equal(5, fresh.MaxPlanCount);
         Assert.Equal(5, fresh.SkillAssignPlans.All.Value.Count);
-        Assert.Equal(0, fresh.SkillAssignPlans.All.Value[0].SkillAssigns[10002].SkillLevel); // base-level 5 gate
+        Assert.DoesNotContain(10002, fresh.SkillAssignPlans.All.Value[0].SkillAssigns.Keys); // base-level 5 gate: absent, like the official's unlearned skills
         await alice.SendGameAsync(SkillService.PlanUpdate, new SkillGrowthSkillPlanUpdateReq { Plan = 99 });
         Assert.Equal(ErrorCodes.Parameter,
             (await Next(alice, SkillService.PlanUpdate, SkillGrowthSkillPlanUpdateResp.Parser)).Result);
@@ -159,8 +159,10 @@ public sealed class SkillGrowthTests : IAsyncLifetime
         await alice.SendGameAsync(SkillService.PlanUpdate, learn);
         var allocated = await Next(alice, SkillService.SkillDataSync, DBSkillDataIncrement.Parser,
             m => !m.SyncAllMark && m.SkillAssignPlans?.Inc?.Value[0].SkillAssigns.ContainsKey(11002) == true);
-        Assert.Equal(1, allocated.SkillAssignPlans.Inc.Value[0].SkillAssigns[11002].Inc.SkillLevel);
-        Assert.Equal(9, allocated.SkillAssignPlans.Inc.Value[0].SkillPoints[2].All);
+        var allocatedPlan = allocated.SkillAssignPlans.Inc.Value[0];
+        var smite = allocatedPlan.SkillAssigns[11002];
+        Assert.Equal(1, smite.All?.SkillLevel ?? smite.Inc?.SkillLevel ?? 0);
+        Assert.Equal(9, allocatedPlan.SkillPoints[2].All);
         Assert.Equal(0, (await Next(alice, SkillService.PlanUpdate, SkillGrowthSkillPlanUpdateResp.Parser)).Result);
 
         var bad = new SkillGrowthSkillPlanUpdateReq { Plan = 0 };
@@ -177,7 +179,10 @@ public sealed class SkillGrowthTests : IAsyncLifetime
         await alice.SendGameAsync(SkillService.PlanUpdate, bad);
         var refunded = await Next(alice, SkillService.SkillDataSync, DBSkillDataIncrement.Parser,
             m => !m.SyncAllMark && m.SkillAssignPlans?.Inc?.Value[0].SkillAssigns.ContainsKey(11001) == true);
-        Assert.Equal(0, refunded.SkillAssignPlans.Inc.Value[0].SkillAssigns[11001].Inc.SkillLevel);
+        // A refunded skill leaves the plan (the official lists only levels above zero), so the entry is either a deletion
+        // or a zero.
+        var refundedEntry = refunded.SkillAssignPlans.Inc.Value[0].SkillAssigns[11001];
+        Assert.True(refundedEntry.Del || (refundedEntry.All?.SkillLevel ?? refundedEntry.Inc?.SkillLevel ?? 0) == 0);
         Assert.Equal(15, refunded.SkillAssignPlans.Inc.Value[0].SkillPoints[2].All);
         Assert.Equal(0, (await Next(alice, SkillService.PlanUpdate, SkillGrowthSkillPlanUpdateResp.Parser)).Result);
     }
@@ -279,7 +284,7 @@ public sealed class SkillGrowthTests : IAsyncLifetime
         }
         await using var again = await InWorld("Alice", create: false);
         var reloaded = await Next(again, SkillService.SkillDataSync, DBSkillDataIncrement.Parser);
-        Assert.Equal(0, reloaded.SkillAssignPlans.All.Value[0].SkillAssigns[13006].SkillLevel);
+        Assert.True(!reloaded.SkillAssignPlans.All.Value[0].SkillAssigns.TryGetValue(13006, out var reset) || reset.SkillLevel == 0);
         Assert.Equal(0, reloaded.SkillAssignPlans.All.Value[0].SkillQueue[0].SkillId);
         Assert.DoesNotContain(reloaded.SkillWheel.All.WhellSkills.Values, slot => slot.SkillConfigId == 1300601);
     }

@@ -540,8 +540,10 @@ public sealed class CharacterTests : IAsyncLifetime
         Assert.Equal(5, skills.SkillAssignPlans.All.Value.Count);
         Assert.Equal(0, skills.CurrentPlanIndex);
         var plan = skills.SkillAssignPlans.All.Value[skills.CurrentPlanIndex];
-        Assert.Equal(new[] { 10000, 10002, 10003 }, plan.SkillAssigns.Keys.Order());
-        Assert.Equal(0, plan.SkillAssigns[10002].SkillLevel); // Smite activates at base level 5
+        // Only what the role has a level in at this point: the novice's normal attack. Smite (10002) and Basic Skill
+        // (10003) activate at base level 5, so they are not listed yet (the official plan lists only levels above zero).
+        Assert.Equal(new[] { 10000 }, plan.SkillAssigns.Keys.Order());
+        Assert.DoesNotContain(10002, plan.SkillAssigns.Keys); // Smite activates at base level 5
 
         // Keep the master's learned-Smite wheel assertion after the configured activation level.
         await Gm("alice", "!lvl 5");
@@ -563,9 +565,9 @@ public sealed class CharacterTests : IAsyncLifetime
             m => m.SkillAssignPlans?.Inc?.Value.Any(pl => pl.SkillAssigns.ContainsKey(11001)) == true);
         Assert.Equal(5, learned.SkillAssignPlans.Inc.Value.Count);
         var bash = learned.SkillAssignPlans.Inc.Value[req.Plan]; // element-wise: the client listens on skillAssignPlans[plan + 1]
-        // A learnable skill is already present at level zero, so allocation updates its existing map entry.
-        Assert.NotNull(bash.SkillAssigns[11001].Inc);
-        Assert.Equal(3, bash.SkillAssigns[11001].Inc.SkillLevel);
+        // The plan lists only learned levels now, so a fresh group arrives whole (all) instead of as a delta over a zero.
+        var bashEntry = bash.SkillAssigns[11001];
+        Assert.Equal(3, bashEntry.All?.SkillLevel ?? bashEntry.Inc?.SkillLevel ?? 0);
         Assert.Equal(12, bash.SkillPoints[2].All);
         Assert.All(learned.SkillAssignPlans.Inc.Value.Skip(1), other => Assert.DoesNotContain(11001, other.SkillAssigns.Keys));
         Assert.Equal(0, (await Next(alice, SkillService.PlanUpdate, SkillGrowthSkillPlanUpdateResp.Parser)).Result);

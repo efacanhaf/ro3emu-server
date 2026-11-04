@@ -178,15 +178,23 @@ public sealed class SkillService
     {
         var p = session.Progress!;
         int atk = NormalAttack(p.Career);
-        int atkGroup = _data.Row("SkillConfig", atk) is { } a ? (int)GameData.Int(a, "_iSkillID") : 0;
+        int atkGroup = _data.Row("SkillConfig", atk) is { } attackRow ? (int)GameData.Int(attackRow, "_iSkillID") : 0;
+        // The list the client builds its panel from: the career tree's learnable skills plus the CURRENT career's normal
+        // attack at the end (the official's 53: no 10000, the novice attack the Royal Guard replaced, and 11400 last).
+        var otherAttacks = CareerChain(p.Career)
+            .Select(c => _data.Row("SkillConfig", NormalAttack(c)) is { } row ? (int)GameData.Int(row, "_iSkillID") : 0)
+            .Where(group => group > 0 && group != atkGroup).ToHashSet();
         var tree = Tree(p.Career);
         var skillData = new DBSkillData { MaxPlanCount = PlanCount, CurrentPlanIndex = 0, CurrentAtkSkillId = atk };
-        if (atkGroup > 0) skillData.SkillList.Add(atkGroup);
-        skillData.SkillList.Add(tree.Select(t => t.Group).Where(g => g != atkGroup).Distinct());
+        skillData.SkillList.Add(tree.Select(t => t.Group).Where(g => !otherAttacks.Contains(g)).Distinct());
+        if (atkGroup > 0 && !skillData.SkillList.Contains(atkGroup)) skillData.SkillList.Add(atkGroup);
 
         var plan = new SkillPlan { IsUnlock = true };
+        // A plan lists the groups it actually has a level in (the official sends 27 in the active plan and 9 initial-level
+        // defaults in the untouched ones); a group with no level is absent and the client paints it "Não aprendida".
         foreach (int group in skillData.SkillList)
-            plan.SkillAssigns[group] = new SkillData { SkillId = group, SkillLevel = Level(p, group) };
+            if (Level(p, group) is var level and > 0)
+                plan.SkillAssigns[group] = new SkillData { SkillId = group, SkillLevel = level };
         plan.SkillQueue[0] = new SkillData(); // the client pairs() it unguarded
         plan.ManualLoadSkill.Add(new SkillData()); // repeated load lists are read by the client even when empty
         plan.AutoLoadSkill.Add(new SkillData());
@@ -195,12 +203,11 @@ public sealed class SkillService
         for (int index = 1; index < PlanCount; index++)
         {
             var blank = new SkillPlan { IsUnlock = true };
+            // An untouched plan carries the tree's initial-level groups only (the official's idle plans: 9 assignments at
+            // level 1, the normal attack not among them).
             foreach (int group in skillData.SkillList)
-                blank.SkillAssigns[group] = new SkillData
-                {
-                    SkillId = group,
-                    SkillLevel = group == atkGroup ? 1 : Initial(p, group)
-                };
+                if (group != atkGroup && Initial(p, group) is var initial and > 0)
+                    blank.SkillAssigns[group] = new SkillData { SkillId = group, SkillLevel = initial };
             blank.SkillQueue[0] = new SkillData(); // paired by the client even in a fresh plan.
             blank.ManualLoadSkill.Add(new SkillData());
             blank.AutoLoadSkill.Add(new SkillData());
@@ -394,11 +401,23 @@ public sealed class SkillService
         if (session.SkillPlans == null) throw new InvalidOperationException("Skill plans must be loaded before use.");
         var state = session.SkillPlans!.Clone();
         var current = state.SkillAssignPlans[state.CurrentPlanIndex];
-        current.SkillAssigns.Clear();
         var generated = BuildFresh(session);
-        foreach (var (group, level) in generated.SkillAssignPlans[0].SkillAssigns) current.SkillAssigns[group] = level.Clone();
+        // The active plan IS the role's learned map: role.skills is what the import landed and what every purchase or
+        // reset writes back. The plan lists only those groups, so the client paints every other tree skill "Não
+        // aprendida" exactly like the official (its active plan carries 27 assignments, not the whole tree).
+        current.SkillAssigns.Clear();
+        // The active plan is the learned map: what the import landed (or the player bought), plus the change the player
+        // did not make — the tree's initial-level skills (SkillConfig._iInitialLevel), which the client lists as learned
+        // even before any point is spent. Replacements and the other careers' normal attacks are already filtered out of
+        // the generated list, which is why the official plan holds 10003/11508/11614/11615/11637 and not 10000 or 10002
+        // (Smite is replaced by 11099 for the Royal Guard, and that one is listed).
+        foreach (int group in generated.SkillList)
+            if (Level(session.Progress!, group) is var initial and > 0)
+                current.SkillAssigns[group] = new SkillData { SkillId = group, SkillLevel = initial };
+        foreach (var (group, level) in session.Progress!.Skills.OrderBy(pair => pair.Key))
+            if (level > 0) current.SkillAssigns[group] = new SkillData { SkillId = group, SkillLevel = level };
         current.SkillPoints.Clear();
-        foreach (var (rank, points) in generated.SkillAssignPlans[0].SkillPoints) current.SkillPoints[rank] = points;
+        foreach (var (rank, points) in SkillPoints(session.Progress!)) current.SkillPoints[rank] = Math.Max(0, points);
         state.SkillList.Clear();
         state.SkillList.Add(generated.SkillList);
         foreach (var plan in state.SkillAssignPlans)
@@ -414,16 +433,14 @@ public sealed class SkillService
                 foreach (var load in plan.ManualLoadSkill.Concat(plan.AutoLoadSkill).Concat(plan.SkillQueue.Values))
                     if (load.SkillId == old) load.SkillId = replacement;
             }
-            foreach (int group in generated.SkillList)
-                if (!plan.SkillAssigns.ContainsKey(group))
-                    plan.SkillAssigns[group] = new SkillData { SkillId = group, SkillLevel = Initial(session.Progress!, group) };
-            var preview = CharacterService.GenreCloneProgress(session.Progress!);
-            preview.Skills.Clear();
-            foreach (int group in generated.SkillList)
-                if (plan.SkillAssigns.TryGetValue(group, out var assigned)
-                    && assigned.SkillLevel > Initial(preview, group)) preview.Skills[group] = assigned.SkillLevel;
-            plan.SkillPoints.Clear();
-            foreach (var (rank, points) in SkillPoints(preview)) plan.SkillPoints[rank] = Math.Max(0, points);
+            // Every plan keeps the assignments it owns (the official ships five different loadouts); only the active one
+            // above is rebuilt from role.skills. Its remaining points are the only ones recomputed: an untouched plan
+            // keeps the map the server last sent (the official's idle plans carry no entries at all).
+            if (ReferenceEquals(plan, current))
+            {
+                plan.SkillPoints.Clear();
+                foreach (var (rank, points) in SkillPoints(session.Progress!)) plan.SkillPoints[rank] = Math.Max(0, points);
+            }
             if (plan.SkillQueue.Count == 0) plan.SkillQueue[0] = new SkillData();
             if (plan.ManualLoadSkill.Count == 0) plan.ManualLoadSkill.Add(new SkillData());
             if (plan.AutoLoadSkill.Count == 0) plan.AutoLoadSkill.Add(new SkillData());
@@ -558,17 +575,21 @@ public sealed class SkillService
             return ErrorCodes.Parameter;
         var source = state.SkillAssignPlans[index];
         var tree = Tree(progress.Career).ToDictionary(t => t.Group, t => t.Career);
-        // BuildFresh stores normal attacks in plans, but Level grants the current attack implicitly.
-        // Ignore those from the current career chain when an older plan is selected after a job change.
+        // BuildFresh no longer stores normal attacks in plans, but an imported official plan DOES list the career's own
+        // attack (11400 for the Royal Guard) while a plan from an older career lists that career's; the current career's
+        // attack is a legitimate assignment, the older ones are dropped.
+        int currentAttack = _data.Row("SkillConfig", NormalAttack(progress.Career)) is { } attackRow
+            ? (int)GameData.Int(attackRow, "_iSkillID") : 0;
         var normalAttacks = CareerChain(progress.Career)
             .Select(c => _data.Row("SkillConfig", NormalAttack(c)) is { } row ? (int)GameData.Int(row, "_iSkillID") : 0)
             .Where(group => group > 0).ToHashSet();
         progress.Skills.Clear();
         foreach (var (group, assignment) in source.SkillAssigns)
         {
-            if (assignment.SkillLevel == 1 && normalAttacks.Contains(group)) continue;
+            bool normalAttack = normalAttacks.Contains(group);
+            if (assignment.SkillLevel == 1 && normalAttack && group != currentAttack) continue;
             if (assignment.SkillLevel < 0 || assignment.SkillLevel > MaxLevel(group)
-                || (!tree.ContainsKey(group) && assignment.SkillLevel > 0)) return ErrorCodes.SkillNotInTree;
+                || (!tree.ContainsKey(group) && !normalAttack && assignment.SkillLevel > 0)) return ErrorCodes.SkillNotInTree;
             if (assignment.SkillId != 0 && assignment.SkillId != group) return ErrorCodes.Parameter;
             if (assignment.SkillLevel > Initial(progress, group)) progress.Skills[group] = assignment.SkillLevel;
         }
