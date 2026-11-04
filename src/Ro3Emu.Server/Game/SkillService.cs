@@ -589,7 +589,9 @@ public sealed class SkillService
             bool normalAttack = normalAttacks.Contains(group);
             if (assignment.SkillLevel == 1 && normalAttack && group != currentAttack) continue;
             if (assignment.SkillLevel < 0 || assignment.SkillLevel > MaxLevel(group)
-                || (!tree.ContainsKey(group) && !normalAttack && assignment.SkillLevel > 0)) return ErrorCodes.SkillNotInTree;
+                // outside the tree only the innate level is allowed (the queue command 11600, the event passives
+                // 111641-3): a skill reset leaves them at it, and that must not read as "not in the tree"
+                || (!tree.ContainsKey(group) && !normalAttack && assignment.SkillLevel > Math.Max(0, Initial(progress, group)))) return ErrorCodes.SkillNotInTree;
             if (assignment.SkillId != 0 && assignment.SkillId != group) return ErrorCodes.Parameter;
             if (assignment.SkillLevel > Initial(progress, group)) progress.Skills[group] = assignment.SkillLevel;
         }
