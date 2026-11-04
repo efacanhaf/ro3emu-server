@@ -96,9 +96,20 @@ public sealed partial class CombatService
         {
             int group = (int)GameData.Int(row!.Value, "_iSkillID"), mode = (int)GameData.Int(row.Value, "_iMode");
             if (Math.Max(s.SkillCds.GetValueOrDefault(group), s.SkillModeCds.GetValueOrDefault((group, mode))) > Now) error = ErrorCodes.SkillCooldown;
-            // Preserve the established cooldown refusal for a repeated cast, including during its action tail.
+            // A re-press of the skill whose action is still running: the official does not restart or refuse it — the
+            // action completes and the skill is released again right after (hold/release, _iPcReleasingSkill). Only the
+            // newest press is kept; it pays and starts when this action's window closes.
             else if (s.SkillCast is { Cancelled: false } active && Now < active.StartMs + active.ChantMs + active.ActionMs
-                && GameData.Int(row.Value, "_bCancelCast") == 0) error = ErrorCodes.SkillBusy;
+                && GameData.Int(row.Value, "_bCancelCast") == 0)
+            {
+                if (SameSkill(active.Row, row.Value))
+                {
+                    s.SkillCastHold = req;
+                    await s.SendGameAsync(UseSkill, new CastSkillRsp { Result = 0, IsAutoCast = req.IsAutoCast });
+                    return;
+                }
+                error = ErrorCodes.SkillBusy;
+            }
             else error = ValidateTarget(s, row.Value, req, origin, owned == null ? WalkSlack(s) : 0,
                 _data.Row("SkillConfig", request.SkillId) is { } askedRow ? Range(askedRow) : 0);
         }
@@ -464,12 +475,24 @@ public sealed partial class CombatService
             action.Resolved = true;
             await ResolveCastAsync(s, action);
         });
-        ScheduleRuntime(action.WorldScene, TimeSpan.FromMilliseconds(Math.Max(at, action.ChantMs + action.ActionMs) + 1), () =>
+        ScheduleRuntime(action.WorldScene, TimeSpan.FromMilliseconds(Math.Max(at, action.ChantMs + action.ActionMs) + 1), async () =>
         {
             if (ReferenceEquals(s.SkillCast, action)) s.SkillCast = null;
-            return Task.CompletedTask;
+            // The press that arrived during the action releases the skill again right away (never a restart).
+            if (s.SkillCastHold is { } held)
+            {
+                s.SkillCastHold = null;
+                await CastAsync(s, held);
+                return;
+            }
+            await Task.CompletedTask;
         });
     }
+
+    /// <summary>Same skill group and mode: the repeat press of the row whose action is running.</summary>
+    private static bool SameSkill(JsonElement running, JsonElement asked) =>
+        GameData.Int(running, "_iSkillID") == GameData.Int(asked, "_iSkillID")
+        && GameData.Int(running, "_iMode") == GameData.Int(asked, "_iMode");
 
     /// <summary>Piecewise template time mapping; same scale as LC_Skill_RunTimeContext (inferred for attack points).</summary>
     internal static int ImpactOffset(JsonElement? template, double point, int chantMs, int actionMs)
@@ -513,6 +536,7 @@ public sealed partial class CombatService
     private async Task CancelCastAsync(GameSession s, SkillInterruptedInfo.Types.SkillInterruptType cause)
     {
         s.WorldState.ResurrectionCastId = 0;
+        s.SkillCastHold = null; // an interrupted action never releases the skill again
         if (s.SkillCast is not { } action) return;
         action.Cancelled = true;
         s.SkillCast = null;

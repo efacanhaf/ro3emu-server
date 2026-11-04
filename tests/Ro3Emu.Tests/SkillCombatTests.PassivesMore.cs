@@ -133,8 +133,9 @@ public sealed partial class SkillCombatTests
         });
     }
 
-    // Union: "For each Crusader on the team, gain 1 stack of [Union]" (the other Crusader-line members): a Royal Guard
-    // in a party with a Paladin carries one pile of BuffConfig 1162701, and none after the Paladin leaves.
+    // Union: "For each Crusader on the team, gain 1 stack of [Union]" — the carrier himself counts (the naked official
+    // carries one stack alone) and every other Crusader-line member adds one: Alice alone has 1 pile of BuffConfig
+    // 1162701, 2 with Bob (Paladin), and 1 again after he leaves.
     [ClientDataFact]
     public async Task UnionCountsTheOtherCrusadersInTheParty()
     {
@@ -142,7 +143,9 @@ public sealed partial class SkillCombatTests
         await using var bob = await InWorld("Bob");
         await UnionParty(alice, bob);
         await Loop.InvokeAsync(() => _app.Services.GetRequiredService<TeamService>().LeaveAsync(Session("bob")));
-        await Next(alice, BuffService.BuffRemove, BuffRemoveNotify.Parser);
+        var alone = await Next(alice, BuffService.BuffUpdate, BuffUpdateNotify.Parser,
+            x => x.Buffs.Any(b => b.ConfigId == 1162701 && b.PileCount == 1));
+        Assert.Equal(1, alone.Buffs.Single(b => b.ConfigId == 1162701).PileCount);
     }
 
     // In-game 22.10: the Paladin going offline left the Union pile on, since only roster changes recounted it.
@@ -153,7 +156,9 @@ public sealed partial class SkillCombatTests
         var bob = await InWorld("Bob");
         await UnionParty(alice, bob);
         await bob.DisposeAsync();
-        await Next(alice, BuffService.BuffRemove, BuffRemoveNotify.Parser);
+        var alone = await Next(alice, BuffService.BuffUpdate, BuffUpdateNotify.Parser,
+            x => x.Buffs.Any(b => b.ConfigId == 1162701 && b.PileCount == 1));
+        Assert.Equal(1, alone.Buffs.Single(b => b.ConfigId == 1162701).PileCount);
     }
 
     private async Task UnionParty(BotClient alice, BotClient bob)
@@ -172,7 +177,8 @@ public sealed partial class SkillCombatTests
         { TeamId = created.TeamId, IsAgree = true, InviteGuid = (long)alice.Self!.Uuid });
         Assert.Equal(0, (await Next(bob, TeamService.TeamInviteeResp, InviteeRespResp.Parser)).Result);
 
-        var union = await Next(alice, BuffService.BuffUpdate, BuffUpdateNotify.Parser, x => x.Buffs.Any(b => b.ConfigId == 1162701));
-        Assert.Equal(1, union.Buffs.Single(b => b.ConfigId == 1162701).PileCount);
+        var union = await Next(alice, BuffService.BuffUpdate, BuffUpdateNotify.Parser,
+            x => x.Buffs.Any(b => b.ConfigId == 1162701 && b.PileCount == 2));
+        Assert.Equal(2, union.Buffs.Single(b => b.ConfigId == 1162701).PileCount);
     }
 }

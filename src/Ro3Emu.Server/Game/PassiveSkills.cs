@@ -220,15 +220,17 @@ public sealed class PassiveSkills : IGameTicker
 
     /// <summary>
     /// Union: "Join forces with other Crusaders on your team. For each Crusader on the team, gain 1 stack of [Union]:
-    /// Physical ATK, Physical DEF, and Magic DEF increase by ${1}. Stacks up to ${2} times." The other online members of the
-    /// Crusader line count (inferred), as piles of the Union buff, which leaves with the last of them or the passive.
+    /// Physical ATK, Physical DEF, and Magic DEF increase by ${1}. Stacks up to ${2} times." The carrier counts (the
+    /// official shows one stack alone: BuffConfig 1162701 on the character with nobody else nearby) and every other
+    /// online member of the Crusader line adds one (inferred), as piles of the Union buff, which leaves with the last of
+    /// them or the passive.
     /// </summary>
     private async Task UnionAsync(GameSession s)
     {
         if (s.Role is not { } role || s.Dead) return;
         int stacks = 0;
         if (Learned(s, Union) is { Skill: var union })
-            stacks = Math.Min((int)Value(union.DescData, 1), _teams.MembersOf(role.Id).Count(id => id != role.Id
+            stacks = Math.Min((int)Value(union.DescData, 1), 1 + _teams.MembersOf(role.Id).Count(id => id != role.Id
                 && _sessions.All().FirstOrDefault(p => p.Role?.Id == id) is { Progress: { } progress } && IsCrusader(progress.Career)));
         var live = s.Buffs.FirstOrDefault(b => b.ConfigId == UnionBuff && b.ExpireMs > MonsterService.NowMs);
         if (stacks > 0 && live?.PileCount != stacks) await _buffs.SetPileCountAsync(s, UnionBuff, PermanentMs, role.Id, stacks);

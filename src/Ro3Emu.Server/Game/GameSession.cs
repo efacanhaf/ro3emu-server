@@ -139,6 +139,11 @@ public sealed class GameSession(PhonestChannel channel, TrafficLog traffic)
 
     /// <summary>Authoritative cast generation; delayed effects cannot outlive an interrupted/replaced cast.</summary>
     public ActiveSkillCast? SkillCast { get; set; }
+    /// <summary>
+    /// The last re-press of the running skill (CombatService.Casting): the official keeps the action and releases it
+    /// again right after, so faster presses never lose a cast; only the newest press is kept.
+    /// </summary>
+    public Romsg.CastSkillReq? SkillCastHold { get; set; }
     public SemaphoreSlim SkillCastGate { get; } = new(1, 1);
     public List<SkillObject> SkillObjects { get; } = new();
     public Dictionary<(int Group, int Mode), long> SkillModeCds { get; } = new();
