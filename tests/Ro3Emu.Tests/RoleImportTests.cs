@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using Google.Protobuf;
 using Romsg;
@@ -138,9 +139,10 @@ public sealed class RoleImportTests
         Assert.Equal(-48L, plan.Columns["bonus_points"]);
         Assert.Equal(72000006L, plan.Columns["hair"]);
         var skills = ((string)plan.Columns["skills"]!).Split(',');
-        Assert.Equal(38, skills.Length);
+        Assert.Equal(56, skills.Length); // the learned set (official skillList), not just the active plan's assignments
         Assert.Contains("11401:10", skills);
-        Assert.Equal("1:11607,2:11602,3:11628,4:11604,6:11616", plan.Columns["skill_bar"]);
+        Assert.Contains("11600:1", skills);
+        Assert.Equal("1:11607,2:11602,3:11628,4:11604,6:11616,7:11600", plan.Columns["skill_bar"]);
         Assert.Equal(1L, plan.Columns["paragon_level"]);
         Assert.StartsWith("1:392286,2:369137", (string)plan.Columns["currency"]!);
     }
@@ -209,6 +211,24 @@ public sealed class RoleImportTests
         long grade = imported.Plan[official.CurPlanId].TalentNodes.Values.Sum(node => (long)node.CurrentLevel);
         long global = official.TalentNodes.Values.Sum(node => (long)node.CurrentLevel);
         Assert.True(grade >= global, $"grade {grade} < global {global}");
+    }
+
+    [Fact]
+    public void LearnedSkillsIncludeTheQueueCommandAndItsBarSlot()
+    {
+        using var snapshot = Fixture();
+        var plan = Build(snapshot);
+        var skills = ((string)plan.Columns["skills"]!).Split(',')
+            .Select(pair => pair.Split(':'))
+            .ToDictionary(pair => int.Parse(pair[0], CultureInfo.InvariantCulture), pair => int.Parse(pair[1], CultureInfo.InvariantCulture));
+        // The client shows the "Fila" (skill queue) tab only when the learned list holds the queue command group 11600.
+        Assert.Contains(11600, skills.Keys);
+        Assert.Equal(1, skills[11600]);
+        Assert.Contains(111641, skills.Keys);
+        Assert.Equal(56, skills.Count);
+        // ...and the official wheel carries it on its own bar slot 7 (11607 at level 10 stays the highest for its group).
+        Assert.Contains("7:11600", ((string)plan.Columns["skill_bar"]!).Split(','));
+        Assert.Contains("1:11607", ((string)plan.Columns["skill_bar"]!).Split(','));
     }
 
     [Fact]

@@ -21,6 +21,8 @@ public sealed class SkillService
     public const uint SkillReset = 31156, QueueUpdate = 31159, SwitchGenre = 31160;
     private const int PlanCount = 5; // (inferred) PublicParamConfig.SchemeNum.
     private const int BarSlots = 6;
+    /// <summary>The queue command group ("Skill Bar" 1160001): its own wheel slot, shown as the "Fila" tab.</summary>
+    private const int QueueCommand = 11600;
     private const long FightBit = 1L << 15;
 
     private readonly GameData _data;
@@ -419,6 +421,12 @@ public sealed class SkillService
             { state.SkillWheel.SkillQueue = new SkillWheelSlot { SkillConfigId = id, Enable = true }; break; }
         if (PetWheel?.Invoke(session) is { } pet)
             state.SkillWheel.WhellSkills[(int)SkillWheelSlotType.SkillWheelPet] = pet;
+        // The queue command (11600 «Skill Bar») has its own wheel slot in the original, and its saved bar slot is a
+        // data-only projection: a role that learned it gets it on slot 7, so the "Fila" panel and the bar match.
+        int queueGroup = QueueCommand;
+        if (Level(session.Progress!, queueGroup) > 0 && RealId(queueGroup, Math.Max(1, Level(session.Progress!, queueGroup))) is var queueId and > 0)
+            state.SkillWheel.WhellSkills[(int)SkillWheelSlotType.SkillWheelSkillQueue] =
+                new SkillWheelSlot { SkillConfigId = queueId, Enable = true };
         state.OriginSkillWheel = state.SkillWheel.Clone();
         return state;
     }
@@ -480,6 +488,21 @@ public sealed class SkillService
             {
                 if (!state.SkillList.Contains(group)) state.SkillList.Add(group);
                 current.SkillAssigns[group] = new SkillData { SkillId = group, SkillLevel = level };
+            }
+        }
+        // Learned skills the career tree does not hold (the queue command 11600 «Skill Bar», the 111641-111643 event
+        // passives): the original server lists everything the role has learned, and the client builds its panel from it —
+        // lc_skillgrowthhelper:GetHasSkillQueue shows the "Fila" (skill queue) tab only when 11600 is in that list.
+        // Sent like a granted skill (current plan, never persisted): a plan switch still validates against the tree.
+        if (session.Progress is { } learned)
+        {
+            var treeGroups = Tree(learned.Career).Select(entry => entry.Group).ToHashSet();
+            var current = state.SkillAssignPlans[state.CurrentPlanIndex];
+            foreach (var (group, level) in learned.Skills.OrderBy(pair => pair.Key))
+            {
+                if (treeGroups.Contains(group) || state.SkillList.Contains(group) || RealId(group, 1) <= 0) continue;
+                state.SkillList.Add(group);
+                current.SkillAssigns[group] = new SkillData { SkillId = group, SkillLevel = Math.Max(1, level) };
             }
         }
         await CharacterService.SyncAsync(session, SkillDataSync, state);

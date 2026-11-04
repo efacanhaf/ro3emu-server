@@ -490,7 +490,13 @@ public sealed class CharacterPlan
         _notes.Add($"bonus_points: {bonus} (official total {attrs.AllAttrPoints} - local base {localBaseStatPoints})");
     }
 
-    /// <summary>The active skill plan's assignments are the authoritative skills; the bar comes from its load list.</summary>
+    /// <summary>
+    /// The LEARNED set is `DBSkillData.skillList` (56 groups on the reference character), not just the active plan's
+    /// assignments: the client builds its skill panel from it and `lc_skillgrowthhelper:GetHasSkillQueue` only shows the
+    /// "Fila" (skill queue) tab when it finds the queue command group 11600 in that list. Each learned group's level is
+    /// the highest level it has in ANY plan, and 1 for a learned command skill no plan assigns (11600 «Skill Bar»,
+    /// the 111641-111643 event passives). The bar still comes from the active plan's load list.
+    /// </summary>
     private void BuildSkills()
     {
         if (!_snapshot.TryMessage("DBSKILLDATA", out var json)) { _notes.Add("skills: no DBSKILLDATA in the snapshot"); return; }
@@ -499,17 +505,33 @@ public sealed class CharacterPlan
         if (current < 0 || current >= data.SkillAssignPlans.Count)
             throw new InvalidDataException($"DBSKILLDATA has no active plan {current}.");
         var plan = data.SkillAssignPlans[current];
-        Columns["skills"] = string.Join(',', plan.SkillAssigns
-            .Where(assign => assign.Value.SkillLevel > 0)
-            .OrderBy(assign => assign.Key)
-            .Select(assign => $"{assign.Key}:{assign.Value.SkillLevel}"));
+        var levels = new SortedDictionary<int, int>();
+        foreach (var (group, assignment) in data.SkillAssignPlans.SelectMany(entry => entry.SkillAssigns))
+            if (assignment.SkillLevel > levels.GetValueOrDefault(group)) levels[group] = assignment.SkillLevel;
+        var learned = new SortedDictionary<int, int>();
+        foreach (int group in data.SkillList)
+            if (group > 0) learned[group] = Math.Max(1, levels.GetValueOrDefault(group));
+        foreach (var (group, level) in levels)
+            if (level > 0 && !learned.ContainsKey(group)) learned[group] = level;
+        Columns["skills"] = string.Join(',', learned.Select(pair => $"{pair.Key}:{pair.Value}"));
+        _notes.Add($"skills: {learned.Count} learned groups (official skillList {data.SkillList.Count})");
         var bar = new List<string>();
         for (int slot = 1; slot <= plan.ManualLoadSkill.Count; slot++)
         {
             var load = plan.ManualLoadSkill[slot - 1];
             if (load.SkillId > 0) bar.Add($"{slot}:{load.SkillId}");
         }
-        Columns["skill_bar"] = string.Join(',', bar);
+        // The official wheel carries the queue command (11600 «Skill Bar») on its own slot (7); the plan's load list only
+        // has the six cast slots. Mirror the wheel's slots the bar lacks so the command lands where the official has it.
+        if (data.SkillWheel is { } wheel)
+            foreach (var (slot, entry) in wheel.WhellSkills.OrderBy(pair => pair.Key))
+            {
+                int group = (int)(entry.SkillConfigId / 100);
+                if (group <= 0 || !learned.ContainsKey(group) || slot is < 1 or > 12) continue;
+                if (bar.Contains($"{slot}:{group}") || bar.Any(entry => entry.EndsWith($":{group}", StringComparison.Ordinal))) continue;
+                bar.Add($"{slot}:{group}");
+            }
+        Columns["skill_bar"] = string.Join(',', bar.OrderBy(text => int.Parse(text.Split(':')[0], CultureInfo.InvariantCulture)));
     }
 
     private void BuildParagon()

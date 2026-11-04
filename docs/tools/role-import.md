@@ -81,7 +81,7 @@ Role row (`role` table):
 | `hair` | `DBPERSONALINFO` current plan's `kAppearances[7]` |
 | `stats` | `BASEATTRINFO.allPlanBaseProperty[curPlanIndex].baseProperty[1..6]`, the order STR/AGI/VIT/INT/DEX/LUK |
 | `bonus_points` | see "stat points" below |
-| `skills` | active `DBSKILLDATA` plan's `skillAssigns`, `group:level` |
+| `skills` | the LEARNED set: `DBSKILLDATA.skillList`, each group at its highest level in any plan (1 for a learned command skill) |
 | `skill_bar` | that plan's `manualLoadSkill`, `slot:group`, empty slots omitted |
 | `paragon_level`, `paragon_exp` | `DBPARAGONLEVEL.lv` / `.exp` |
 | `currency` | `DBITEMSINFO.currency`, `id:amount` |
@@ -185,6 +185,30 @@ instead of 48 extra free points.
 The import also never invents an item the account did not own: a reference to an instance the snapshot
 does not carry (a shortcut-bar slot of a consumed item, a Soul Echo slot of a missing echo) is reported
 in the tool's output and dropped rather than pointed at a dangling guid.
+
+## Learned skills, the "Fila" tab and the skill bar
+
+`role.skills` is the character's LEARNED set, not the active plan's assignments: the official
+`DBSkillData.skillList` lists 56 groups (the career tree plus things the tree does not hold — the queue
+command 11600 «Skill Bar» and the 111641-111643 event passives), each at the highest level it has in any
+plan, or level 1 for a learned command skill no plan assigns. The active plan's `skillAssigns` only
+covers 26-38 of them.
+
+That was a real copy gap with a visible symptom: `lc_skillgrowthhelper:GetHasSkillQueue` shows the
+"Fila" (skill queue) tab only when the client's skill list contains 11600, and the client's list is the
+one the server sends. The import alone cannot make it appear, because `SkillService.Build` rebuilds the
+list from the career tree; the tool therefore also lands the data the projection needs, and the server
+sends it the way it already sends a card-granted skill:
+
+- `SkillService.SyncAsync` adds every learned group the tree does not hold to the sent `skillList` and to
+  the current plan's assignments (level from `role.skills`). Sent only — a plan switch still validates
+  against the tree, exactly like the card-granted path above it;
+- `SkillService.Build` puts the queue command on wheel slot 7 (`SkillWheelSkillQueue`) when the role
+  learned it, which is where the original client has it.
+
+Both are projections of data the role owns; no combat rule changes. Verified live on the reference
+replica: the "Fila" tab appears, its queue shows Bloqueio Nv.5 / Escudo Reflexo Nv.1 / Canto Santo Nv.10
+(the official screenshot), and `skillWheel.whellSkills[7].skillConfigId = 1160001` like the official.
 
 ## Naming a residual: the `!attrsrc` diagnostic
 
