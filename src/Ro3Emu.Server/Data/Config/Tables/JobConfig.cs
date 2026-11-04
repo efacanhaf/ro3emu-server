@@ -13,6 +13,7 @@ public readonly partial record struct JobConfig(JsonElement Row)
     [ConfigField("_iJob")] public partial long Job { get; }
     [ConfigField("_iJobRank")] public partial long JobRank { get; }
     [ConfigField("_iName")] public partial long[] Name { get; }
+    [ConfigField("_iQueueSkillId")] public partial long QueueSkillId { get; }
     [ConfigField("_iNotTransformJob")] public partial long NotTransformJob { get; }
     [ConfigField("_iParentId")] public partial long ParentId { get; }
     [ConfigField("_iSecondaryRoots")] public partial long SecondaryRoots { get; }

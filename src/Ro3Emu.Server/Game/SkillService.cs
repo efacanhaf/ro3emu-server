@@ -23,6 +23,10 @@ public sealed class SkillService
     private const int BarSlots = 6;
     /// <summary>The queue command group ("Skill Bar" 1160001): its own wheel slot, shown as the "Fila" tab.</summary>
     private const int QueueCommand = 11600;
+
+    /// <summary>The career's queue command group from JobConfig._iQueueSkillId (a SkillConfig row id); 0 when none.</summary>
+    private int QueueGroup(int career) => JobConfig.Get(_data, career) is { QueueSkillId: > 0 } job
+        && SkillConfig.Get(_data, job.QueueSkillId) is { } skill ? (int)skill.SkillId : 0;
     // SkillConfig field names, shared by the row lookups (the project counts string field names outside Data/Config).
     private const string SkillIdField = "_iSkillID";
     private const string SkillLevelField = "_iLevel";
@@ -452,8 +456,11 @@ public sealed class SkillService
             state.SkillWheel.WhellSkills[(int)SkillWheelSlotType.SkillWheelPet] = pet;
         // The queue command (11600 «Skill Bar») has its own wheel slot in the original, and its saved bar slot is a
         // data-only projection: a role that learned it gets it on slot 7, so the "Fila" panel and the bar match.
-        int queueGroup = QueueCommand;
-        if (Level(session.Progress!, queueGroup) > 0 && RealId(queueGroup, Math.Max(1, Level(session.Progress!, queueGroup))) is var queueId and > 0)
+        // The career's queue command is innate (JobConfig._iQueueSkillId, 1160001 for 1410): no points, never reset.
+        int innate = QueueGroup(session.Progress!.Career);
+        int queueGroup = innate > 0 ? innate : QueueCommand;
+        if ((innate > 0 || Level(session.Progress!, queueGroup) > 0)
+            && RealId(queueGroup, Math.Max(1, Level(session.Progress!, queueGroup))) is var queueId and > 0)
             state.SkillWheel.WhellSkills[(int)SkillWheelSlotType.SkillWheelSkillQueue] =
                 new SkillWheelSlot { SkillConfigId = queueId, Enable = true };
         state.OriginSkillWheel = state.SkillWheel.Clone();
@@ -532,6 +539,13 @@ public sealed class SkillService
                 if (treeGroups.Contains(group) || state.SkillList.Contains(group) || RealId(group, 1) <= 0) continue;
                 state.SkillList.Add(group);
                 current.SkillAssigns[group] = new SkillData { SkillId = group, SkillLevel = Math.Max(1, level) };
+            }
+            // The career's innate queue command (JobConfig._iQueueSkillId): listed even when the saved skills lost it
+            // (a skill reset), so the "Fila" tab never disappears - the official keeps it after a reset (Eduardo, 2026-11-04).
+            if (QueueGroup(learned.Career) is var queue and > 0 && !state.SkillList.Contains(queue) && RealId(queue, 1) > 0)
+            {
+                state.SkillList.Add(queue);
+                current.SkillAssigns[queue] = new SkillData { SkillId = queue, SkillLevel = Math.Max(1, Level(learned, queue)) };
             }
         }
         await CharacterService.SyncAsync(session, SkillDataSync, state);
