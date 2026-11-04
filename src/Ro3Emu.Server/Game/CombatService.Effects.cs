@@ -408,7 +408,7 @@ public sealed partial class CombatService
         return id > 0 && Rolls.Proc(10000) < (GameData.Number(tuple[1]) ?? 0);
     }
 
-    internal enum DisplaceKind { CasterForward, CasterBack, TargetPush, TargetPull }
+    internal enum DisplaceKind { CasterForward, CasterBack, TargetPush, TargetPull, CasterToPoint }
 
     /// <summary>
     /// Skills whose show has a displacement EffectData (m_kPoint.m_bMovement) and whose description names the
@@ -423,6 +423,9 @@ public sealed partial class CombatService
             ["RetreatingShadows"] = (DisplaceKind.CasterBack, 0),
             ["RetreatingShadowsS1"] = (DisplaceKind.CasterBack, 0),
             ["WolvesDash"] = (DisplaceKind.CasterForward, 0),
+            // Twilight (Royal Guard): "Leap to a selected area within ${2} meters" - the caster lands on the chosen point, the
+            // area hit is around it. The reach is the row's _kRange (6 m), not a description value.
+            ["HesperusLit"] = (DisplaceKind.CasterToPoint, -2),
             ["HighspeedSlide"] = (DisplaceKind.CasterForward, 0),
             ["HighspeedSlideMecha"] = (DisplaceKind.CasterForward, 0),
             ["PinpointAttack"] = (DisplaceKind.CasterForward, 3),
@@ -463,17 +466,28 @@ public sealed partial class CombatService
         if (!Displacements.TryGetValue(Script(row), out var rule)) return null;
         var (effect, ms) = MovementEffect(GameData.Int(row, "_iScriptShow"));
         if (effect == 0) return null;
-        float distance = rule.DescIndex < 0 ? 1 // (inferred) "pulling them in front of you": 1 m ahead of the caster
+        float distance = rule.DescIndex == -2 ? (float)(Numbers(row, "_kRange").FirstOrDefault(0) / 100)
+            : rule.DescIndex < 0 ? 1 // (inferred) "pulling them in front of you": 1 m ahead of the caster
             : (float)Numbers(row, "_kDescData").ElementAtOrDefault(rule.DescIndex);
         return distance > 0 ? (rule.Kind, distance, effect, ms) : null;
     }
 
     private async Task MoveCasterAsync(GameSession s, ActiveSkillCast action)
     {
-        if (Displacement(action.Row) is not { Kind: DisplaceKind.CasterForward or DisplaceKind.CasterBack } move) return;
+        if (Displacement(action.Row) is not { Kind: DisplaceKind.CasterForward or DisplaceKind.CasterBack or DisplaceKind.CasterToPoint } move) return;
         float face = action.Request.Face + (move.Kind == DisplaceKind.CasterBack ? 180 : 0);
         double angle = face * Math.PI / 180;
-        var end = WalkableEnd(s.SceneEntry, s.Position, (float)Math.Sin(angle) * move.Distance, (float)Math.Cos(angle) * move.Distance);
+        float dx = (float)Math.Sin(angle) * move.Distance, dz = (float)Math.Cos(angle) * move.Distance;
+        if (move.Kind == DisplaceKind.CasterToPoint)
+        {
+            // The leap goes to the chosen point, no further than the skill's reach, along the way the caster can walk.
+            if (action.Request.TargetPos is not { } point) return;
+            dx = point.X - s.Position.X; dz = point.Z - s.Position.Z;
+            float length = MathF.Sqrt(dx * dx + dz * dz);
+            if (length < 0.05f) return;
+            if (length > move.Distance) { dx *= move.Distance / length; dz *= move.Distance / length; }
+        }
+        var end = WalkableEnd(s.SceneEntry, s.Position, dx, dz);
         var start = s.Position.Clone();
         await ToPlayerAndViewersAsync(s, SkillMove, new SkillStartMoveNotify
         {

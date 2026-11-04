@@ -27,7 +27,7 @@ namespace Ro3Emu.Server.Game;
 /// </summary>
 public sealed partial class SeasonTalentService
 {
-    private const long AttrOp = 1, BuffOp = 2, BuffDictRefOp = 12, WeaponAttrOp = 16, SkillLevelAttrOp = 19, PendantAttrOp = 20,
+    private const long AttrOp = 1, BuffOp = 2, ProfessionBuffOp = 6, BuffDictRefOp = 12, WeaponAttrOp = 16, SkillLevelAttrOp = 19, PendantAttrOp = 20,
         SkillParameterOp = 21, WeaponSkillAttrOp = 22;
 
     /// <summary>
@@ -75,6 +75,12 @@ public sealed partial class SeasonTalentService
                 {
                     case [AttrOp, var attr, var value]:
                         yield return (attr, value);
+                        break;
+                    // [6, buff]: the effect of a chosen profession (Season Talent type 6/7 nodes) is a permanent buff; its flat
+                    // _kChangeAttri counts like any talent attribute (its skill tuples are SkillEffects').
+                    case [ProfessionBuffOp, var buff] when BuffConfig.Get(_data, buff) is { } professionBuff:
+                        foreach (var change in professionBuff.ChangeAttri)
+                            if (change is [var attr, var value]) yield return (attr, value);
                         break;
                     case [WeaponAttrOp, var weapon, var attr, var value]
                         when SkillParameterRules.Wields(s, _data, weapon) && once.Add((WeaponAttrOp, attr, value, 0)):
@@ -125,6 +131,11 @@ public sealed partial class SeasonTalentService
                     else if (op is [SkillParameterOp, var weapon, 0, var group, var type, var operation, var value, ..] && group > 0)
                         modifiers.Add((weapon, 0, new SkillParameterRules.Modifier((int)group, (int)type, (int)operation, value,
                             op.Length > 7 ? (int)op[7] : 0)));
+                    else if (op is [ProfessionBuffOp, var professionBuff])
+                    {
+                        // A profession's permanent buff selects the skill's enhanced MODE (BuffConfig type 15) and the like.
+                        foreach (var modifier in SkillParameterRules.BuffModifiers(_data, (int)professionBuff)) modifiers.Add((0, 0, modifier));
+                    }
                     else if (op is [BuffOp, var buff])
                     {
                         foreach (var modifier in SkillParameterRules.BuffModifiers(_data, (int)buff)) modifiers.Add((0, 0, modifier));
