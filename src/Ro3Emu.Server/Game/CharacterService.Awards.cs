@@ -30,7 +30,7 @@ public sealed partial class CharacterService
 
     /// <summary>Loot: several items / currencies at once, one bag sync, marked new (no float: the drop notify shows them).</summary>
     public Task GrantAsync(GameSession session, IReadOnlyList<(int Entry, int Count)> items, Func<bool>? stillOwner = null) =>
-        GrantBoundAsync(session, items.Select(i => (i.Entry, i.Count, Bind: 0)).ToList(), stillOwner);
+        GrantBoundAsync(session, [.. items.Select(i => (i.Entry, i.Count, Bind: 0))], stillOwner);
 
     /// <summary>Quest grants preserve AwardConfig's bind flag; bound and unbound stacks remain separate.</summary>
     public async Task GrantBoundAsync(GameSession session, IReadOnlyList<(int Entry, int Count, int Bind)> items,
@@ -96,13 +96,13 @@ public sealed partial class CharacterService
         byte[]? taskRuntimeState = null, int manifestType = 1, byte[]? expectedDaily = null,
         byte[]? nextDaily = null, byte[]? expectedTasks = null, Action<RoleItemPlanBuilder>? persist = null,
         bool stateLockHeld = false, Action? committed = null, EconomyMutation? familyEconomy = null,
-        OwnedAwardSource? ownedAward = null, bool suppressRewardNotice = false)
+        OwnedAwardSource? ownedAward = null, bool suppressRewardNotice = false, IReadOnlyList<int>? rewardIndexes = null)
     {
         using var _ = stateLockHeld ? null : await LockAsync(session);
         var context = RequireOwnedRole(session);
         return await ApplyAwardCoreAsync(session, context, plan, taskBaseExp, costs, deliveredTaskState,
             taskRuntimeState, manifestType, expectedDaily, nextDaily, expectedTasks, persist, committed,
-            familyEconomy, ownedAward, suppressRewardNotice);
+            familyEconomy, ownedAward, suppressRewardNotice, rewardIndexes);
     }
 
     /// <summary>Checked owned Core: stage copied award values, commit, apply before notices.</summary>
@@ -110,13 +110,16 @@ public sealed partial class CharacterService
         long taskBaseExp, IReadOnlyList<(int Entry, int Count)>? costs, byte[]? deliveredTaskState,
         byte[]? taskRuntimeState, int manifestType, byte[]? expectedDaily, byte[]? nextDaily,
         byte[]? expectedTasks, Action<RoleItemPlanBuilder>? persist, Action? committed,
-        EconomyMutation? familyEconomy, OwnedAwardSource? ownedAward, bool suppressRewardNotice)
+        EconomyMutation? familyEconomy, OwnedAwardSource? ownedAward, bool suppressRewardNotice,
+        IReadOnlyList<int>? rewardIndexes = null)
     {
         context.AssertRole(session.Role!.Id);
         context.BindPresentation(session);
         var attachment = session.Attachment;
-        if (taskBaseExp < 0) throw new ArgumentOutOfRangeException(nameof(taskBaseExp));
-        if (manifestType is < 1 or > 19 or 15 or 18) throw new ArgumentOutOfRangeException(nameof(manifestType));
+        ArgumentOutOfRangeException.ThrowIfNegative(taskBaseExp);
+        // PBManifestType.ManifestTypeRunRing (18) needs the slots LC_DAL_Reward uses to stop the wheel.
+        if (manifestType is < 1 or > 19 or 15 || manifestType == TaskService.ManifestTypeRunRing && rewardIndexes is not { Count: > 0 })
+            throw new ArgumentOutOfRangeException(nameof(manifestType));
         if ((expectedDaily == null) != (nextDaily == null)) throw new ArgumentException("Daily award requires before and after state");
         if (expectedTasks != null && deliveredTaskState == null) throw new ArgumentException("Task comparison requires next task state");
         if (expectedDaily != null && (session.Daily == null
@@ -161,6 +164,7 @@ public sealed partial class CharacterService
         long baseExp = taskBaseExp, jobExp = 0;
         var notification = new Romsg.GetRewardNotify { TargetUid = session.Role!.Id };
         var gained = new List<(int Entry, int Count)>();
+        var gearRows = new List<(int Row, InvItem Item)>();
         var received = new HashSet<InvItem>();
         foreach (var grant in plan.Grants)
         {
@@ -203,7 +207,7 @@ public sealed partial class CharacterService
                     {
                         Entry = grant.Entry, Stack = stack, Pack = pack,
                         Sort = items.Where(i => i.Grid == 0 && i.Pack == pack).Select(i => i.Sort).DefaultIfEmpty(0).Max() + 1,
-                        BindType = grant.BindType, BindExpire = grant.ExpireTimeStamp,
+                        BindType = grant.BindType, BindExpire = grant.ExpireTimeStamp != 0 ? grant.ExpireTimeStamp : AcquireExpiry(grant.Entry),
                         Attrs = TotemAttrFactory?.Invoke(grant.Entry) ?? EmblemAttrFactory?.Invoke(grant.Entry) ?? RollAttrs(grant.Entry)
                     };
                     items.Add(item);
@@ -215,7 +219,12 @@ public sealed partial class CharacterService
                 if (IsEquipment(grant.Entry))
                 {
                     // Each gear instance may roll distinct attributes; a single aggregate popup would misstate them.
-                    foreach (var item in created) notification.Rewards.Add(ItemInfo(item));
+                    // GUIDs are assigned at commit; the row is rebuilt then (quick-equip prompt needs itemGuid).
+                    foreach (var item in created)
+                    {
+                        gearRows.Add((notification.Rewards.Count, item));
+                        notification.Rewards.Add(ItemInfo(item));
+                    }
                     continue;
                 }
             }
@@ -230,6 +239,7 @@ public sealed partial class CharacterService
         // Other ApplyAward callers have no quest delivery boundary and retain their standalone behavior.
         var decomposed = deliveredTaskState == null && ownedAward?.CommandKind != "cd13e/grant" ? new ItemAutoDecomposeTipsNtf()
             : StageAutoDecomposeAward(session, items, staged, received, beforeGrants, gained);
+        jobExp = checked(jobExp + JobExpFromBase(baseExp));
         AddVirtualReward(notification, BaseExpItem, baseExp);
         AddVirtualReward(notification, JobExpItem, jobExp);
         int oldLevel = staged.Level, oldJob = staged.JobLevel;
@@ -237,7 +247,7 @@ public sealed partial class CharacterService
         // TaskService can hold unsaved in-memory objective progress. Compare that snapshot above, then
         // use the persisted blob as the SQLite CAS baseline for this single award transaction.
         byte[]? persistedTasks = expectedTasks == null ? null : roles.LoadTasks(session.Role.Id);
-        var cardSight = StageFirstCardSight?.Invoke(session, gained.Select(g => g.Entry).ToList(), 0);
+        var cardSight = StageFirstCardSight?.Invoke(session, [.. gained.Select(g => g.Entry)], 0);
         void PublishAward()
         {
             session.Progress = staged;
@@ -342,14 +352,19 @@ public sealed partial class CharacterService
                 foreach (var handler in ProgressHandlers) await handler(session);
             }
         }
-        if (!suppressRewardNotice && notification.Rewards.Count > 0)
+        // A wheel (rewardIndexes) waits for its notice to stop and unlock, even when nothing showable was granted.
+        if (!suppressRewardNotice && (notification.Rewards.Count > 0 || rewardIndexes is { Count: > 0 }))
         {
+            foreach (var (row, item) in gearRows)
+                if (item.Guid > 0 && session.Items.Contains(item)) notification.Rewards[row] = ItemInfo(item);
             notification.RewardType.Add(manifestType);
+            if (rewardIndexes != null) notification.RewardIndexes.Add(rewardIndexes);
             await session.SendGameAsync(GetRewardNotify, notification);
         }
         if (decomposed.DecomposeItemInfo.Count > 0)
             await session.SendGameAsync(EquipmentService.ItemAutoDecomposeNotice, decomposed);
         foreach (var (entry, count) in gained) foreach (var handler in ItemGained) handler(session, entry, count);
+        foreach (var handler in ItemsAwarded) handler(session, gained);
         foreach (var handler in StateChanged) handler(session);
         return true;
     }
@@ -464,7 +479,8 @@ public sealed partial class CharacterService
             var item = new InvItem
             {
                 Entry = entry, Stack = stack, Pack = pack, Sort = NextSort(session, pack),
-                Attrs = TotemAttrFactory?.Invoke(entry) ?? EmblemAttrFactory?.Invoke(entry) ?? RollAttrs(entry), BindType = bind
+                Attrs = TotemAttrFactory?.Invoke(entry) ?? EmblemAttrFactory?.Invoke(entry) ?? RollAttrs(entry), BindType = bind,
+                BindExpire = AcquireExpiry(entry)
             };
             if (persist) itemStore.Insert(session.Role!.Id, item);
             session.Items.Add(item);

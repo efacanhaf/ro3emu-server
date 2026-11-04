@@ -43,9 +43,10 @@ public sealed class ReservationCoordinator
     private TaskCompletionSource _changed = NewSignal();
     public long Conflicts { get; private set; }
     public int Active => _held.Count;
+    internal IReadOnlyDictionary<long, ReservationKey[]> Held => _held;
     internal int WaitingWriters => _waitingWriters.Count;
     public int RecoveryRequired => _recovery.Count;
-    internal void Quarantine(string operation, IEnumerable<ReservationKey> keys) => _recovery[operation] = keys.Distinct().ToArray();
+    internal void Quarantine(string operation, IEnumerable<ReservationKey> keys) => _recovery[operation] = [.. keys.Distinct()];
     internal Task Changed => _changed.Task;
     private static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -99,7 +100,7 @@ public sealed class ReservationCoordinator
                     return [];
                 if (!entities.Contains(key.Id)) entities.Add(key.Id);
             }
-        return entities.ToArray();
+        return [.. entities];
     }
     public void Release(long operation)
     {

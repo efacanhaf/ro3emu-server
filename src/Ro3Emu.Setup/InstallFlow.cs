@@ -19,12 +19,20 @@ internal static class InstallFlow
 
         if (options.ServerFiles)
         {
-            // A server needs the game scripts and the VFS index, then only the VFS files that hold the walk maps.
+            // A server needs the game scripts and the VFS index, then only the VFS files that hold the walk maps and
+            // the panel's pictures. Pictures packed into a sprite atlas name it only once their own bundle is here: a
+            // second round fetches the atlases.
             await InstallAsync(folder, options, path => path.StartsWith("ro3_Data/StreamingAssets/Recovery/LuaPayload/", StringComparison.Ordinal)
                 || path == "ro3_Data/StreamingAssets/VFS/assetmeta.data");
-            var vfs = DataExport.GameDataExport.NavSourceFiles(folder).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            Ui.Info($"The walk maps are in {vfs.Count} VFS file(s).");
-            await InstallAsync(folder, options, vfs.Contains);
+            var vfs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int round = 0; round < 2; round++)
+            {
+                var needed = DataExport.GameDataExport.ServerSourceFiles(folder, icons: !options.NoIcons);
+                if (needed.All(vfs.Contains)) break;
+                vfs.UnionWith(needed);
+                Ui.Info($"The walk maps{(options.NoIcons ? "" : " and the panel's pictures")} are in {vfs.Count} VFS file(s).");
+                await InstallAsync(folder, options, vfs.Contains);
+            }
             Ui.Ok($"{folder} has what the server export needs.");
             return 0;
         }
@@ -49,16 +57,25 @@ internal static class InstallFlow
         return folder;
     }
 
-    private static string AskFolder()
+    /// <summary>Where a new install goes unless the player says otherwise.</summary>
+    public static string SuggestedFolder()
     {
         // The fixed drive with the most free space, in a plain folder (no Program Files: no administrator needed).
         var drive = DriveInfo.GetDrives().Where(d => d.DriveType == DriveType.Fixed && d.IsReady).OrderByDescending(d => d.AvailableFreeSpace).FirstOrDefault();
-        var suggestion = Path.Combine(drive?.RootDirectory.FullName ?? SetupHome.Root, "Games", "Ragnarok3");
-        var answer = Ui.Ask("Folder to install the game into:", suggestion);
+        return Path.Combine(drive?.RootDirectory.FullName ?? SetupHome.Root, "Games", "Ragnarok3");
+    }
+
+    private static string AskFolder()
+    {
+        var answer = Ui.Ask("Folder to install the game into:", SuggestedFolder());
         return Path.GetFullPath(answer.Trim('"'));
     }
 
-    public static async Task InstallAsync(string folder, Options options, Func<string, bool>? only = null)
+    /// <summary>
+    /// Brings <paramref name="folder"/> to the publisher's current release (only the files that differ). Ctrl+C in the
+    /// console, or <paramref name="stop"/> from the launcher, pauses it; the next run continues where it stopped.
+    /// </summary>
+    public static async Task InstallAsync(string folder, Options options, Func<string, bool>? only = null, CancellationToken stop = default)
     {
         var config = PublisherConfig.Load(SetupHome.AppDir);
         using var http = new HttpClient(new SocketsHttpHandler { AutomaticDecompression = System.Net.DecompressionMethods.All, ConnectTimeout = TimeSpan.FromSeconds(20) })
@@ -66,9 +83,9 @@ internal static class InstallFlow
             Timeout = Timeout.InfiniteTimeSpan,
         };
         http.DefaultRequestHeaders.UserAgent.ParseAdd($"RO3Emu/{typeof(InstallFlow).Assembly.GetName().Version}");
-        var installer = new ClientInstaller(config, http, SetupHome.DownloadDir) { Log = SetupLog.Write };
+        var installer = new ClientInstaller(config, http, SetupHome.DownloadDir) { Log = SetupLog.Write, Connections = 4 };
 
-        Ui.Step("Asking the official servers for the current release");
+        Ui.Step("Asking Genesis' update servers for the current release");
         ClientInstaller.Manifests manifests;
         using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(3)))
             manifests = await installer.FetchAsync(cts.Token);
@@ -100,16 +117,20 @@ internal static class InstallFlow
         if (!Ui.Confirm("Download now?")) throw new SetupException("Download cancelled.", "Run the same command again when you are ready.");
 
         Ui.Step("Downloading the game");
-        using var cancel = new CancellationTokenSource();
-        ConsoleCancelEventHandler stop = (_, e) => { e.Cancel = true; cancel.Cancel(); };
-        Console.CancelKeyPress += stop;
+        using var cancel = CancellationTokenSource.CreateLinkedTokenSource(stop);
+        ConsoleCancelEventHandler ctrlC = (_, e) => { e.Cancel = true; cancel.Cancel(); };
+        if (Ui.Sink == null) Console.CancelKeyPress += ctrlC;
         var watch = Stopwatch.StartNew();
         try { await installer.ApplyAsync(plan, folder, cancel.Token); }
+        catch (OperationCanceledException) when (stop.IsCancellationRequested)
+        {
+            throw;
+        }
         catch (OperationCanceledException)
         {
             throw new SetupException("Download stopped.", "Run the same command again: it continues where it stopped.");
         }
-        finally { Console.CancelKeyPress -= stop; }
+        finally { if (Ui.Sink == null) Console.CancelKeyPress -= ctrlC; }
         Ui.EndProgress();
         Record(folder, release.Sequence);
         Ui.Ok($"{plan.Needed.Count} files written and checked in {Ui.Duration(watch.Elapsed)}");
@@ -165,11 +186,11 @@ internal static class InstallFlow
             while (_window.Count > 2 && t - _window.Peek().T > 10) _window.Dequeue();
             if (_shown.ElapsedMilliseconds < 250 && done < total) return;
             _shown.Restart();
-            if (total <= 0) { Ui.Progress(stage + "..."); return; }
+            if (total <= 0) { Ui.Progress(stage, 0, 0, stage + "..."); return; }
             var (t0, b0) = _window.Peek();
             double speed = t - t0 > 0.5 ? (done - b0) / (t - t0) : 0;
             var eta = speed > 0 ? Ui.Duration(TimeSpan.FromSeconds((total - done) / speed)) : "...";
-            Ui.Progress($"{stage}: {Ui.Size(done)} of {Ui.Size(total)} ({done * 100 / total}%)  {Ui.Size((long)speed)}/s  {eta} left");
+            Ui.Progress(stage, done, total, $"{stage}: {Ui.Size(done)} of {Ui.Size(total)} ({done * 100 / total}%)  {Ui.Size((long)speed)}/s  {eta} left");
         }
     }
 }
@@ -188,6 +209,9 @@ internal sealed class OptionsWithClient(Options options, string client)
         if (o.Home != null) args.AddRange(["--home", o.Home]);
         args.AddRange(["--http-port", o.Ports.Http.ToString(), "--micro-port", o.Ports.MicroGate.ToString(), "--game-port", o.Ports.GameGate.ToString()]);
         if (o.Ports.Voice > 0) args.AddRange(["--voice-port", o.Ports.Voice.ToString()]);
-        return args.ToArray();
+        if (o.Ports.Panel > 0) args.AddRange(["--panel-port", o.Ports.Panel.ToString(System.Globalization.CultureInfo.InvariantCulture)]);
+        else args.Add("--no-panel");
+        if (o.PurchaseUrl != null) args.AddRange(["--purchase-url", o.PurchaseUrl]);
+        return [.. args];
     }
 }

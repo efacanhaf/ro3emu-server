@@ -106,6 +106,7 @@ public sealed class TerritoryPvpTests : IAsyncLifetime
         long enemyId = (long)enemy.Self!.Uuid, allyId = (long)ally.Self!.Uuid;
         Assert.Equal(Session(attacker).WorldScene, Session(enemy).WorldScene);
 
+        await SwingWait.UntilDoneAsync(Service<GameLoop>(), Session(attacker), enemyId);
         await attacker.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1000001, TargetId = enemyId });
         Assert.Equal(3022, (await Next(attacker, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
 
@@ -130,10 +131,13 @@ public sealed class TerritoryPvpTests : IAsyncLifetime
             // out-of-combat regeneration tick while the wire requests below are in flight.
             victim.LastCombatMs = MonsterService.NowMs;
             victim.StatusBits |= 1L << 15;
+            victim.NoRegenUntilMs = long.MaxValue; // fighting does not pause regeneration
         });
 
+        await SwingWait.UntilDoneAsync(Service<GameLoop>(), Session(attacker), allyId);
         await attacker.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1000001, TargetId = allyId });
         Assert.Equal(3022, (await Next(attacker, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
+        await SwingWait.UntilDoneAsync(Service<GameLoop>(), Session(attacker), enemyId);
         await attacker.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1000001, TargetId = enemyId });
         Assert.Equal(0, (await Next(attacker, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
         var hit = await Next(attacker, CombatService.SkillHit, SkillHitInfo.Parser,
@@ -147,6 +151,7 @@ public sealed class TerritoryPvpTests : IAsyncLifetime
         Assert.Equal(1, dealt[0].Amount); // Effective HP loss, not overkill or absorbed damage.
         Assert.Equal(1, killed);
 
+        await SwingWait.UntilDoneAsync(Service<GameLoop>(), Session(attacker), enemyId);
         await attacker.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1000001, TargetId = enemyId });
         Assert.Equal(3022, (await Next(attacker, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
 
@@ -157,11 +162,13 @@ public sealed class TerritoryPvpTests : IAsyncLifetime
         Assert.True(await Service<GameLoop>().InvokeAsync(() => Service<SceneService>().EnterSceneAsync(Session(enemy), 30303)));
         var scene = await Next(enemy, MsgId.SwitchSceneLine, SwitchSceneLineResp.Parser, s => s.SceneEntry == 30303);
         Assert.True(Session(enemy).SceneLoading);
+        await SwingWait.UntilDoneAsync(Service<GameLoop>(), Session(attacker), enemyId);
         await attacker.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1000001, TargetId = enemyId });
         Assert.Equal(3022, (await Next(attacker, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
         await enemy.SendGameAsync(MsgId.SceneLoaded, new SceneLoadedReq { SceneId = scene.SceneEntry });
         Assert.Equal(0, (await Next(enemy, MsgId.SceneLoaded, SceneLoadedResp.Parser)).Result);
         await Next(enemy, MsgId.EntitySelf, EntitySelf.Parser);
+        await SwingWait.UntilDoneAsync(Service<GameLoop>(), Session(attacker), enemyId);
         await attacker.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1000001, TargetId = enemyId });
         Assert.Equal(3022, (await Next(attacker, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
     }
@@ -196,6 +203,7 @@ public sealed class TerritoryPvpTests : IAsyncLifetime
             await Service<CharacterService>().SetHpSpAsync(target, 1, null);
             target.LastCombatMs = MonsterService.NowMs;
             target.StatusBits |= 1L << 15;
+            target.NoRegenUntilMs = long.MaxValue; // fighting no longer pauses regeneration
             await Service<BuffService>().AddSupportAsync(target, 2354401, 30000, 1L << 51, shield);
             Assert.Equal(shield, Service<CharacterService>().Stats(target)[2003]);
         });
@@ -260,6 +268,7 @@ public sealed class TerritoryPvpTests : IAsyncLifetime
             await character.SetHpSpAsync(target, maximum, null);
             target.LastCombatMs = MonsterService.NowMs;
             target.StatusBits |= 1L << 15;
+            target.NoRegenUntilMs = long.MaxValue; // fighting no longer pauses regeneration
             var buffs = Service<BuffService>();
             await buffs.AddAsync(target, 1430501, 30000, target.Role!.Id);
             if (revokeDuringShield) await buffs.AddSupportAsync(target, 2354401, 30000, 1L << 51, 1);
@@ -329,9 +338,11 @@ public sealed class TerritoryPvpTests : IAsyncLifetime
                 if (a == source && b == target) attributedKills++;
                 return Task.CompletedTask;
             });
+            target.NoRegenUntilMs = long.MaxValue; // a recovery tick would lift this 1 HP out of one lethal hit
             await Service<CharacterService>().SetHpSpAsync(target, 1, null);
         });
 
+        await SwingWait.UntilDoneAsync(Service<GameLoop>(), Session(attacker), victimId);
         await attacker.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1000001, TargetId = victimId });
         Assert.Equal(0, (await Next(attacker, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
         await Next(victim, CombatService.EntityBaseChange, EntityBase.Parser,
@@ -380,13 +391,15 @@ public sealed class TerritoryPvpTests : IAsyncLifetime
                 return Task.CompletedTask;
             });
             target.LastCombatMs = MonsterService.NowMs;
-            target.StatusBits |= 1L << 15; // This pending-hit assertion excludes unrelated out-of-combat regeneration.
+            target.StatusBits |= 1L << 15;
+            target.NoRegenUntilMs = long.MaxValue; // fighting no longer pauses regeneration
             await Service<CharacterService>().SetHpSpAsync(target, 1, null);
         });
 
         await target.StateLock.WaitAsync();
         try
         {
+            await SwingWait.UntilDoneAsync(Service<GameLoop>(), Session(attacker), victimId);
             await attacker.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1000001, TargetId = victimId });
             Assert.Equal(0, (await Next(attacker, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
             await landed.Task.WaitAsync(Wait);
@@ -426,10 +439,13 @@ public sealed class TerritoryPvpTests : IAsyncLifetime
             firstSession.Progress!.Skills[12013] = 1;
             secondSession.Progress!.Skills[12013] = 1;
             await Service<CharacterService>().SetLevelAsync(victimSession, 99, null);
-            await Service<CharacterService>().SetHpSpAsync(victimSession, 180, null);
+            await Service<CharacterService>().SetLevelAsync(firstSession, 99, null); // defense counts the attacker's level (DefenseFactor)
+            await Service<CharacterService>().SetLevelAsync(secondSession, 99, null);
+            await Service<CharacterService>().SetHpSpAsync(victimSession, 300, null);
             victimSession.LastCombatMs = MonsterService.NowMs;
-            victimSession.StatusBits |= 1L << 15; // hold off the five-second out-of-combat regen during the overlap fixture
-            Assert.Equal(180, victimSession.CurrentHp);
+            victimSession.StatusBits |= 1L << 15;
+            victimSession.NoRegenUntilMs = long.MaxValue; // fighting no longer pauses regeneration
+            Assert.Equal(300, victimSession.CurrentHp);
             var position = victimSession.Position;
             var probe = await Service<MonsterService>().SpawnSingleAsync(victimSession.SceneEntry, 5000001,
                 new MapPoint(position.X, position.Y, position.Z, 0));
@@ -464,7 +480,7 @@ public sealed class TerritoryPvpTests : IAsyncLifetime
             await first.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1201301, TargetPos = victimSession.Position.Clone() });
             Assert.Equal(0, (await Next(first, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
             await held.Task.WaitAsync(Wait); // the first AoE reserved HP, then its real monster callback yielded
-            Assert.True(victimSession.CurrentHp is > 0 and < 180,
+            Assert.True(victimSession.CurrentHp is > 0 and < 300,
                 $"first reserved HP={victimSession.CurrentHp}, dead={victimSession.Dead}, dealt={dealt.Count}");
             Assert.False(victimSession.Dead);
 
@@ -518,6 +534,7 @@ public sealed class TerritoryPvpTests : IAsyncLifetime
             });
         });
 
+        await SwingWait.UntilDoneAsync(Service<GameLoop>(), Session(attacker), first.Uid);
         await attacker.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1000001, TargetId = first.Uid });
         Assert.Equal(0, (await Next(attacker, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
         await firstKilled.Task.WaitAsync(Wait);
@@ -532,6 +549,7 @@ public sealed class TerritoryPvpTests : IAsyncLifetime
                 new MapPoint(at.X, at.Y, at.Z, 0)))!;
             Assert.NotNull(second);
         });
+        await SwingWait.UntilDoneAsync(Service<GameLoop>(), Session(attacker), second.Uid);
         await attacker.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1000001, TargetId = second.Uid });
         Assert.Equal(0, (await Next(attacker, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
         await secondDamaged.Task.WaitAsync(Wait);

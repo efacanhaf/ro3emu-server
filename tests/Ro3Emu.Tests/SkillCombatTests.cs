@@ -18,7 +18,7 @@ public sealed partial class SkillCombatTests : IAsyncLifetime
     private string _http = "";
     private GameLoop Loop => _app.Services.GetRequiredService<GameLoop>();
     private CharacterService Character => _app.Services.GetRequiredService<CharacterService>();
-    private GameSession Session(string name) => _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Account == name.ToLowerInvariant());
+    private GameSession Session(string name) => _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => string.Equals(s.Account, name, StringComparison.OrdinalIgnoreCase));
 
     public async Task InitializeAsync()
     {
@@ -53,7 +53,7 @@ public sealed partial class SkillCombatTests : IAsyncLifetime
     private async Task Gm(string account, string line)
     {
         using var client = new HttpClient();
-        (await client.PostAsync($"{_http}/ro3emu/gm?account={account}", new StringContent(line))).EnsureSuccessStatusCode();
+        (await client.PostAsync($"{_http}/ro3emu/gm?account={account}", Operator.Command(line))).EnsureSuccessStatusCode();
     }
     private static string RepoRoot()
     {
@@ -61,7 +61,41 @@ public sealed partial class SkillCombatTests : IAsyncLifetime
         while (dir != null && !File.Exists(Path.Combine(dir.FullName, "Ro3Emu.slnx"))) dir = dir.Parent;
         return dir?.FullName ?? throw new DirectoryNotFoundException();
     }
-    private Task Teach(string name, int group) => Loop.InvokeAsync(() => { Session(name).Progress!.Skills[group] = 1; return Task.CompletedTask; });
+    /// <summary>
+    /// Learns the skill under the character's StateLock. A GM !lvl or !job leaves follow-up work (a quest reward, a
+    /// level-up award) that stages a copy of the progress under that lock and publishes it on commit: a skill written
+    /// beside it, without the lock, was dropped when a loaded run let that commit land after it (3002 SkillNotLearned).
+    /// </summary>
+    private Task Teach(string name, int group) => Loop.InvokeAsync(async () =>
+    {
+        var session = Session(name);
+        using var held = await CharacterService.Lock(session);
+        session.Progress!.Skills[group] = 1;
+        // The weapon the row's _iSkillCondition asks: without it the server refuses the cast, as the client does.
+        if (AskedWeapon(group) is { } weapon && !session.Items.Any(i => i.Grid is 1 or 2 && i.Entry == weapon))
+            session.Items.Add(new Ro3Emu.Server.Accounts.InvItem { Guid = 990100 + group, Entry = weapon, Stack = 1, Grid = 1 });
+    });
+
+    /// <summary>An item of the first weapon subtype (LC_ConditionList [2001, subtype]) the group's first row asks, if any.</summary>
+    private int? AskedWeapon(int group)
+    {
+        var data = _app.Services.GetRequiredService<Ro3Emu.Server.Data.GameData>();
+        if (Ro3Emu.Server.Data.Config.SkillConfig.Get(data, group * 100 + 1) is not { SkillCondition: not 0 } row
+            || Ro3Emu.Server.Data.Config.LCConditionList.Get(data, row.SkillCondition) is not { } node) return null;
+        long? subType = FirstEquipLeaf(node);
+        return subType == null ? null : (int)data.Table("ItemConfig").Values.Select(r => new Ro3Emu.Server.Data.Config.ItemConfig(r))
+            .First(item => item.SubType == subType && item.EquipPart > 0).Id;
+    }
+
+    private static long? FirstEquipLeaf(Ro3Emu.Server.Data.Config.LCConditionList node)
+    {
+        if (node.Type == 3) return node.Data is [2001, var subType, ..] ? subType : null;
+        if (node.SubConditionList is not { ValueKind: System.Text.Json.JsonValueKind.Array } subs) return null;
+        foreach (var sub in subs.EnumerateArray())
+            if (FirstEquipLeaf(new Ro3Emu.Server.Data.Config.LCConditionList(sub)) is { } found) return found;
+        return null;
+    }
+
     private Task<MonsterUnit> Target(string name, bool stationary = false, int npcId = 5000001) => Loop.InvokeAsync(async () =>
     {
         var s = Session(name);
@@ -71,7 +105,8 @@ public sealed partial class SkillCombatTests : IAsyncLifetime
         {
             template = monsters.Template(npcId);
             Assert.NotNull(template);
-            template = template with { RoamDistance = 0 };
+            // A stationary dummy neither roams nor walks out to a surround slot (MonsterService.Surround).
+            template = template with { RoamDistance = 0, SurroundDistance = 0 };
         }
         var result = await monsters.SpawnSingleAsync(s.SceneEntry, npcId,
             new MapPoint(s.Position.X, s.Position.Y, s.Position.Z, 0), s.InstanceId, customTemplate: template);
@@ -271,6 +306,21 @@ public sealed partial class SkillCombatTests : IAsyncLifetime
     }
 
     [ClientDataFact]
+    public async Task GroundUnitDamageCountsForItsCasterInTheStatistics()
+    {
+        await using var alice = await InWorld("Alice");
+        await Gm("alice", "!job 2100"); await Teach("alice", 12010);
+        var target = await Target("alice", stationary: true);
+        await alice.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1201001, TargetPos = target.Pos.Clone() });
+        Assert.Equal(0, (await Next(alice, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
+        long caster = (long)alice.Self!.Uuid;
+        var tick = await Next(alice, CombatService.SkillHit, SkillHitInfo.Parser, x => x.SrcID != caster && x.Dsts.Any(d => d.DstID == target.Uid));
+        var report = await Next(alice, CombatService.DamageStatistics, DamageStatisticsNotify.Parser, n => n.Damages.Any(d => d.DamageTargetId == target.Uid));
+        Assert.Equal(caster, Assert.Single(report.Damages).DamageSourceId);
+        Assert.Equal(tick.SkillId, report.Damages[0].SkillId);
+    }
+
+    [ClientDataFact]
     public async Task HealSelectsAllyAndInsufficientSpDoesNotStartCooldown()
     {
         await using var alice = await InWorld("Alice"); await using var bob = await InWorld("Bob");
@@ -280,8 +330,9 @@ public sealed partial class SkillCombatTests : IAsyncLifetime
         var accepted = await Next(alice, CombatService.UseSkill, CastSkillRsp.Parser);
         Assert.Equal(0, accepted.Result);
         var hit = await Next(alice, CombatService.SkillHit, SkillHitInfo.Parser, x => x.SessionId == accepted.SessionId);
-        Assert.Equal((long)bob.Self.Uuid, Assert.Single(hit.Dsts).DstID); Assert.Equal(DamageType.Heal, hit.Dsts[0].DamageType);
+        Assert.Equal(DamageType.Heal, Assert.Single(hit.Dsts, d => d.DstID == (long)bob.Self.Uuid).DamageType); // "for you and the designated ST ally"
         await Task.Delay(600);
+        Session("alice").NoRegenUntilMs = long.MaxValue; // a recovery tick would pay for the refused cast
         await Loop.InvokeAsync(() => Character.SetHpSpAsync(Session("alice"), null, 0));
         await alice.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1400101 });
         Assert.Equal(ErrorCodes.SkillCostShort, (await Next(alice, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
@@ -300,6 +351,7 @@ public sealed partial class SkillCombatTests : IAsyncLifetime
         var settled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         await Loop.InvokeAsync(async () =>
         {
+            player.NoRegenUntilMs = long.MaxValue; // a recovery tick would lift this 1 HP out of one lethal hit
             await Character.SetHpSpAsync(player, 1, null);
             combat.TakenAsync.Add(async (_, target, _) =>
             {
@@ -437,6 +489,7 @@ public sealed partial class SkillCombatTests : IAsyncLifetime
             await _app.Services.GetRequiredService<SceneService>().TeleportInMapAsync(b,
                 new MapPoint(a.Position.X, a.Position.Y, a.Position.Z, b.Face));
             await _app.Services.GetRequiredService<BuffService>().AddAsync(b, 2052101, 60000, b.Role.Id);
+            b.NoRegenUntilMs = long.MaxValue; // the exact HP below must not meet a recovery tick
             await Character.SetHpSpAsync(b, 1, null);
             await Character.SetHpSpAsync(a, null, long.MaxValue);
             a.SkillCds.Clear(); a.SkillModeCds.Clear();
@@ -543,9 +596,14 @@ public sealed partial class SkillCombatTests : IAsyncLifetime
         await Loop.InvokeAsync(() => { Assert.Equal(moved.EndPos, session.Position); return Task.CompletedTask; });
     }
 
+    /// <summary>WalkReq.dir from one point to another: degrees, 0 = +z, clockwise toward +x.</summary>
+    private static float Toward(Vec3 from, Vec3 to) =>
+        (float)((Math.Atan2(to.X - from.X, to.Z - from.Z) * 180 / Math.PI + 360) % 360);
+
     [ClientDataFact]
     public async Task ACasterStillWalkingIntoRangeIsAcceptedAndAStandingOneOutOfRangeIsNot()
     {
+        // The walk carries its direction (WalkReq.dir, what other clients are shown): the range slack lies along it.
         // In-game 11.10: the client sends the attack on reaching range and its stop 13 ms later; the server measured
         // from the last walk's start and refused 3024 on most approaches.
         await using var alice = await InWorld("Alice");
@@ -562,7 +620,7 @@ public sealed partial class SkillCombatTests : IAsyncLifetime
 
         long speed = await Loop.InvokeAsync(() => Task.FromResult(Session("alice").Speed));
         Assert.True(speed >= 400, $"speed {speed}"); // 0.5 s below covers the 1.5 m beyond range at ≥ 4 m/s
-        await alice.SendGameAsync(MsgId.Walk, new WalkReq { Pos = away, Dir = 180, Face = 180, SpeedRate = 1 });
+        await alice.SendGameAsync(MsgId.Walk, new WalkReq { Pos = away, Dir = Toward(away, start), Face = Toward(away, start), SpeedRate = 1 });
         await Task.Delay(500);
         await alice.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1000001, TargetId = target.Uid, ComboIndex = 1 });
         var accepted = await Next(alice, CombatService.UseSkill, CastSkillRsp.Parser);
@@ -591,7 +649,7 @@ public sealed partial class SkillCombatTests : IAsyncLifetime
         // Walk until 2 m from the target: 7 m, longer than 0.75 s at this speed.
         int walkMs = (int)(7 / (speed / 100.0) * 1000);
         Assert.True(walkMs > 900, $"speed {speed}");
-        await alice.SendGameAsync(MsgId.Walk, new WalkReq { Pos = away, Dir = 180, Face = 180, SpeedRate = 1 });
+        await alice.SendGameAsync(MsgId.Walk, new WalkReq { Pos = away, Dir = Toward(away, start), Face = Toward(away, start), SpeedRate = 1 });
         await Task.Delay(walkMs);
         await alice.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1000001, TargetId = target.Uid, ComboIndex = 1 });
         var accepted = await Next(alice, CombatService.UseSkill, CastSkillRsp.Parser);
@@ -609,6 +667,7 @@ public sealed partial class SkillCombatTests : IAsyncLifetime
         // and UnitConfig[31007]._iCollisionType is None, so the client's target radius is 0.
         await using var alice = await InWorld("Alice");
         await Gm("alice", "!job 3100");
+        await HoldInMainHand("alice", Bow);
         var target = await Target("alice", stationary: true, npcId: 5000007);
         var aoi = await Next(alice, GameAoiSink.SyncAoiView, AoIViewChangeData.Parser,
             view => view.Bases.Any(b => b.Uuid == (ulong)target.Uid));

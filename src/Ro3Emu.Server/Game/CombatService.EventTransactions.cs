@@ -1,3 +1,5 @@
+using System.Text.Json;
+using Romsg;
 using Ro3Emu.Server.Maps;
 using Ro3Emu.Server.Accounts;
 using Ro3Emu.Server.Game.Ownership;
@@ -12,11 +14,11 @@ internal sealed class EventSettlementOutcomeUnknownException(string message, Exc
 public sealed partial class CombatService
 {
     /// <summary>E05e: frozen event entitlement precedes lethal wire publication; ordinary kill callbacks retain their order.</summary>
-    public List<Func<GameSession, MonsterUnit, long, Task>> BeforeLethalPublication { get; } = new();
+    public List<Func<GameSession, MonsterUnit, long, Task>> BeforeLethalPublication { get; } = [];
     /// <summary>Finalize a committed event death even when the initiating attachment stopped during commit.</summary>
-    public List<Func<MonsterUnit, Task>> AfterLethalPublication { get; } = new();
+    public List<Func<MonsterUnit, Task>> AfterLethalPublication { get; } = [];
     /// <summary>Undo unpublished combat-side scores when the event source is proven absent.</summary>
-    public List<Action<MonsterUnit>> LethalHitRolledBack { get; } = new();
+    public List<Action<MonsterUnit>> LethalHitRolledBack { get; } = [];
     internal Action<MonsterUnit, long, long>? LethalRollbackObservedForTest { get; set; }
 
     internal void RestoreUnpublishedLethalHit(MonsterUnit monster, long beforeHp)
@@ -36,7 +38,7 @@ public sealed partial class CombatService
                 || !ReferenceEquals(killer.Attachment, attachment) || attachment?.Cancelled == true
                 || killer.SceneLoading || killer.SceneGeneration != sceneGeneration
                 || killer.WorldScene != worldScene || killer.WorldScene != monster.WorldScene
-                || !_sessions.All().Contains(killer))
+                || !_sessions.Contains(killer))
                 throw new OperationCanceledException("Retained kill lost its original reward recipient.");
             await CommitMonsterDeathAsync(killer, monster, beforeHp, monster.StagedLethalDamage,
                 role, attachment, sceneGeneration, worldScene);
@@ -53,7 +55,7 @@ public sealed partial class CombatService
         bool CurrentCaster() => role != null && ReferenceEquals(killer.Role, role)
             && ReferenceEquals(killer.Attachment, attachment)
             && killer.SceneGeneration == sceneGeneration && killer.WorldScene == worldScene
-            && !killer.SceneLoading && _sessions.All().Contains(killer);
+            && !killer.SceneLoading && _sessions.Contains(killer);
         if (!monster.DeathDurable) throw new InvalidOperationException("Retained death lacks its ordinary reward barrier.");
         try
         {
@@ -68,7 +70,12 @@ public sealed partial class CombatService
         }
     }
     /// <summary>Durable event scores complete before their corresponding hit is published.</summary>
-    public List<Func<GameSession, GameSession, long, bool, Task>> PvpDealtAsync { get; } = new();
-    public List<Func<GameSession, MonsterUnit, long, Task>> EventDamageRecorded { get; } = new();
-    public List<Func<GameSession, long, Task>> HealedAsync { get; } = new();
+    public List<Func<GameSession, GameSession, long, bool, Task>> PvpDealtAsync { get; } = [];
+    /// <summary>A player's hit on a player, with its row, what the attacker's cards see: the attacker, the target, the row, what it took
+    /// and whether it was lethal (CardEffects).</summary>
+    internal List<Func<GameSession, GameSession, JsonElement, long, bool, Task>> PvpHitLanded { get; } = [];
+    /// <summary>A player's hit on a player before it commits: the attacker, the row, its result, the damage (CardEffects).</summary>
+    internal List<Func<GameSession, JsonElement, DamageHitResult, long, long>> PvpDamageAdjusters { get; } = [];
+    public List<Func<GameSession, MonsterUnit, long, Task>> EventDamageRecorded { get; } = [];
+    public List<Func<GameSession, long, Task>> HealedAsync { get; } = [];
 }

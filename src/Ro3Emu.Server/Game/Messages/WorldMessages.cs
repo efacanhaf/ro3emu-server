@@ -5,7 +5,7 @@ using Romsg;
 namespace Ro3Emu.Server.Game;
 
 /// <summary>The world around the role: scenes, combat targets, MVPs, world interaction, revival and the territory war.</summary>
-public sealed class WorldMessages(Maps.World world, CombatService combat, SceneService scene, MvpService mvps, TowerService tower, DungeonService dungeons, WorldCoreService worldCore, WorldCommonService common, WorldInteractionService interaction, TimedBattleService timedBattles, FestivalService festival, GuildHomeService guildHome, DraculaWeddingService dracula, TrainingService training, TerritoryWarsService territory, TerritoryEscortService escort, GuildLeagueService league) : Messaging.IMessageModule
+public sealed class WorldMessages(Maps.World world, CombatService combat, SceneService scene, MvpService mvps, TowerService tower, DungeonService dungeons, WorldCoreService worldCore, WorldCommonService common, WorldInteractionService interaction, TimedBattleService timedBattles, FestivalService festival, GuildHomeService guildHome, DraculaWeddingService dracula, TrainingService training, TerritoryWarsService territory, TerritoryEscortService escort, GuildLeagueService league, CasualBattleService casual) : Messaging.IMessageModule
 {
     private const uint ChangeViewCfg = 30007, SyncMiniMapStatus = 31043, SceneGetLineInfo = 70009;
 
@@ -20,6 +20,8 @@ public sealed class WorldMessages(Maps.World world, CombatService combat, SceneS
         routes.AdmitRole(id => id is WorldInteractionService.Action or WorldInteractionService.SeatChange
             or WorldInteractionService.VehicleSync);
         routes.AdmitRole(id => id is WorldCoreService.ReliveItem); // owns the role payment and the exclusive revive claim
+        // The chat typing state changes only the sender's own unit custom data, shown to its viewers.
+        routes.AdmitRole(id => id is WorldCoreService.TypeDown);
 
         // Siege, territory battle and an ordinary dungeon answer the same statistics requests; escort cargo and
         // territory pickups are NPCs behind the ordinary interaction.
@@ -32,6 +34,19 @@ public sealed class WorldMessages(Maps.World world, CombatService combat, SceneS
         routes.Intercept("territory/battle", DungeonStatistics, territory.SharedAsync);
         routes.Intercept("escort/actors", id => id is 32287 || NpcInteraction(id), escort.HandleSharedAsync); // guild goods, cargo NPCs
         routes.Intercept("territory/world", NpcInteraction, territory.WorldSharedAsync);
+        // A siege cannon is an NPC of the siege room; its operator's buttons are 32703.
+        routes.Intercept("territory/cannon", id => NpcInteraction(id) || id == WorldInteractionService.Action,
+            territory.CannonSharedAsync);
+        // So are the siege's bag NPCs, which open the war bag.
+        routes.Intercept("territory/siege-bag", NpcInteraction, territory.SiegeBagSharedAsync);
+        // Mock Battle's supply boxes are NPCs of its room.
+        routes.Intercept("casual/supply", NpcInteraction, casual.SupplySharedAsync);
+        // A Madogear rider's buttons, seat changes and facing (after the territory's own riders).
+        routes.Intercept("casual/madogear", id => id is WorldInteractionService.Action or WorldInteractionService.SeatChange
+            or WorldInteractionService.VehicleSync, casual.MadogearSharedAsync);
+        // A war vehicle is an NPC of the siege room too; its riders' buttons, seat changes and facing follow it.
+        routes.Intercept("territory/vehicle", id => NpcInteraction(id) || id is WorldInteractionService.Action
+            or WorldInteractionService.SeatChange or WorldInteractionService.VehicleSync, territory.VehicleSharedAsync);
 
         routes.Map(1031, "common", async (session, msgId, body) =>
         {
@@ -109,6 +124,10 @@ public sealed class WorldMessages(Maps.World world, CombatService combat, SceneS
         {
             await worldCore.ItemReviveAsync(session);
         });
+        routes.Map(WorldCoreService.TypeDown, "worldCore", async (session, msgId, body) =>
+        {
+            await worldCore.TypeDownAsync(session, GuildVoiceTypeDownMessageReq.Parser.ParseFrom(body.Span));
+        });
         routes.Map(WorldCoreService.FlySwitch, "worldCore", async (session, msgId, body) =>
         {
             await worldCore.FlySwitchAsync(session, FlySwitchReq.Parser.ParseFrom(body.Span));
@@ -133,6 +152,10 @@ public sealed class WorldMessages(Maps.World world, CombatService combat, SceneS
             if (!await training.TryEnterAsync(session, dungeonRequest) && !await festival.TryEnterAsync(session, dungeonRequest) && !await timedBattles.TryEnterOnePieceAsync(session, dungeonRequest) && !await guildHome.TryEnterViaDungeonAsync(session, dungeonRequest)
                 && !await dracula.TryEnterAsync(session, dungeonRequest))
                 await dungeons.EnterAsync(session, dungeonRequest);
+        });
+        routes.Map(DraculaWeddingService.Watch, "territory", async (session, msgId, body) =>
+        {
+            await dracula.WatchAsync(session, DungeonWatchChangeTargetReq.Parser.ParseFrom(body.Span));
         });
         routes.Map(TowerService.LeaveDungeon, "territory", async (session, msgId, body) =>
         {
@@ -204,6 +227,7 @@ public sealed class WorldMessages(Maps.World world, CombatService combat, SceneS
             if (await timedBattles.TryRefuseReliveAsync(session)) return; // Survivor Battle revives with 82661
             if (await territory.ReviveAsync(session, EntityReliveReq.Parser.ParseFrom(body.Span), combat)) return;
             if (await league.ReviveAsync(session)) return;
+            if (await casual.ReviveAsync(session, EntityReliveReq.Parser.ParseFrom(body.Span), combat)) return;
             if (session.DungeonAttempt != null) await dungeons.ReviveAsync(session, EntityReliveReq.Parser.ParseFrom(body.Span));
             else await combat.ReviveAsync(session, EntityReliveReq.Parser.ParseFrom(body.Span));
         });

@@ -27,6 +27,8 @@ public sealed partial class CharacterService
         session.DungeonSyncMinute = 0;
         var progress = roles.LoadProgress(role.Id);
         session.Progress = progress;
+        session.GmAllFunctionsOpen = roles.LoadGmState(role.Id) is { Length: > 0 } gm
+            && JsonSerializer.Deserialize<GmCommands.RoleGmState>(gm)?.AllFunctionsOpen == true; // GM panel openallfunc
         session.Pets = null; // The next role's pets load before 5056; never reuse a previous role's stat contributions.
         session.Items = itemStore.Load(role.Id);
         session.BagState = new RoleBagState(roles.LoadBagState(role.Id));
@@ -41,6 +43,7 @@ public sealed partial class CharacterService
         LoadStatPlans(session);
         MigrateEquipmentInstances(session);
         MigrateCardPackItems(session);
+        MigrateAcquireTimeBoundItems(session);
         session.EquipLevels = roles.LoadEquipLevels(role.Id) is { } levels ? System.Text.Json.JsonSerializer.Deserialize<EquipLevels>(levels) ?? new() : new();
         LoadEquipmentPlans(session);
         session.AutoDecompose = roles.LoadAutoDecompose(role.Id) is { } setting ? AutoDecomposeSetting.Parser.ParseFrom(setting) : new();
@@ -50,6 +53,13 @@ public sealed partial class CharacterService
         session.SyncVersions.Clear();
         // Stats are current before the selection awaits anything: the loop may tick this session meanwhile.
         Refresh(session);
+    }
+
+    /// <summary>GM panel openallfunc: every function counts as open for the role, now and at its later logins.</summary>
+    internal void OpenAllFunctions(GameSession session)
+    {
+        roles.SaveGmState(session.Role!.Id, JsonSerializer.SerializeToUtf8Bytes(new GmCommands.RoleGmState { AllFunctionsOpen = true }));
+        session.GmAllFunctionsOpen = true;
     }
 
     /// <summary>The rest of <see cref="Load"/>: a new role's starter kit.</summary>
@@ -74,6 +84,10 @@ public sealed partial class CharacterService
             var tx = roles.NewTransaction();
             int receipt = tx.ItemDelta(role.Id, before, session.Items);
             tx.Progress(role.Id, progress);
+            // The kit and its Zeny enter the economy ledger as starter grants (EconomyReason.StarterGrant), so the
+            // panel's duplication check sees where a new character's first items came from.
+            tx.WithEconomy(FamilyEconomy(session, StarterKitEconomyKind, [], StarterKit,
+                new { Operation = "starter-kit", Items = session.Items, Progress = progress }));
             var items = session.Items;
             await roles.CommitAsync(tx, "character/starter-kit", receipts =>
             {
@@ -103,7 +117,7 @@ public sealed partial class CharacterService
             var item = old.Clone();
             if (item.Attrs == null || !item.Attrs.ContainsKey(AttrAppraise))
             {
-                item.Attrs ??= RollAttrs(item.Entry) ?? new();
+                item.Attrs ??= RollAttrs(item.Entry) ?? [];
                 item.Attrs[AttrAppraise] = 1;
             }
             if (EquipmentAffixes.NeedsLegacyEntries(item, data)) EquipmentAffixes.Appraise(item, data);
@@ -124,7 +138,29 @@ public sealed partial class CharacterService
             role: session.Role!.Id, items: [item]))).ToArray();
         var receipts = roles.Commit(builder, "character/equipment-migration");
         for (int i = 0; i < additions.Count; i++) additions[i].Guid = ((long[])receipts[inserted[i]]!)[0];
-        session.Items = session.Items.Select(i => replacements.GetValueOrDefault(i.Guid, i)).Concat(additions).ToList();
+        session.Items = [.. session.Items.Select(i => replacements.GetValueOrDefault(i.Guid, i)), .. additions];
+    }
+
+    /// <summary>
+    /// (inferred) An _iTimeBoundEnum 1 instance obtained while the end was not stored has none, and the client shows it as
+    /// expired (AcquireExpiry). It was never usable, so it gets one full duration from this login; the stored end makes
+    /// this happen once.
+    /// </summary>
+    private void MigrateAcquireTimeBoundItems(GameSession session)
+    {
+        var stamped = new Dictionary<long, InvItem>();
+        foreach (var old in session.Items.Where(i => i.BindExpire == 0))
+            if (AcquireExpiry(old.Entry) is var end and not 0)
+            {
+                var item = old.Clone();
+                item.BindExpire = end;
+                stamped[item.Guid] = item;
+            }
+        if (stamped.Count == 0) return;
+        var builder = roles.NewTransaction();
+        foreach (var item in stamped.Values) builder.ItemUpdate(item);
+        roles.Commit(builder, "character/time-bound-migration");
+        session.Items = [.. session.Items.Select(i => stamped.GetValueOrDefault(i.Guid, i))];
     }
 
     /// <summary>Full syncs of the role datasets, after role select (5066 must precede 5009: currency merges into it).</summary>

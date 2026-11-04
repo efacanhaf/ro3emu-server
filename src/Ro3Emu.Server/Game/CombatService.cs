@@ -11,11 +11,18 @@ namespace Ro3Emu.Server.Game;
 /// <summary>A player's running auto-attack: the server repeats the normal attack.</summary>
 public sealed class AttackLoop
 {
+    public long OutOfReachSinceMs { get; set; }
     public required MonsterUnit Target { get; init; }
-    public required int SkillId { get; init; }
+    public required int SkillId { get; set; }
     public long NextSwingMs { get; set; }
-    public float StartX { get; init; }
-    public float StartZ { get; init; }
+    public float StartX { get; set; }
+    public float StartZ { get; set; }
+    /// <summary>Started while the player still walked: the stop that follows at once is where the loop really starts.</summary>
+    public bool StartedWalking { get; set; }
+    public long StartMs { get; init; }
+    /// <summary>The walk speed (m/s) and the last walk message when the loop started (CombatService.PlayerMoved).</summary>
+    public float ArrivalSpeed { get; init; }
+    public DateTime WalkFromUtc { get; init; }
 }
 
 /// <summary>
@@ -39,6 +46,8 @@ public sealed partial class CombatService : IGameTicker
 
     private const int AttrStatus = 2701;
     private const long FightBit = 1L << 15;           // eObjectStateBattling (16)
+    private const long CutSceneProtectionMs = 120_000;
+    private const long AttackOutOfReachMs = 3000; // (inferred) a loop on a target it cannot reach ends instead of waiting for ever
     private const long OutOfCombatMs = 10000;          // PublicParamConfig.OutOfCombatTime
     private const long RegenIntervalMs = 5000;         // PublicParamConfig.AutoRecoverInterval
     public const uint SkillCdUpdate = 31113;
@@ -61,21 +70,21 @@ public sealed partial class CombatService : IGameTicker
     private long _regenSlot = -1;
     /// <summary>Monsters whose fight bit is set: the out-of-combat check walks these instead of every unit of every
     /// map each tick. Entries leave on the clear or when the unit leaves the world.</summary>
-    private readonly HashSet<MonsterUnit> _fightingMonsters = new();
+    private readonly HashSet<MonsterUnit> _fightingMonsters = [];
 
     /// <summary>A monster died by this player: rewards (RewardService), quest kill targets (TaskService).</summary>
-    public List<Func<GameSession, MonsterUnit, Task>> Killed { get; } = new();
+    public List<Func<GameSession, MonsterUnit, Task>> Killed { get; } = [];
     /// <summary>E04: freeze and commit the lethal source/entitlement before publishing a lethal hit or corpse.</summary>
-    public List<Func<GameSession, MonsterUnit, Task>> BeforeKilled { get; } = new();
+    public List<Func<GameSession, MonsterUnit, Task>> BeforeKilled { get; } = [];
     private sealed class InstanceDeathGate
     {
         internal readonly SemaphoreSlim Semaphore = new(1, 1);
         internal int Users;
     }
-    private readonly Dictionary<long, InstanceDeathGate> _instanceDeathGates = new();
+    private readonly Dictionary<long, InstanceDeathGate> _instanceDeathGates = [];
     private sealed class LethalFinalization { internal int Started; }
     private readonly System.Runtime.CompilerServices.ConditionalWeakTable<MonsterUnit, LethalFinalization>
-        _finalizedLethalPublications = new();
+        _finalizedLethalPublications = [];
 
     private async Task FinalizeLethalPublicationAsync(MonsterUnit monster)
     {
@@ -94,7 +103,7 @@ public sealed partial class CombatService : IGameTicker
             && ReferenceEquals(player.Attachment, attachment) && attachment?.Cancelled != true
             && !player.SceneLoading && player.SceneGeneration == sceneGeneration
             && player.WorldScene == worldScene && player.WorldScene == monster.WorldScene
-            && _sessions.All().Contains(player);
+            && _sessions.Contains(player);
         InstanceDeathGate? gate = null;
         if (monster.InstanceId != 0)
         {
@@ -159,7 +168,7 @@ public sealed partial class CombatService : IGameTicker
             && ReferenceEquals(player.Attachment, attachment) && attachment?.Cancelled != true
             && !player.SceneLoading && player.SceneGeneration == sceneGeneration
             && player.WorldScene == worldScene && player.WorldScene == monster.WorldScene
-            && _sessions.All().Contains(player);
+            && _sessions.Contains(player);
         try
         {
             if (monster.Hp == 0) monster.StagedLethalDamage = damage;
@@ -198,7 +207,7 @@ public sealed partial class CombatService : IGameTicker
         bool CanPublish() => current() && player.Owner?.State != Ownership.RoleOwnerState.RecoveryRequired;
         if (!monster.DeathDurable || monster.KillObserversStarted || !CanPublish()) return;
         monster.KillObserversStarted = true; // reserve the one callback pass across awaited observers
-        foreach (var handler in Killed)
+        foreach (var handler in Killed.ToArray()) // a service built lazily during a handler adds its own
         {
             if (!CanPublish()) break;
             try { await handler(player, monster); }
@@ -207,36 +216,45 @@ public sealed partial class CombatService : IGameTicker
     }
 
     /// <summary>Dungeon owners settle a loss after authoritative player death (inferred).</summary>
-    public List<Func<GameSession, Task>> PlayerDied { get; } = new();
+    public List<Func<GameSession, Task>> PlayerDied { get; } = [];
     /// <summary>A death some owner publishes its own 30112 for (a dungeon run's revive rule, a territory battle's
     /// countdown): the generic 30-second notice is not sent then. Two notices with different times reached the
     /// client before (seen in the traffic of a dungeon death).</summary>
-    public List<Func<GameSession, bool>> ReviveInfoOwners { get; } = new();
+    public List<Func<GameSession, bool>> ReviveInfoOwners { get; } = [];
 
     /// <summary>A tower-owned type-7 actor died; TowerService sends 32809 and replaces it from the saved party.</summary>
-    public List<Func<TowerPetUnit, Task>> TowerPetDied { get; } = new();
+    public List<Func<TowerPetUnit, Task>> TowerPetDied { get; } = [];
 
     /// <summary>A player damaged a monster (MVP statistics).</summary>
-    public List<Action<GameSession, MonsterUnit, long>> Dealt { get; } = new();
+    public List<Action<GameSession, MonsterUnit, long>> Dealt { get; } = [];
 
     /// <summary>Territory objective/cart owner observes committed monster HP before kill settlement.</summary>
-    public List<Func<GameSession, MonsterUnit, long, Task>> MonsterDamageApplied { get; } = new();
+    public List<Func<GameSession, MonsterUnit, long, Task>> MonsterDamageApplied { get; } = [];
 
     /// <summary>Territory and escort owners observe effective hostile-player damage and its lethal transition.</summary>
-    public List<Action<GameSession, GameSession, long, bool>> PvpDealt { get; } = new();
-    public List<Func<GameSession, GameSession, Task>> PlayerKilled { get; } = new();
+    public List<Action<GameSession, GameSession, long, bool>> PvpDealt { get; } = [];
+    public List<Func<GameSession, GameSession, Task>> PlayerKilled { get; } = [];
     public Func<GameSession, GameSession, bool>? PlayerHostile { get; set; }
     public Func<GameSession, MonsterUnit, bool>? MonsterTargetAllowed { get; set; }
-    public Func<GameSession, MonsterUnit, Vec3, Vec3, bool>? BlockedMonsterEndpointAllowed { get; set; }
+    /// <summary>
+    /// Whether something stands between the caster and the target of a skill that walls stop (_iPassBlock 2): the
+    /// monster aimed at (null for a ground or player target), the caster's and the target's positions. Unset, nothing
+    /// does (see <see cref="ValidateTarget"/>).
+    /// </summary>
+    public Func<GameSession, MonsterUnit?, Vec3, Vec3, bool>? SkillLineBlocked { get; set; }
 
     /// <summary>A monster damaged a player; the flag says the hit was lethal (MVP statistics).</summary>
-    public List<Action<MonsterUnit, GameSession, long, bool>> Taken { get; } = new();
+    public List<Action<MonsterUnit, GameSession, long, bool>> Taken { get; } = [];
+
+    /// <summary>A boss special's area landed (each hit moment): the boss, the skill, the cast's origin, the area's centre and
+    /// the facing it was marked with. A raid trial's breakers use it (DungeonService.RaidTrials: Drake's barrels).</summary>
+    internal List<Func<MonsterUnit, BossSkill, Vec3, Vec3, float, Task>> BossAreaLanded { get; } = [];
 
     /// <summary>Effective self-skill healing for authoritative dungeon statistics (MG_Common.RoleStatisticsInfo).</summary>
-    public List<Action<GameSession, long>> Healed { get; } = new();
+    public List<Action<GameSession, long>> Healed { get; } = [];
 
     // Totem passives need the row and final target before the existing post-hit event loses that context.
-    public List<Func<GameSession, JsonElement, Task>> CastLanded { get; } = new();
+    public List<Func<GameSession, JsonElement, Task>> CastLanded { get; } = [];
     /// <summary>After a player's own cast applied its effects, with the monsters it processed and its published hit (each
     /// target's result, the allies it healed) (TalentProcs).</summary>
     internal List<Func<GameSession, ActiveSkillCast, IReadOnlyList<MonsterUnit>, SkillHitInfo, Task>> CastResolved { get; } = [];
@@ -245,15 +263,41 @@ public sealed partial class CombatService : IGameTicker
     internal Func<GameSession, JsonElement, int, JsonElement>? TargetCountRow { get; set; }
     /// <summary>May the caster's skill put this _kBuff1 buff on the recipient (TalentProcs: talent-gated buffs).</summary>
     internal Func<GameSession, GameSession, int, bool>? SkillBuffAllowed { get; set; }
-    public List<Func<GameSession, MonsterUnit, JsonElement, DamageHitResult, long, long>> DamageAdjusters { get; } = new();
-    public List<Func<GameSession, MonsterUnit, JsonElement, long, long>> ExtraHitDamage { get; } = new();
-    public List<Func<GameSession, MonsterUnit, JsonElement, long, Task>> DealtAsync { get; } = new();
-    public List<Func<GameSession, long, long>> ExtraHeal { get; } = new();
-    public List<Func<MonsterUnit, GameSession, DamageHitResult, long, Task<long>>> IncomingDamageAdjusters { get; } = new();
-    public List<Func<MonsterUnit, GameSession, long, Task>> TakenAsync { get; } = new();
-    public List<Func<GameSession, Task>> PlayerRevived { get; } = new();
+    public List<Func<GameSession, MonsterUnit, JsonElement, DamageHitResult, long, long>> DamageAdjusters { get; } = [];
+    public List<Func<GameSession, MonsterUnit, JsonElement, long, long>> ExtraHitDamage { get; } = [];
+    public List<Func<GameSession, MonsterUnit, JsonElement, long, Task>> DealtAsync { get; } = [];
+    public List<Func<GameSession, long, long>> ExtraHeal { get; } = [];
+    public List<Func<MonsterUnit, GameSession, DamageHitResult, long, Task<long>>> IncomingDamageAdjusters { get; } = [];
+    public List<Func<MonsterUnit, GameSession, long, Task>> TakenAsync { get; } = [];
+    /// <summary>The amount about to fall on a player, before any share, shield or lethal rule: the player, the row (a tick's buff row,
+    /// null without one), whether it is a skill's or a swing's hit rather than a tick, an environment or a fixed amount, the damage.</summary>
+    internal List<Func<GameSession, JsonElement?, bool, long, long>> PlayerDamageAdjusters { get; } = [];
+    public List<Func<GameSession, Task>> PlayerRevived { get; } = [];
     /// <summary>A match owner decides which skills a participant may cast (true/false), or defers (null).</summary>
     public Func<GameSession, int, bool?>? MatchSkillRule { get; set; }
+    /// <summary>
+    /// A skill a feature owns outright (the war commander's): null for any other skill, else 0 to cast it or the refusal.
+    /// Such a cast skips the job-tree check and the SkillConfig cooldowns; <see cref="OwnSkillCast"/> runs in their place
+    /// once the cast is accepted, and <see cref="OwnSkillLanded"/> resolves it instead of the generic effects.
+    /// </summary>
+    public Func<GameSession, int, int?>? OwnSkillAdmit { get; set; }
+    public Func<GameSession, int, Task>? OwnSkillCast { get; set; }
+    public Func<GameSession, JsonElement, Task>? OwnSkillLanded { get; set; }
+
+    /// <summary>
+    /// Runs once a player's own cast is accepted, before its timeline starts, and returns the milliseconds that cast must
+    /// wait. MountService gets a system-mount rider off first (the client holds a skill until the unit is off one,
+    /// LC_State_Unit_Skill.InitSkillState), so the dismount plays and the hit follows. The cast is never refused.
+    /// </summary>
+    public Func<GameSession, Task<int>>? BeforeCast { get; set; }
+
+    /// <summary>
+    /// Skills a player may cast without learning them, resolved like any other (a war vehicle seat's skills,
+    /// VehicleSeatConfig _kMainSkills / _kSkills); their cooldowns are the ordinary SkillConfig ones.
+    /// </summary>
+    public List<Func<GameSession, int, bool>> GrantedSkill { get; } = [];
+    /// <summary>The player fires this skill from a seat with a crosshair (DungeonService.Cannon): the client names what it aims at.</summary>
+    public Func<GameSession, int, bool>? AimsFromSeat { get; set; }
     /// <summary>World-core owns the dead player's explicit accept/decline invitation.</summary>
     public Func<GameSession, GameSession, JsonElement, Task>? ReviveOffer { get; set; }
     public Func<GameSession, int>? ReviveCheck { get; set; }
@@ -292,10 +336,13 @@ public sealed partial class CombatService : IGameTicker
         scene.Leaving.Add(ClearSceneSkillProtocolAsync);
         skills.QueueEligibility = CanQueueSkill;
         character.ProgressHandlers.Add(buffs.ReconcileEnergyAsync);
+        CastResolved.Add(ReadingExtraCastAsync);
+        CastResolved.Add(ClassLoopsOnCastAsync);
         monsters.AttackPet = MonsterAttackPetAsync;
         buffs.UnitChanged.Add(PublishTowerPetStatsAsync);
         WireBuffRules();
         WireBossSkills();
+        WireCompanions();
     }
 
     private static long Now => MonsterService.NowMs;
@@ -308,13 +355,36 @@ public sealed partial class CombatService : IGameTicker
         _log.LogDebug("{Name} locks {Target}", s.Role?.Name, req.EnemyId);
     }
 
-    /// <summary>The template's damage EffectData (hit fx + flinch): the first with m_kDamage in [show*100, show*100+99].</summary>
+    /// <summary>
+    /// The template's hit EffectData (hit fx, flinch, hit sound) for SkillHitInfo.showPoint: the first in
+    /// [show*100, show*100+99] whose m_kDamage has m_kActionDamge, else the first with any m_kDamage.
+    /// LC_DamageHelper.CalcDamageHitPoint reads only m_kActionDamge from the show point, so a bullet entry there (Fire
+    /// Bolt 1200411, Lightning Bolt 1200503, Double Strafe 1300304) showed no hit; the bullet goes in 31120 instead
+    /// (<see cref="BulletEffect"/>).
+    /// </summary>
+    /// <summary>A heal's hit effect. HitEffect's fallback 1000002 plays ReceivingDamage, so a healed ally flinched: EffectData 14007800 and its family (show * 1000 + 800) hold only
+    /// the heal's own effect. Then any of the show's effects with no hit reaction, then none (inferred).</summary>
+    private int HealEffect(long scriptShow)
+    {
+        var effects = _data.SkillTemplateTable("Lua_Config_EffectData");
+        long own = scriptShow * 1000 + 800;
+        if (SkillEffectData.Find(effects, own) is { HasDamage: true }) return (int)own;
+        for (long id = scriptShow * 100; id < scriptShow * 100 + 100; id++)
+            if (SkillEffectData.Find(effects, id) is { HasDamage: true, HasHitReaction: false }) return (int)id;
+        return 0;
+    }
+
     private int HitEffect(long scriptShow)
     {
         var effects = _data.SkillTemplateTable("Lua_Config_EffectData");
+        int first = 0;
         for (long id = scriptShow * 100; id < scriptShow * 100 + 100; id++)
-            if (effects.TryGetValue(id.ToString(), out var e) && e.TryGetProperty("m_kDamage", out _)) return (int)id;
-        return 1000002;
+        {
+            if (SkillEffectData.Find(effects, id) is not { HasDamage: true } effect) continue;
+            if (effect.HasHitReaction) return (int)id;
+            if (first == 0) first = (int)id;
+        }
+        return first != 0 ? first : 1000002;
     }
 
     /// <summary>
@@ -372,7 +442,7 @@ public sealed partial class CombatService : IGameTicker
                     .OrderBy(m => MonsterService.Distance(pet.X, pet.Z, m.X, m.Z)).Take(limit).ToList()
                 : !target.Dead && target.Hp > 0 && target.InstanceId == pet.InstanceId
                     && MonsterService.Distance(pet.X, pet.Z, target.X, target.Z) <= pet.AttackSkills.First(s => s.Id == skillId).Range + 2f
-                    ? new List<MonsterUnit> { target } : [];
+                    ? [target] : [];
             if (targets.Count == 0) return;
             var stats = pet.CombatStats;
             var attacker = new Fighter(stats[103], stats[104], stats[109], stats[111], pet.Level, pet.Element);
@@ -533,7 +603,11 @@ public sealed partial class CombatService : IGameTicker
             if (MonsterService.Distance(m, p) > m.Template.AttackRange + 2f || !_buffs.CanSeePosition(m, p.Position)) return; // stepped away
             var stats = _character.Stats(p);
             var attacker = MonsterFighter(m);
-            var defender = new Fighter(0, 0, 0, 0, p.Progress!.Level, 1) { Def = stats[105], Mdef = stats[106], Flee = stats[110], ResCri = stats[112] };
+            var defender = new Fighter(0, 0, 0, 0, p.Progress!.Level, ArmorElement(p))
+            {
+                Def = stats[105], Mdef = stats[106], Flee = stats[110], ResCri = stats[112], FixedDamage = (p.GmCombat & GmCombatSwitches.FixedDamage) != 0,
+                Attributes = PlayerAttributes(p, stats), Race = PlayerRace, Size = PlayerSize,
+            };
             var row = _data.Row("SkillConfig", m.Template.NormalSkill);
             var (damage, result) = row is { } r ? Damage(attacker, defender, r) : (Math.Max(1, m.Template.Atk), DamageHitResult.Normal);
             damage = ScaleMonsterDamage(damage, m.DamageRatio);
@@ -545,16 +619,17 @@ public sealed partial class CombatService : IGameTicker
                     && p.WorldScene == targetScene && m.WorldScene == targetScene
                     && p.SceneGeneration == targetGeneration && ReferenceEquals(p.Attachment, targetLease)
                     && targetLease?.Cancelled != true,
-                sourceElement: m.Template.Element);
+                sourceElement: m.Template.Element, directHit: true);
             if (committed == null) return;
             (damage, long hp, _, long shieldDamage) = committed.Value;
             try
             {
                 foreach (var handler in Taken) handler(m, p, damage, hp == 0);
+                await ReactToHitAsync(p, m, null, row, damage);
                 var hit = new SkillHitInfo
                 {
                     SrcID = m.Uid, SkillId = m.Template.NormalSkill, ShowPoint = 1000002, SessionId = session, SrcElement = m.Template.Element,
-                    Dsts = { new DamageInfo { DstID = p.Role.Id, Damage = damage, SheildDamage = shieldDamage, HitResult = result, DstElement = 1, IsDead = hp == 0 } },
+                    Dsts = { new DamageInfo { DstID = p.Role.Id, Damage = damage, SheildDamage = shieldDamage, HitResult = result, DstElement = ArmorElement(p), IsDead = hp == 0 } },
                 };
                 await _world.ToUnitViewersAsync(m, SkillHit, hit);
                 if (!m.Viewers.Contains(p)) await p.SendGameAsync(SkillHit, hit);
@@ -574,21 +649,27 @@ public sealed partial class CombatService : IGameTicker
 
     /// <summary>One protected HP transition for monster and event hits; reserve lethal state before publication.</summary>
     private async Task<(long Damage, long Hp, long Effective, long ShieldDamage)?> CommitPlayerDamageAsync(GameSession target, long damage, JsonElement? row,
-        Func<bool>? valid = null, int sourceElement = 1)
+        Func<bool>? valid = null, int sourceElement = 1, bool directHit = false)
     {
         var targetRole = target.Role;
         using var held = await CharacterService.Lock(target);
         if (target.Dead || targetRole == null || !ReferenceEquals(target.Role, targetRole) || target.SceneLoading
             || valid?.Invoke() == false) return null;
+        // Owner's decision 2.11, deliberately past 1:1 (the client has no such rule): no damage during a cutscene, at most 120 s.
+        if (damage > 0 && target.InCutScene && target.CutSceneSinceMs > 0 && Now - target.CutSceneSinceMs <= CutSceneProtectionMs) damage = 0;
+        if (damage > 0) foreach (var adjust in PlayerDamageAdjusters) damage = adjust(target, row, directHit, damage);
+        damage = ShareDevotedDamage(target, damage);
         // A missed/fully absorbed hit must not spend a finite Safety Wall charge.
-        if (damage > 0 && (_buffs.HasForbidden(target, ForbiddenState.Damage) || await GroundProtectsAsync(target, row))) damage = 0;
+        // GmUnlimit's invincibility (inferred): the hit lands as 0, like a Safety Wall.
+        if (damage > 0 && ((target.GmCombat & GmCombatSwitches.Unlimited) != 0 || _buffs.HasForbidden(target, ForbiddenState.Damage)
+            || await GroundProtectsAsync(target, row))) damage = 0;
         if (row is { } incomingSkill) damage = GuardianNormalAttackResistance(target, incomingSkill, damage);
         // (inferred) Support damage reductions precede the finite shield and lethal-hit handling.
         damage = ApplyPetSupportResistance(damage, target.Buffs.Where(b => b.ExpireMs > Now
                 && (b.SourceId is >= TowerPetUnit.UidBase and < TowerPetUnit.UidLimit || b.IsGuardianOwned))
             .SelectMany(b => b.Changes).Select(c => (c.Attr, c.Value)), row, sourceElement);
         long beforeShield = damage;
-        damage = await _buffs.AbsorbAsync(target, damage);
+        damage = await _buffs.AbsorbAsync(target, damage, SkillShieldRules.IsMagic(row));
         long shieldDamage = beforeShield - damage;
         if (!ReferenceEquals(target.Role, targetRole) || target.SceneLoading || valid?.Invoke() == false) return null;
         long before = _character.Stats(target)[2000];
@@ -618,53 +699,126 @@ public sealed partial class CombatService : IGameTicker
         public long Mdef { get; init; }
         public long Flee { get; init; }
         public long ResCri { get; init; }
+        /// <summary>A GM with GmDamageFix on: hits it deals or takes skip the DamageFloat roll.</summary>
+        public bool FixedDamage { get; init; }
+        /// <summary>A player's attribute sheet for <see cref="DamageAttributes"/>; a monster's buffs go through its own stats.</summary>
+        public Func<int, long>? Attributes { get; init; }
+        public int Race { get; init; }
+        public int Size { get; init; }
+        public DamageAttributes.Kind Kind { get; init; }
+    }
+
+    /// <summary>Every JobConfig row has _iRace 2 (Demi-Human) and _iSize 2 (Medium).</summary>
+    private const int PlayerRace = 2, PlayerSize = 2;
+
+    /// <summary>What a hit reads on a player: the sheet without the buffs that have their own path and would count twice.</summary>
+    private Func<int, long> PlayerAttributes(GameSession p, StatSheet stats)
+    {
+        if (!p.Buffs.Any(BuffService.HasOwnDamagePath)) return id => stats[id];
+        var own = _buffs.OwnDamagePathAttributes(p);
+        return id => stats[id] - own[id];
     }
 
     private (long Damage, DamageHitResult Result) Damage(Fighter a, Fighter b, JsonElement skill, int branch = 0,
         double bonusCrit = 0, bool forceCrit = false)
     {
-        // A skill that never misses (_iSkillHit 10000) draws no hit roll, as before.
-        if (GameData.Int(skill, "_iSkillHit") < 10000 && Rolls.Hit() >= HitRate(a, b, skill)) return (0, DamageHitResult.Miss);
-        double dmg = BaseDamage(a, b, skill, branch, out bool magic);
-        dmg *= 0.97 + Rolls.DamageFloat() * 0.06; // DamageFloat [9700, 10300]
+        if (!NeverMisses(skill) && Rolls.Hit() >= HitRate(a, b, skill)) return (0, DamageHitResult.Miss);
+        double dmg = BaseDamage(a, b, skill, branch, out _);
+        if (!a.FixedDamage && !b.FixedDamage) dmg *= 0.97 + Rolls.DamageFloat() * 0.06; // DamageFloat [9700, 10300]
         var result = DamageHitResult.Normal;
-        // (inferred) Miguel's guardian crit bonus (bonusCrit/forceCrit) also lets a magic hit crit; nothing else changes.
-        if (forceCrit || (!magic || bonusCrit > 0) && Rolls.Crit() < CritRate(a, b, skill) + bonusCrit)
+        // A magic hit crits as well (owner's decision 2.11): its row's _iSkillCri decides, 1166 of them carry 10000.
+        if (forceCrit || Rolls.Crit() < CritRate(a, b, skill) + bonusCrit)
         {
-            dmg *= 1.5; // FormulaParamCriDmg 15000
+            dmg *= CritMultiplier(a, b);
             result = DamageHitResult.Critical;
         }
         return (Math.Max(1, (long)Math.Round(dmg)), result);
     }
 
     // Hit: dodge = FLEE/(FLEE + ParHit 600), attacker HIT adds back; HitRateRange [0.3, 1]; _iSkillHit 10000 never misses.
-    private static double HitRate(Fighter a, Fighter b, JsonElement skill) => GameData.Int(skill, "_iSkillHit") >= 10000 ? 1
+    private static double HitRate(Fighter a, Fighter b, JsonElement skill) => NeverMisses(skill) ? 1
         : Math.Clamp(1 - b.Flee / (double)(b.Flee + 600) + a.Hit / (double)(a.Hit + 600) * 0.5, 0.3, 1.0);
 
+    /// <summary>
+    /// _iSkillHit 10000 never misses (inferred). The data sets it per row: nearly every damaging skill, physical and
+    /// magic, and 444 monster normal attacks carry 10000; the players' normal attacks and 55 monster ones (MVP swings,
+    /// GvG and Pet Tower monsters) carry 0 and roll against FLEE. So FLEE dodges players and those monsters, not the
+    /// rest, as the data was set up (#bug-reports "163 FLEE, every attack hits" is that rule, not a bug).
+    /// </summary>
+    internal static bool NeverMisses(JsonElement skill) => new Data.Config.SkillConfig(skill).SkillHit >= 10000;
+
     private static double CritRate(Fighter a, Fighter b, JsonElement skill) =>
-        Math.Max(0, a.Cri - b.ResCri) / 10000.0 * GameData.Int(skill, "_iSkillCri") / 10000.0;
+        Math.Max(0, Math.Max(0, a.Cri - b.ResCri) + (a.Attributes?.Invoke(DamageAttributes.CritChance) ?? 0) - (b.Attributes?.Invoke(DamageAttributes.CritChanceTaken) ?? 0))
+            / 10000.0 * GameData.Int(skill, "_iSkillCri") / 10000.0;
+
+    private static double CritMultiplier(Fighter a, Fighter b) => DamageAttributes.CritMultiplier(
+        a.Attributes?.Invoke(DamageAttributes.CritDamage) ?? 0, b.Attributes?.Invoke(DamageAttributes.CritDamageTaken) ?? 0);
+
+    /// <summary>SkillConfig._iAffectByArrow selects the equipped arrow ItemConfig._kParam1 element.</summary>
+    internal int AttackElement(GameSession source, JsonElement row)
+    {
+        var skill = new Data.Config.SkillConfig(row);
+        if (skill.AffectByArrow != 0 && source.BagState.Info.CurrentArrowID is var arrowId and > 0
+            && Data.Config.ItemConfig.Get(_data, arrowId) is { } arrow && int.TryParse(arrow.Param1, out int element)
+            && element is >= 1 and <= 10) return element;
+        if (skill.IsNormalAttack(_data) && ElementFromBuff(source) is var buffed and > 0) return buffed;
+        return (int)Math.Max(1, skill.EleType);
+    }
 
     /// <summary>The roll-free part of a hit: skill ratio and flat, defense and element.</summary>
-    private double BaseDamage(Fighter a, Fighter b, JsonElement skill, int branch, out bool magic)
+    private double BaseDamage(Fighter a, Fighter b, JsonElement skill, int branch, out bool magic, bool attack = true)
     {
         magic = GameData.Int(skill, "_iDmgType") == 2;
         var ratios = Numbers(skill, "_kDamageParam1");
         var flats = Numbers(skill, "_kDamageParam2");
         double p1 = ratios.Length > branch ? ratios[branch] : 10000, p2 = flats.Length > branch ? flats[branch] : 0;
-        double dmg = (magic ? a.Matk : a.Atk) * p1 / 10000 + p2;
-        // Defense: def / (def + ParDef 20 × the defender's level), the shape of the client's damage-reduction tooltip.
-        double def = magic ? b.Mdef : b.Def;
-        dmg *= 1 - def / (def + 20.0 * Math.Max(1, b.Level));
+        // A player's _kDamageFormulaExtra raises the percentage, not the flat part.
+        double percent = a.Attributes is { } sheet ? p1 * DamageFormula.Factor(new Data.Config.SkillConfig(skill), branch, sheet) : p1;
+        double dmg = DamageSource(skill, a.Atk, a.Matk, magic) * percent / 10000 + p2 + DamageFormula.Flat(new Data.Config.SkillConfig(skill), branch);
+        long Penetration(int id) => a.Attributes?.Invoke(id) ?? 0;
+        dmg *= DefenseFactor(a.Level, magic
+            ? DamageAttributes.DefenseAfterPenetration(b.Mdef, Penetration(DamageAttributes.IgnoreMdef), Penetration(DamageAttributes.IgnoreMdefPercent))
+            : DamageAttributes.DefenseAfterPenetration(b.Def, Penetration(DamageAttributes.IgnoreDef), Penetration(DamageAttributes.IgnoreDefPercent)));
+        if (attack) dmg = Math.Max(0, dmg + DamageAttributes.FlatBonus(a.Attributes, b.Attributes, magic));
         // Element: EleConfig row = defender element, column = attacker element (/10000), clamped [0.1, 10].
         int element = (int)GameData.Int(skill, "_iEleType") is var se and > 1 ? se : a.Element;
-        return dmg * Math.Clamp(1 + ElementFactor(element, b.Element) / 10000.0, 0.1, 10);
+        dmg *= Math.Clamp(1 + ElementFactor(element, b.Element) / 10000.0, 0.1, 10);
+        if (a.Attributes == null && b.Attributes == null) return dmg;
+        var row = new Data.Config.SkillConfig(skill);
+        // A player's Element here is the hit's, and the element monster attributes (321-340) only name monsters.
+        return dmg * DamageAttributes.Factor(a.Attributes, b.Attributes, new DamageAttributes.Hit(magic, row.DistanceType == 2, !row.IsNormalAttack(_data), element,
+            a.Race, a.Size, a.Attributes == null ? a.Element : 0, b.Race, b.Size, b.Attributes == null ? b.Element : 0, a.Kind, b.Kind));
+    }
+
+    /// <summary>
+    /// What a hit's ratio multiplies. _iDmgType says it for nearly every row and always says which defense counts, but the text
+    /// names another source on two physical skills: Magic Crasher and Magic Cannon, "Physical damage equal to MATK * 60%+10", and
+    /// both Soul Destroyers, "Physical ATK*41%+Magic ATK*41%+42" (the row's one ratio, its text gives both the same).
+    /// </summary>
+    internal static double DamageSource(JsonElement skill, double atk, double matk, bool magic) => new Data.Config.SkillConfig(skill).SkillId switch
+    {
+        12201 or 14316 => matk, // 14316: Double Holy Light's "Neutral ranged Physical damage equal to your Magic ATK"
+        15210 or 15240 => atk + matk,
+        _ => magic ? matk : atk,
+    };
+
+    /// <summary>
+    /// ATK * k / (k + DEF), k = ParDef * the attacker's level. PBDubugDamageFormulaEnum names it Formula_AParDef beside
+    /// Formula_BPhysicsDef, A attacking and B hit, and LC_PlayerInfoHelper._doFormulaPhysicalDamageDec has that shape, though the
+    /// panel can only use the player's own level. BaseLvConfig holds ParDef and ParMDef at 20 for all 100 levels. (owner's decision
+    /// 2.11, inferred where the client does not compute it.)
+    /// </summary>
+    internal static double DefenseFactor(long attackerLevel, double defense)
+    {
+        double k = 20.0 * Math.Max(1, attackerLevel);
+        return k / (k + Math.Max(0, defense));
     }
 
     /// <summary>The expected damage of one hit (hit rate, mean float, crit share) from the same formula.</summary>
     private double ExpectedDamage(Fighter a, Fighter b, JsonElement skill)
     {
-        double dmg = Math.Max(1, BaseDamage(a, b, skill, 0, out bool magic));
-        return HitRate(a, b, skill) * dmg * (magic ? 1 : 1 + 0.5 * CritRate(a, b, skill));
+        double dmg = Math.Max(1, BaseDamage(a, b, skill, 0, out _));
+        return HitRate(a, b, skill) * dmg * (1 + (CritMultiplier(a, b) - 1) * Math.Min(1, CritRate(a, b, skill)));
     }
 
     /// <summary>
@@ -675,12 +829,15 @@ public sealed partial class CombatService : IGameTicker
     internal (double PlayerDps, double MonsterDps, long PlayerHp) Duel(GameSession p, MonsterTemplate m)
     {
         var stats = _character.Stats(p);
-        var playerSkill = _data.Row("SkillConfig", _skills.NormalAttack(p.Progress!.Career))!.Value;
-        var player = new Fighter(stats[103], stats[104], stats[109], stats[111], p.Progress.Level, 1);
-        var asTarget = new Fighter(0, 0, m.Flee, 0, m.Level, m.Element) { Def = m.Def, Mdef = m.Mdef, Flee = m.Flee };
+        var playerSkill = _data.Row("SkillConfig", _skills.CurrentAttack(p))!.Value;
+        var attributes = PlayerAttributes(p, stats);
+        var player = new Fighter(stats[103], stats[104], stats[109], stats[111], p.Progress!.Level, AttackElement(p, playerSkill))
+        { Attributes = attributes, Race = PlayerRace, Size = PlayerSize };
+        var asTarget = new Fighter(0, 0, m.Flee, 0, m.Level, m.Element) { Def = m.Def, Mdef = m.Mdef, Flee = m.Flee, Race = m.Race, Size = m.Size, Kind = KindOf(m) };
         double playerDps = ExpectedDamage(player, asTarget, playerSkill) * 1000.0 / Math.Max(1, SkillMs(p, playerSkill));
-        var monster = new Fighter(m.Atk, m.Matk, m.Hit, m.Cri, m.Level, m.Element);
-        var defender = new Fighter(0, 0, 0, 0, p.Progress.Level, 1) { Def = stats[105], Mdef = stats[106], Flee = stats[110], ResCri = stats[112] };
+        var monster = new Fighter(m.Atk, m.Matk, m.Hit, m.Cri, m.Level, m.Element) { Race = m.Race, Size = m.Size, Kind = KindOf(m) };
+        var defender = new Fighter(0, 0, 0, 0, p.Progress.Level, ArmorElement(p))
+        { Def = stats[105], Mdef = stats[106], Flee = stats[110], ResCri = stats[112], Attributes = attributes, Race = PlayerRace, Size = PlayerSize };
         double monsterHit = _data.Row("SkillConfig", m.NormalSkill) is { } row ? ExpectedDamage(monster, defender, row) : Math.Max(1, m.Atk);
         return (playerDps, monsterHit * 1000.0 / Math.Max(1, m.SwingIntervalMs), stats[101]);
     }
@@ -736,7 +893,7 @@ public sealed partial class CombatService : IGameTicker
             await ClearSkillsAsync(p);
             await _buffs.ClearOnDeathAsync(p);
             _log.LogInformation("{Name} died", p.Role?.Name);
-            await ToPlayerAndViewersAsync(p, EntityBaseChange, LifeState(p));
+            await PublishLifeStateAsync(p);
             if (!ReviveInfoOwners.Any(owns => owns(p)))
                 await p.SendGameAsync(ReviveInfo, new SyncClientPlayerReviveInfoNtf
                 {
@@ -767,6 +924,43 @@ public sealed partial class CombatService : IGameTicker
         return effective;
     }
 
+    /// <summary>
+    /// GmKillEntity and a GmChangeHp that takes the last HP: HP 0 and the ordinary death, past shields, lethal
+    /// prevention and GmUnlimit (inferred: a GM kill is meant to land).
+    /// </summary>
+    internal async Task KillPlayerAsync(GameSession p)
+    {
+        using (await CharacterService.Lock(p))
+        {
+            if (p.Dead || p.Role == null || p.SceneLoading) return;
+            p.CurrentHp = 0;
+            lock (_reviveClaims)
+            {
+                p.ReviveDeathSource = RewardSourceId.ProcessRun + "/" + Guid.NewGuid().ToString("N");
+                p.Dead = true;
+                _deathPublications.Add(p);
+            }
+        }
+        try
+        {
+            await _character.SetHpSpAsync(p, null, null);
+            await PlayerDiesAsync(p);
+        }
+        finally { ReleaseDeathPublication(p); }
+    }
+
+    /// <summary>
+    /// 31024 first, then 31049. LC_DAL_Team.ParseTeamMemberBattleInfo replaces a visible member's life status in every
+    /// 42051 with the unit's head info, which only 31024 sets (LC_HeadInfoManager.SetUnitLifeStatusInfo); a party card
+    /// update between the two would otherwise put the member back to Alive (or Dead after a revive) on the party frame.
+    /// </summary>
+    private async Task PublishLifeStateAsync(GameSession p)
+    {
+        await ToPlayerAndViewersAsync(p, WorldCoreService.LifeStatus, new PlayerLifeStatusNotify
+        { EntityId = p.Role!.Id, PlayerLifeStatus = p.Dead ? EPlayerLifeStatus.Dead : EPlayerLifeStatus.Alive });
+        await ToPlayerAndViewersAsync(p, EntityBaseChange, LifeState(p));
+    }
+
     private static EntityBase LifeState(GameSession p) => new()
     {
         Uuid = (ulong)p.Role!.Id,
@@ -774,6 +968,8 @@ public sealed partial class CombatService : IGameTicker
         EntityCamp = p.EventFaction > 0 ? p.EventFaction : 1,
         ElementType = 0,
         State = p.Dead ? EntityState.Dead : EntityState.Alive,
+        // A same-group unit's status goes to the party frame (LC_Scene_Sync._syncEntityBaseViewChange); unset reads as Alive.
+        PlayerLifeStatus = p.Dead ? EPlayerLifeStatus.Dead : EPlayerLifeStatus.Alive,
         NotifyType = EntityBase.Types.NotifyType.Base,
     };
 
@@ -872,13 +1068,24 @@ public sealed partial class CombatService : IGameTicker
         finally { ReleaseReviveClaim(p); }
     }
 
-    /// <summary>Publish an already committed resurrection; never changes the dead/alive state.</summary>
+    /// <summary>Test seam: runs after the first revive packet so a role handover can detach the session mid-publication.</summary>
+    internal Func<GameSession, Task>? ReviveBroadcastedForTest;
+
+    /// <summary>Publish an already committed resurrection; never changes the dead/alive state. A role handover can
+    /// detach the session (Role = null, RoleHandover.cs:100) at any await; the reconnect reloads the committed state,
+    /// so each step first checks that the role is still attached.</summary>
     public async Task PublishReviveAsync(GameSession p, MapPoint? point)
     {
-        await ToPlayerAndViewersAsync(p, EntityBaseChange, LifeState(p));
+        if (p.Role == null) return;
+        await PublishLifeStateAsync(p);
+        if (ReviveBroadcastedForTest is { } seam) await seam(p);
+        if (p.Role == null) return;
         if (point is { } at) await _scene.TeleportInMapAsync(p, at);
+        if (p.Role == null) return;
         await _character.SetHpSpAsync(p, null, null); // send committed/current health; never overwrite later damage
+        if (p.Role == null) return;
         await p.SendGameAsync(ReviveInfo, new SyncClientPlayerReviveInfoNtf { BDead = p.Dead, SceneEntry = p.SceneEntry });
+        if (p.Role == null) return;
         await RefreshRevivedAsync(p);
     }
 
@@ -900,7 +1107,14 @@ public sealed partial class CombatService : IGameTicker
                 foreach (var unit in s.SkillObjects.ToArray()) _loop.TrackRuntimeDetached("skill object tick", () => TickSkillObjectAsync(unit));
             if (s.Attack is { } a && !s.Dead && now >= a.NextSwingMs)
             {
-                if (s.SceneLoading || !CanHitMonster(s, a.Target) || MonsterService.Distance(a.Target, s) > 30)
+                bool gaveUp = false;
+                if (EffectiveSkillRow(s, a.SkillId) is { } reach && MonsterService.Distance(a.Target, s) > Range(reach) + a.Target.Template.DamageRadius + 1.5f)
+                {
+                    if (a.OutOfReachSinceMs == 0) a.OutOfReachSinceMs = now;
+                    gaveUp = now - a.OutOfReachSinceMs > AttackOutOfReachMs;
+                }
+                else a.OutOfReachSinceMs = 0;
+                if (gaveUp || s.SceneLoading || !CanHitMonster(s, a.Target) || MonsterService.Distance(a.Target, s) > 30)
                 {
                     s.Attack = null;
                     if (s.SkillCast?.Request.SkillId == a.SkillId)
@@ -911,9 +1125,9 @@ public sealed partial class CombatService : IGameTicker
                         InterruptedInfo = new SkillInterruptedInfo { Type = SkillInterruptedInfo.Types.SkillInterruptType.LockerInvalid },
                     }));
                 }
-                else if (s.SkillCast == null && EffectiveSkillRow(s, a.SkillId) is { } row && MonsterService.Distance(a.Target, s) <= Range(row) + 1.5f)
+                else if (SwingPlayedOut(s.SkillCast, now) && EffectiveSkillRow(s, a.SkillId) is { } row && MonsterService.Distance(a.Target, s) <= Range(row) + a.Target.Template.DamageRadius + 1.5f)
                 {
-                    a.NextSwingMs = now + SkillMs(s, row);
+                    a.NextSwingMs = NextSwing(a.NextSwingMs, now, SkillMs(s, row));
                     _loop.TrackRuntimeDetached("combat swing", () => SwingAsync(s, a.Target, a.SkillId, ++_sessionIds));
                 }
             }
@@ -950,17 +1164,22 @@ public sealed partial class CombatService : IGameTicker
         }
     }
 
-    /// <summary>HP/SP regeneration every 5 s out of combat: FinalReHp = ReHP + MaxHP × per_rehp (117/118, inferred).</summary>
+    /// <summary>
+    /// HP/SP regeneration every 5 s, in combat too: FinalReHp = ReHP + MaxHP × per_rehp (117/118, inferred formula).
+    /// AttributeConfig 117/118, the panel's HP/SP Recovery, read "Recovers ${1} MP every @{1} sec." with no condition; the
+    /// out-of-combat recovery is its own pair, 120/121 rest_rehp/rest_resp, "... while out of combat", not implemented here.
+    /// </summary>
     private async Task RegenAsync(GameSession s)
     {
         if (s.Role == null || s.Progress == null) return;
         using var held = await CharacterService.Lock(s);
-        if (s.Role == null || s.Progress == null || s.Dead || (s.StatusBits & FightBit) != 0) return;
+        if (s.Role == null || s.Progress == null || s.Dead || Now < s.NoRegenUntilMs) return;
         if (s.CurrentHp == null && s.CurrentSp == null) return; // unset = full (CharacterService.Stats): nothing to restore
         var st = _character.Stats(s);
         if (st[2000] >= st[101] && st[2001] >= st[102]) return;
         long rehp = st[107] + st[101] * st.Data.GetValueOrDefault(1071) / 10000;
-        long resp = st[108] + st[102] * st.Data.GetValueOrDefault(1081) / 10000;
+        // 243 temporary_per_magicrecover: Meditatio "MP Recovery Speed", as 1081 per_resp beside it.
+        long resp = st[108] + st[102] * (st.Data.GetValueOrDefault(1081) + st.Data.GetValueOrDefault(243)) / 10000;
         await _character.SetHpSpAsync(s, st[2000] + Math.Max(1, rehp), st[2001] + Math.Max(1, resp));
     }
 

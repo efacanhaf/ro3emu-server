@@ -48,11 +48,11 @@ public sealed class GrowthClassService
     }
 
     /// <summary>BecomeStrongerRankConfig rows in id order: (rank, _iStandard, _iReward).</summary>
-    private List<(int Id, long Standard, long Reward)> Ranks() => _ranks ??= _data.Table("BecomeStrongerRankConfig").Values
+    private List<(int Id, long Standard, long Reward)> Ranks() => _ranks ??= [.. _data.Table("BecomeStrongerRankConfig").Values
         .SelectMany(v => v.ValueKind == JsonValueKind.Array ? v.EnumerateArray().ToArray() : [v])
         .Where(r => r.ValueKind == JsonValueKind.Object && GameData.Int(r, "_iID") > 0)
         .Select(r => ((int)GameData.Int(r, "_iID"), GameData.Int(r, "_iStandard"), GameData.Int(r, "_iReward")))
-        .OrderBy(r => r.Item1).ToList();
+        .OrderBy(r => r.Item1)];
 
     public void Load(GameSession s)
     {
@@ -112,7 +112,9 @@ public sealed class GrowthClassService
         int? playBook = s.Synced.GetValueOrDefault(SeasonService.SeasonSync) is DBSeasonInfo { Current: { } current }
             ? (int)current.PlayBookId : null;
         AwardPlan plan;
+        // Rank 2 (AwardConfig 1001002, [2, 11, 99]) pays from base 11: the rank stays unclaimed until then.
         try { plan = _awards.Resolve(s, group, playBook); }
+        catch (AwardConditionException) { return ErrorCodes.PlayerLevelLow; }
         catch (AwardResolutionException e) when (FixedAward(group, playBook) is { } items)
         {
             _log.LogInformation("Growth Classroom rank {Rank} pays the fixed items of its award: {Reason}", rank, e.Message);

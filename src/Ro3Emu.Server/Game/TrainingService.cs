@@ -30,8 +30,8 @@ public sealed class TrainingService : IGameTicker
     private readonly MonsterService _monsters;
     private readonly AwardService _awards;
     private readonly GameLoop _loop;
-    private readonly Dictionary<long, MapPoint> _points = new();
-    private readonly Dictionary<GameSession, Attempt> _attempts = new();
+    private readonly Dictionary<long, MapPoint> _points = [];
+    private readonly Dictionary<GameSession, Attempt> _attempts = [];
     private sealed class Attempt
     {
         public required InstanceService.Room Room;
@@ -43,6 +43,8 @@ public sealed class TrainingService : IGameTicker
         public long Damage;
         public bool Settling;
     }
+    /// <summary>After a challenge's result is committed (quest target 210006, TaskService.OnDummyChallengeSettled).</summary>
+    public List<Action<GameSession>> ChallengeSettled { get; } = [];
     private long Now => _clock.UtcNow.ToUnixTimeMilliseconds();
     private int Duration => _data.Table("PublicParamConfig").TryGetValue("TrainingChallengeTimeLimit", out var v)
         ? checked((int)(GameData.Number(v) ?? 60)) : 60;
@@ -262,7 +264,7 @@ public sealed class TrainingService : IGameTicker
             byte[] claimed = next.ToByteArray();
             string source = $"training/claim/{s.Role!.Id}/{string.Join('-', req.AimAwardIds.Order())}";
             var economy = EventEconomy.ForRole(_data, s, "training-claim", source,
-                Array.Empty<(int Entry, long Count)>(), grants,
+                [], grants,
                 new
                 {
                     Claimed = req.AimAwardIds.Order().ToArray(), MaxDps = next.MaxDps,
@@ -313,6 +315,8 @@ public sealed class TrainingService : IGameTicker
                 Res = (DungeonRes)1, Data = new() { TrainingGroundData = new() { MaxDps = dps, SumDamage = a.Damage } }
             });
             await CharacterService.SyncAsync(s, Sync, next.Clone()); await SnapshotAsync(s, a);
+            if (a.Challenge)
+                foreach (var handler in ChallengeSettled) handler(s);
         }
         finally { a.Settling = false; }
     }

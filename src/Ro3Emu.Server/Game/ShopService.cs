@@ -5,6 +5,7 @@ using System.Text.Json;
 using Romsg;
 using Ro3Emu.Server.Accounts;
 using Ro3Emu.Server.Data;
+using Ro3Emu.Server.Data.Config;
 using Ro3Emu.Server.Economy;
 
 namespace Ro3Emu.Server.Game;
@@ -16,9 +17,9 @@ namespace Ro3Emu.Server.Game;
 /// and keeps the personal purchase counters and favourites in 5024 DBShopInfo. Fashion-tab commodities (shop type 7)
 /// carry _iAppearanceId instead of _iItemId: WardrobeService.BuyFromShopLockedAsync unlocks the look in the same commit.
 /// </summary>
-public sealed class ShopService(GameData data, CharacterService character, FunctionService functions, RoleStore roles, SeasonService seasons,
+public sealed partial class ShopService(GameData data, CharacterService character, FunctionService functions, RoleStore roles, SeasonService seasons,
     WardrobeService wardrobe, AwardService awards, TimeProvider clock, SessionRegistry sessions, GameLoop loop,
-    ILogger<ShopService> log) : IGameTicker
+    FriendStore friends, MailService mail, ILogger<ShopService> log) : IGameTicker
 {
     public const uint ShopSync = 5024;
     public const uint BuyCommodity = 82332, CommodityCollect = 82333, CommodityPresent = 82335, CommodityGetInfo = 82338,
@@ -34,9 +35,14 @@ public sealed class ShopService(GameData data, CharacterService character, Funct
     private readonly TimeProvider _clock = clock;
     private readonly SessionRegistry _sessions = sessions;
     private readonly GameLoop _loop = loop;
+    private readonly FriendStore _friends = friends;
+    private readonly MailService _mail = mail;
     private readonly ILogger<ShopService> _log = log;
     private TimeSpan _lastTick;
-    private DateTime _gameDay;
+    /// <summary>The game day the online roles were last synced for. Taken when the server starts: taken by the first
+    /// throttled tick instead (a second into the loop), it missed a rollover that came before it.</summary>
+    private DateTime _gameDay = DailyActivityService.GameDay(clock.GetLocalNow().DateTime);
+    private long Now => _clock.GetUtcNow().ToUnixTimeSeconds();
 
     /// <summary>
     /// At the 05:00 game-day rollover the online roles get 5024 again: their daily (and on Monday weekly, on the 1st
@@ -48,9 +54,7 @@ public sealed class ShopService(GameData data, CharacterService character, Funct
         _lastTick = time.Now;
         var day = DailyActivityService.GameDay(_clock.GetLocalNow().DateTime);
         if (day == _gameDay) return;
-        bool first = _gameDay == default;
         _gameDay = day;
-        if (first) return;
         foreach (var session in _sessions.All())
             if (session.Role != null && session.Shop is { Bought.Count: > 0 })
                 _loop.PostOwned(session, () => session.Shop != null && session.Role != null ? SyncAsync(session) : Task.CompletedTask);
@@ -59,8 +63,8 @@ public sealed class ShopService(GameData data, CharacterService character, Funct
     /// <summary>Saved per role: purchase counters with the period they were counted in, and favourites.</summary>
     public sealed class ShopState
     {
-        public Dictionary<int, Counter> Bought { get; set; } = new();
-        public HashSet<int> Favorites { get; set; } = new();
+        public Dictionary<int, Counter> Bought { get; set; } = [];
+        public HashSet<int> Favorites { get; set; } = [];
     }
 
     public sealed class Counter
@@ -83,6 +87,7 @@ public sealed class ShopService(GameData data, CharacterService character, Funct
             { counter.Period = "S1"; migrated = true; }
         if (migrated) Save(session);
         await SyncAsync(session);
+        await LoginGiftsAsync(session);
     }
 
     private Task SyncAsync(GameSession session)
@@ -163,7 +168,7 @@ public sealed class ShopService(GameData data, CharacterService character, Funct
         }
         else if (error == null)
         {
-            int currency = PaymentItem(row!.Value), entry = (int)GameData.Int(row.Value, "_iItemId"), perUnit = (int)Math.Max(1, GameData.Int(row.Value, "_iItemPerMount"));
+            int currency = PaymentItem(row!.Value), entry = (int)GameData.Int(row.Value, "_iItemId"), perUnit = GoodsPerUnit(row.Value);
             var cost = currency > 0 ? new[] { (currency, (long)unit * count) } : [];
             if ((long)perUnit * count > int.MaxValue) error = new(ErrorCodes.Parameter, "quantity overflow");
             else
@@ -207,24 +212,6 @@ public sealed class ShopService(GameData data, CharacterService character, Funct
     /// AppearanceShopTests pins that no row is dated.
     public Task CommodityInfoAsync(GameSession session, CommodityGetInfoReq req) =>
         session.SendGameAsync(CommodityGetInfo, new CommodityGetInfoResp());
-
-    /// <summary>
-    /// 82335 COMMODITY_PRESENT (gift a Fashion commodity to a friend) is refused until gifting exists. On any zero result
-    /// LC_DAL_Shop.CommodityPresentResp (LC_DAL_Shop.lua:1178-1216) pops "gift sent" and posts a gift card in the
-    /// friend's private chat, so the generic empty reply (result 0) faked a gift nobody paid for or received. A non-zero
-    /// result takes LC_BaseDAL.DecodeError (LC_BaseDAL.lua:536-663) to the ErrorCodeConfig tip and skips that handler.
-    /// 2317 "This shop does not allow gifts" is the inferred code. Nothing is charged, granted, counted or saved.
-    /// </summary>
-    public async Task RefusePresentAsync(GameSession session, CommodityPresentReq req)
-    {
-        _log.LogInformation("{Name} tries to gift commodity {Id} to {Target}: refused, gifting is not implemented",
-            session.Role!.Name, req.BuyReq?.CommodityId ?? 0, req.TargetId);
-        await session.SendGameAsync(CommodityPresent, new CommodityPresentResp
-        {
-            Result = ErrorCodes.ShopGiftNotAllowed, CommodityId = req.BuyReq?.CommodityId ?? 0, TargetId = req.TargetId,
-            GiftContent = req.GiftContent,
-        });
-    }
 
     /// <summary>
     /// E01: one server-admitted NPC purchase (ShopConfig type 3) authorizes its exact payment and
@@ -311,6 +298,18 @@ public sealed class ShopService(GameData data, CharacterService character, Funct
         return Math.Clamp((long)(GameData.Number(param[1]) ?? 0), 0, 10000);
     }
 
+    /// <summary>
+    /// The items one purchase grants. The Spirit Tower rows 24101-24128 show as "Pet Egg x5" in the shop, and their only 5
+    /// is _iIsShowCount (_iItemPerMount is 1); their 25000 Zeny list price is five times the Zeny Shop's single Pet Egg
+    /// (12102, 5000). So the purchase grants the larger of the two fields (inferred: the client's shop Lua was not
+    /// checked); every other row has both at 1.
+    /// </summary>
+    private static int GoodsPerUnit(JsonElement commodity)
+    {
+        var config = new ShopCommodityConfig(commodity);
+        return (int)Math.Clamp(Math.Max(config.ItemPerMount, config.IsShowCount), 1, int.MaxValue);
+    }
+
     /// <summary>_kItemPerPrice is one flat [payment item, amount] pair.</summary>
     private static int PaymentItem(JsonElement commodity) => (int)PricePart(commodity, 0);
 
@@ -342,13 +341,12 @@ public sealed class ShopService(GameData data, CharacterService character, Funct
     /// <summary>_kAppearanceParts: a JSON array of WardRobeConfig ids, or {} when empty.</summary>
     private static List<int> Parts(JsonElement commodity) =>
         commodity.TryGetProperty("_kAppearanceParts", out var parts) && parts.ValueKind == JsonValueKind.Array
-            ? parts.EnumerateArray().Select(p => (long)(GameData.Number(p) ?? 0)).Where(id => id is > 0 and <= int.MaxValue)
-                .Select(id => (int)id).ToList()
+            ? [.. parts.EnumerateArray().Select(p => (long)(GameData.Number(p) ?? 0)).Where(id => id is > 0 and <= int.MaxValue).Select(id => (int)id)]
             : [];
 
     private static ShopState Copy(ShopState state) => new()
     {
-        Favorites = new HashSet<int>(state.Favorites),
+        Favorites = [.. state.Favorites],
         Bought = state.Bought.ToDictionary(p => p.Key, p => new Counter { Count = p.Value.Count, Period = p.Value.Period }),
     };
 
@@ -398,7 +396,7 @@ public sealed class ShopService(GameData data, CharacterService character, Funct
         {
             var next = new ShopState
             {
-                Favorites = new HashSet<int>(session.Shop!.Favorites),
+                Favorites = [.. session.Shop!.Favorites],
                 Bought = session.Shop.Bought.ToDictionary(p => p.Key, p => new Counter { Count = p.Value.Count, Period = p.Value.Period }),
             };
             if (req.OpType == CollectOperateType.Add) next.Favorites.Add(req.CommodityId);

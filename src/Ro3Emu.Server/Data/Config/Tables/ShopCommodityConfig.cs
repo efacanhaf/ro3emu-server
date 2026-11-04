@@ -13,6 +13,7 @@ public readonly partial record struct ShopCommodityConfig(JsonElement Row)
     [ConfigField("_iID")] public partial long Id { get; }
     [ConfigField("_iIsBuy")] public partial long IsBuy { get; }
     [ConfigField("_iIsLock")] public partial long IsLock { get; }
+    [ConfigField("_iIsShowCount")] public partial long IsShowCount { get; }
     [ConfigField("_iItemId")] public partial long ItemId { get; }
     [ConfigField("_iItemPerMount")] public partial long ItemPerMount { get; }
     [ConfigField("_iMerchantDiscount")] public partial long MerchantDiscount { get; }
@@ -21,4 +22,7 @@ public readonly partial record struct ShopCommodityConfig(JsonElement Row)
     [ConfigField("_kAppearanceParts")] public partial long[] AppearanceParts { get; }
     [ConfigField("_kItemPerPrice")] public partial long[] ItemPerPrice { get; }
     [ConfigField("_kMultiverseArray")] public partial long[] MultiverseArray { get; }
+    [ConfigField("_iGroup")] public partial long Group { get; }
+    [ConfigField("_iWeight")] public partial long Weight { get; }
+    [ConfigField("_iGlobalPurchase")] public partial long GlobalPurchase { get; }
 }

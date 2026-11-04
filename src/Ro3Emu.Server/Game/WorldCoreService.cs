@@ -10,7 +10,7 @@ namespace Ro3Emu.Server.Game;
 /// <summary>Durable visited maps; transient subscriptions and movement state belong to the selected session.</summary>
 public sealed class WorldRoleState
 {
-    public HashSet<long> VisitedMaps { get; set; } = new();
+    public HashSet<long> VisitedMaps { get; set; } = [];
 }
 
 public sealed class WorldSessionState
@@ -24,9 +24,9 @@ public sealed class WorldSessionState
     public long LastFlyMs { get; set; }
     public bool Watching { get; set; }
     public EFightStatus? FightStatus { get; set; }
-    public HashSet<long> Hatred { get; } = new();
-    public HashSet<long> Monitored { get; } = new();
-    public Dictionary<long, CustomData> CustomData { get; } = new();
+    public HashSet<long> Hatred { get; } = [];
+    public HashSet<long> Monitored { get; } = [];
+    public Dictionary<long, CustomData> CustomData { get; } = [];
     public long QueueScene { get; set; }
     public long LastEscapeMs { get; set; }
     public long LastHelpMs { get; set; }
@@ -36,6 +36,8 @@ public sealed class WorldSessionState
     public long ReviveHpRate { get; set; } = 10000;
     public long ReviveSpRate { get; set; } = 10000;
     public long TemporaryLeaveUntilMs { get; set; }
+    public long TypingWindowStartMs { get; set; }
+    public int TypingInWindow { get; set; }
 }
 
 /// <summary>
@@ -139,13 +141,12 @@ public sealed partial class WorldCoreService : IGameTicker
         if (s.WorldState.Saved.VisitedMaps.Count > 0) await VisitsAsync(s);
         // Datasets this server has no content for, sent in their empty form so each asset category is materialized
         // (inferred): 5060 DBWizardInfo forbiddenItems is an operator item freeze (LC_DAL_Knapsack reads it nil-safe), 5052
-        // DBQuestionnaireData holds operator surveys (no client table), 5043 DBBarRoomInfo is the Tavern room (none yet).
+        // DBQuestionnaireData holds operator surveys (no client table). 5043 DBBarRoomInfo follows from TavernService.
         await CharacterService.SyncAsync(s, WizardSync, new DBWizardInfo());
         await CharacterService.SyncAsync(s, QuestionnaireSync, new DBQuestionnaireData());
-        await CharacterService.SyncAsync(s, BarRoomSync, new DBBarRoomInfo());
     }
 
-    private const uint BarRoomSync = 5043, QuestionnaireSync = 5052, WizardSync = 5060;
+    private const uint QuestionnaireSync = 5052, WizardSync = 5060;
 
     private Task VisitsAsync(GameSession s) => s.SendGameAsync(VisitedMaps,
         new SyncRoleVisitMapInfoNtf { Mapid = { s.WorldState.Saved.VisitedMaps.Order() } });
@@ -168,7 +169,7 @@ public sealed partial class WorldCoreService : IGameTicker
     public async Task AssetsAsync(GameSession s, PlayerAssetReq req)
     {
         var response = new PlayerAssetResp();
-        var requested = req.AssetType.Count == 0 ? AssetDatasets.Keys.ToArray() : req.AssetType.Distinct().ToArray();
+        var requested = req.AssetType.Count == 0 ? AssetDatasets.Keys.ToArray() : [.. req.AssetType.Distinct()];
         var emitted = new HashSet<uint>();
         foreach (long type in requested)
         {
@@ -200,7 +201,7 @@ public sealed partial class WorldCoreService : IGameTicker
         if (!CurrentScene()) return;
         if (!s.WorldState.Saved.VisitedMaps.Contains(s.SceneEntry))
         {
-            var next = new WorldRoleState { VisitedMaps = new(s.WorldState.Saved.VisitedMaps) };
+            var next = new WorldRoleState { VisitedMaps = [.. s.WorldState.Saved.VisitedMaps] };
             next.VisitedMaps.Add(s.SceneEntry);
             var transaction = _roles.NewTransaction();
             transaction.RoleBlob(s.Role!.Id, "world_state", JsonSerializer.SerializeToUtf8Bytes(next));

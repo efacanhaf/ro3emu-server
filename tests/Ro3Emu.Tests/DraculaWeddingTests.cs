@@ -79,7 +79,7 @@ public sealed class DraculaWeddingTests : IAsyncLifetime
     private async Task Gm(BotClient bot, string command)
     {
         using var client = new HttpClient();
-        (await client.PostAsync($"{_http}/ro3emu/gm?account={bot.Account}", new StringContent(command))).EnsureSuccessStatusCode();
+        (await client.PostAsync($"{_http}/ro3emu/gm?account={bot.Account}", Operator.Command(command))).EnsureSuccessStatusCode();
     }
 
     private GameSession Session(BotClient bot) => Service<SessionRegistry>().All().Single(s => s.Account == bot.Account && s.Role != null);
@@ -262,12 +262,20 @@ public sealed class DraculaWeddingTests : IAsyncLifetime
         Assert.Equal(instance, await Read(() => Session(bob).InstanceId));
         var info = await Next(bob, DungeonService.BaseInfo, DungeonBaseInfoNotify.Parser);
         Assert.Equal([select.BridePlayerId], info.Vars.Single(v => v.VarId == 1301).Vi64);
-        // The tracker runs the lair's first task.
-        Assert.Contains(await Read(() => Service<TaskService>().ExtraTasks.SelectMany(f => f(Session(bob))).ToArray()),
-            t => t.TaskId == 9000100 && t.Status == TaskState.Running);
+        // The tracker runs the lair's first task (posted on the member's owner loop).
+        await Until(() => Service<TaskService>().ExtraTasks.SelectMany(f => f(Session(bob)))
+            .Any(t => t.TaskId == 9000100 && t.Status == TaskState.Running), "the lair's first task");
 
         var plan = await Read(() => Session(alice).DungeonAttempt!.Plan);
         var map = Service<WorldData>().Map(Lair)!;
+        // Fresh level 1 roles against the lair's waves, which fight back and kill them through any heal: !hp stops at MaxHp.
+        // Alice kills them one right after the other, faster than her basic attack's cooldown.
+        await OnLoop(() =>
+        {
+            Session(alice).GmCombat |= GmCombatSwitches.Unlimited | GmCombatSwitches.NoCooldown;
+            Session(bob).GmCombat |= GmCombatSwitches.Unlimited;
+            return Task.CompletedTask;
+        });
         for (int wave = 0; wave < plan.Waves.Count - 1; wave++)
         {
             await Until(() => Session(alice).DungeonAttempt?.Wave == wave, $"wave {wave + 1}");
@@ -277,14 +285,13 @@ public sealed class DraculaWeddingTests : IAsyncLifetime
                 await Gm(alice, FormattableString.Invariant($"!actors walk {region.X} {region.Z}"));
                 continue;
             }
-            await Gm(alice, "!hp 999999");
             foreach (var actor in await WaveIn(instance, plan.Waves[wave].Spawns.Count)) await Kill(alice, actor);
         }
 
         // The key: Alice did the fighting, Bob searches the bushes until one holds it.
         await Until(() => Session(alice).DungeonAttempt?.Wave == plan.Waves.Count - 1, "the key step");
-        Assert.Contains(await Read(() => Service<TaskService>().ExtraTasks.SelectMany(f => f(Session(bob))).ToArray()),
-            t => t.TaskId == 9000110);
+        await Until(() => Service<TaskService>().ExtraTasks.SelectMany(f => f(Session(bob))).Any(t => t.TaskId == 9000110),
+            "the lair's last task");
         var actors = await Read(() => Session(alice).DungeonAttempt!.SceneActors.ToArray());
         Assert.Equal(5, actors.Length);
         var cage = actors.Single(a => a.NpcId == 4114038);
@@ -351,5 +358,50 @@ public sealed class DraculaWeddingTests : IAsyncLifetime
         await Task.Delay(200);
         Assert.DoesNotContain(Mailbox(Id(alice)).Letters, l => l.TemplateId is 10208 or 10209);
         Assert.Equal(ErrorCodes.ActivityPeriod, await EnterLair(alice));
+    }
+
+    [ClientDataFact]
+    public async Task TheBrideSpectatesALairMemberThroughCameraCustomData()
+    {
+        await using var alice = await InWorld("Alice");
+        await using var bob = await InWorld("Bob");
+        long guild = await CreateGuild(alice, "Watch");
+        await Join(alice, bob, guild);
+        await EnterHome(alice);
+        await EnterHome(bob);
+        await Gm(alice, "!dracula open");
+        _clock.Advance(1);
+        long brideId = (await Next(alice, DraculaWeddingService.SelectBride, GuildDraculaSelectBrideNtf.Parser)).BridePlayerId;
+        var (bride, guest) = brideId == Id(alice) ? (alice, bob) : (bob, alice);
+        await Story(alice, Home, 3001);
+        await Story(bob, Home, 3001);
+        Assert.Equal(0, await EnterLair(bride));
+        await Load(bride, Lair);
+        Assert.Equal(0, await EnterLair(guest));
+        await Load(guest, Lair);
+        // The guest's arrival refreshes the Spectate widget's list (var 145).
+        var list = await Next(bride, DungeonService.Event, DungeonEventNotify.Parser,
+            e => e.Vars.Any(v => v.VarId == 145 && v.Vi64.Count == 2));
+        Assert.Equal(new[] { Id(alice), Id(bob) }.Order(), list.Vars.Single(v => v.VarId == 145).Vi64.Order());
+
+        static bool Camera(CustomDataChange c, long value) => c.CustomDatas.Any(d => d.Id == 1002 && d.CustomParam.LongParam == value);
+        // Only the bride watches, and only another member of her lair.
+        await guest.SendGameAsync(DraculaWeddingService.Watch, new DungeonWatchChangeTargetReq { PlayerId = brideId });
+        await bride.SendGameAsync(DraculaWeddingService.Watch, new DungeonWatchChangeTargetReq { PlayerId = 999999 });
+        await bride.SendGameAsync(DraculaWeddingService.Watch, new DungeonWatchChangeTargetReq { PlayerId = Id(guest) });
+        var watch = await Next(bride, WorldCoreService.CustomChange, CustomDataChange.Parser, c => c.CustomDatas.Any(d => d.Id == 1002));
+        Assert.Equal((ulong)brideId, (ulong)watch.EntityId);
+        Assert.True(Camera(watch, Id(guest)));
+        Assert.False(await Read(() => Session(guest).WorldState.CustomData.ContainsKey(1002)));
+        await bride.SendGameAsync(DraculaWeddingService.Watch, new DungeonWatchChangeTargetReq { PlayerId = -1 });
+        await Next(bride, WorldCoreService.CustomChange, CustomDataChange.Parser, c => Camera(c, 0));
+        Assert.False(await Read(() => Session(bride).WorldState.CustomData.ContainsKey(1002)));
+
+        // The watched guest leaves: nobody is left to watch, so the camera returns to the bride.
+        await bride.SendGameAsync(DraculaWeddingService.Watch, new DungeonWatchChangeTargetReq { PlayerId = Id(guest) });
+        await Next(bride, WorldCoreService.CustomChange, CustomDataChange.Parser, c => Camera(c, Id(guest)));
+        await guest.SendGameAsync(TowerService.LeaveDungeon, new LeaveDungeonReq());
+        await Next(bride, WorldCoreService.CustomChange, CustomDataChange.Parser, c => Camera(c, 0));
+        Assert.Equal(0, await Read(() => Session(bride).DungeonAttempt!.Dracula!.Watched));
     }
 }

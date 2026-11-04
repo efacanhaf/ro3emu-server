@@ -12,11 +12,14 @@ public sealed class LocalServer : IAsyncDisposable
     private readonly Task _stderr;
     public string Url { get; }
     public string DataDir { get; }
+
+    /// <summary>The operator token the server was started with (Ro3Emu:OperatorToken), for its metrics.</summary>
+    public string OperatorToken { get; }
     public int ProcessId => _process.Id;
     public string? CaptureFailure { get; private set; }
 
-    private LocalServer(Process process, Task stdout, Task stderr, string url, string dataDir)
-    { _process = process; _stdout = stdout; _stderr = stderr; Url = url; DataDir = dataDir; }
+    private LocalServer(Process process, Task stdout, Task stderr, string url, string dataDir, string operatorToken)
+    { _process = process; _stdout = stdout; _stderr = stderr; Url = url; DataDir = dataDir; OperatorToken = operatorToken; }
 
     public static async Task<LocalServer> StartAsync(string repo, string outputDir, CancellationToken ct)
     {
@@ -43,14 +46,18 @@ public sealed class LocalServer : IAsyncDisposable
         start.ArgumentList.Add(dll);
         start.Environment["Ro3Emu__PublicHost"] = "127.0.0.1";
         start.Environment["Ro3Emu__BindAddress"] = "127.0.0.1";
+        start.Environment["Ro3Emu__GuildFounding"] = "instant"; // S5's guilds have no responders to wait for
         start.Environment["Ro3Emu__HttpPort"] = http.ToString();
         start.Environment["Ro3Emu__MicroGatePort"] = micro.ToString();
         start.Environment["Ro3Emu__GameGatePort"] = game.ToString();
         start.Environment["Ro3Emu__DataDir"] = data;
+        string token = Convert.ToHexStringLower(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32));
+        start.Environment["Ro3Emu__OperatorToken"] = token;
         start.Environment["Ro3Emu__GameDataDir"] = Path.Combine(repo, "data"); // shared junction: read only
         // The measured configuration is production's: tables parsed before admission, no traffic log.
         start.Environment["Ro3Emu__PreloadGameData"] = "true";
         start.Environment["Ro3Emu__TrafficLog"] = "off";
+        start.Environment["Ro3Emu__TravelCheck"] = "log"; // the scenarios place their bots with a raw 30012
         start.Environment["Logging__LogLevel__Default"] = "Warning";
         start.Environment["ASPNETCORE_ENVIRONMENT"] = "Production";
         Directory.CreateDirectory(outputDir);
@@ -62,8 +69,9 @@ public sealed class LocalServer : IAsyncDisposable
             process.PriorityClass = ProcessPriorityClass.Normal;
             var stdout = CaptureAsync(process.StandardOutput, Path.Combine(outputDir, $"server-{runId}.stdout.log"));
             var stderr = CaptureAsync(process.StandardError, Path.Combine(outputDir, $"server-{runId}.stderr.log"));
-            result = new LocalServer(process, stdout, stderr, url, data);
+            result = new LocalServer(process, stdout, stderr, url, data, token);
             using var httpClient = new HttpClient { BaseAddress = new Uri(url), Timeout = TimeSpan.FromSeconds(2) };
+            httpClient.DefaultRequestHeaders.Add(Ro3Emu.Server.Http.OperatorToken.Header, token);
             var deadline = Stopwatch.StartNew();
             while (deadline.Elapsed < TimeSpan.FromMinutes(2))
             {

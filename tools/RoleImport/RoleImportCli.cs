@@ -177,9 +177,9 @@ public static class RoleImportCli
             {
                 using var document = JsonDocument.Parse(File.ReadAllBytes(path));
                 var root = document.RootElement;
-                var rows = root.ValueKind == JsonValueKind.Array
-                    ? root.EnumerateArray().ToArray()
-                    : root.EnumerateObject().Select(property => property.Value).ToArray();
+                JsonElement[] rows = root.ValueKind == JsonValueKind.Array
+                    ? [.. root.EnumerateArray()]
+                    : [.. root.EnumerateObject().Select(property => property.Value)];
                 foreach (var row in rows)
                 {
                     if (Number(row, "_iSystemType") != 6 || Number(row, "_iInitialLevel") <= 0) continue;

@@ -13,7 +13,8 @@ namespace Ro3Emu.Server.Game;
 /// </summary>
 public sealed class GameGateServer(
     IOptions<ServerOptions> options, GateCrypto crypto, AccountStore accounts, GameMessageHandler messages, RoleSessionService roleSessions, TrafficLog traffic,
-    SessionRegistry sessions, GameLoop loop, ReconnectService reconnects, ILogger<GameGateServer> log, Diagnostics.ServerMetrics metrics)
+    SessionRegistry sessions, GameLoop loop, ReconnectService reconnects, ILogger<GameGateServer> log, Diagnostics.ServerMetrics metrics,
+    MaintenanceMode maintenance)
     : GateListener(options.Value.ListenAddress(), options.Value.GameGatePort, log, metrics)
 {
     // client -> gate
@@ -116,12 +117,19 @@ public sealed class GameGateServer(
             await session.Channel.SendAsync(ConnectResponse, new ConnectServerResp { Type = ConnectServerResp.Types.RespType.ConnectRefused });
             return;
         }
+        // Maintenance (the panel's): only staff get in; the client shows its maintenance notice (MaintenanceMode).
+        if (type == ConnectServerReq.Types.ReqType.NewConnection && maintenance.Refuses(account))
+        {
+            await session.Channel.SendAsync(ConnectResponse, new ConnectServerResp { Type = ConnectServerResp.Types.RespType.ClusterShutdown });
+            return;
+        }
         // Another account on this connection is refused while a role of the first one is in the world.
         if (!await sessions.SignInAsync(session, account, register: type == ConnectServerReq.Types.ReqType.NewConnection))
         {
             await session.Channel.SendAsync(ConnectResponse, new ConnectServerResp { Type = ConnectServerResp.Types.RespType.ConnectRefused });
             return;
         }
+        session.ClientAccount = accounts.ClientAccount(account);
         if (!sessions.IsWinner(session) || session.Channel.PeerClosed) return;
         // SwitchToAccount (back to the role screen) answers with its own response type; the rest is the same.
         var resp = type == ConnectServerReq.Types.ReqType.SwitchToAccount

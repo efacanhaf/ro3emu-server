@@ -31,7 +31,7 @@ public sealed partial class TalentProcs
         TurnUndead = 14118, MagnusExorcismus = 14109,
         FireBolt = 12004, LightningBolt = 12005, ColdBolt = 12006, FireBall = 12012, EarthSpike = 12100, JupitelThunder = 12102,
         FrostNova = 12103, MeteorStorm = 12106, StormGust = 12108, GravitationField = 12212,
-        ArrowAttack = 13000, DoubleStrafe = 13003, ArrowShower = 13004, BlitzBeat = 13102, FalconAssault = 13202,
+        ArrowAttack = 13000, DoubleStrafe = 13003, ArrowShower = 13004, BlitzBeat = 13102, AutoBlitzBeat = 13110, FalconAssault = 13202,
         SonicBlow = 15102, VirusSpread = 15106, Grimtooth = 15109, SoulDestroyer = 15210, MeteorAssault = 15229,
         CartRevolution = 16006, HammerFall = 16104, HighSpeedCartRam = 16202, Smite = 11409, Basilica = 14206;
     // The client's element enum (Lua_GameDefine): None 1, Wind 2, Earth 3, Fire 4, Water 5, Poison 6 ...
@@ -89,12 +89,14 @@ public sealed partial class TalentProcs
     /// <paramref name="Hits"/> times; <paramref name="HpBelow"/>: only on a target below that HP percentage;
     /// <paramref name="RandomHit"/> centres the area on a random monster the cast hit (without an area: hits that monster);
     /// <paramref name="Status"/> lands on each monster the described hit struck with the <paramref name="StatusChance"/>% of
-    /// the description for its <paramref name="StatusSeconds"/>.</remarks>
+    /// the description for its <paramref name="StatusSeconds"/>; <paramref name="CastArea"/>: a field's cast hits nothing itself,
+    /// so "within the area" is the monsters its row covers as it is cast, up to Count.</remarks>
     private sealed record Rule(int[] Groups, bool NormalAttack = false, long Weapon = 0, int? Chance = null, int? Cooldown = null,
         int? Radius = null, int? Count = null, int? Others = null, bool OthersOnly = false, bool RowArea = false, bool Buff = false,
         long Active = 0, bool AroundCaster = false, int Logic = 0, bool Recast = false, bool TargetBuff = false, int? BuffSeconds = null,
         bool HitTargets = false, int? Ratio = null, int? Flat = null, int? Hits = null, long Element = Neutral, int? HpBelow = null,
-        bool RandomHit = false, long Status = 0, int? StatusChance = null, int? StatusSeconds = null, int ResetCooldown = 0);
+        bool RandomHit = false, long Status = 0, int? StatusChance = null, int? StatusSeconds = null, int ResetCooldown = 0,
+        bool CastArea = false);
 
     /// <summary>Talent BuffConfig id -> the buff group that must live for its _kLogicData buff to apply.</summary>
     internal static readonly IReadOnlyDictionary<long, long> WhileActive = new Dictionary<long, long>
@@ -172,7 +174,7 @@ public sealed partial class TalentProcs
         // Holy Light Strike: "When [Basic Attack] hits an enemy, it triggers Holy Light Strike ... Internal Cooldown: ${4} seconds."
         [1421601] = new([], NormalAttack: true, Logic: 1, Cooldown: 3),
         // Holy Cross Judgment: "When [Magnus Exorcismus] is cast, it also unleashes ... to up to ${1} enemies within the area."
-        [1422401] = new([MagnusExorcismus], Logic: 1, HitTargets: true, Count: 0),
+        [1422401] = new([MagnusExorcismus], Logic: 1, Count: 0, CastArea: true),
         // Fated Resurrection: "After casting [Turn Undead], there is a ${1}% Chance to trigger Turn Undead one Extra time.
         // Internal Cooldown: ${2} seconds."
         [1422201] = new([TurnUndead], Chance: 0, Cooldown: 1, Recast: true),
@@ -223,11 +225,13 @@ public sealed partial class TalentProcs
         // within a ${2}-meter radius of the target. Internal Cooldown: ${6} seconds."
         [1321501] = new([DoubleStrafe], Logic: 1, Chance: 0, Radius: 1, Count: 2, Cooldown: 5),
         // Falcon Strike: "When [Blitz Beat] hits an enemy, it has a ${1}% Chance to Summon the Falcon ... Internal Cooldown: ${4} seconds."
-        [1321701] = new([BlitzBeat], Logic: 1, Chance: 0, Cooldown: 3),
+        // Its 0.2 s and Lightning Blitz's 1 s cooldowns mean nothing on a skill with a 10 s cooldown, so the automatic casts
+        // (TalentProcs.Passives) count (inferred).
+        [1321701] = new([BlitzBeat, AutoBlitzBeat], Logic: 1, Chance: 0, Cooldown: 3),
         // Meteor Arrow Shower: "When [Arrow Shower] hits enemies, it deals ... to one of them. Internal Cooldown: ${3} seconds."
         [1322001] = new([ArrowShower], Logic: 1, Cooldown: 2),
         // Lightning Blitz: "After casting [Blitz Beat], ASPD increases by ${1}% for ${2} seconds. Internal Cooldown: ${3} seconds."
-        [1322401] = new([BlitzBeat], Logic: 1, Buff: true, BuffSeconds: 1, Cooldown: 2),
+        [1322401] = new([BlitzBeat, AutoBlitzBeat], Logic: 1, Buff: true, BuffSeconds: 1, Cooldown: 2),
         // Double Assault: "Casts [Falcon Assault] ${1} times. Internal Cooldown: ${2} seconds."
         [1323501] = new([FalconAssault], Recast: true, Cooldown: 1),
         // Falcon Rush: "When [Falcon Assault] hits an enemy, it deals ... to up to ${2} enemies within a ${1}-meter radius of
@@ -307,6 +311,7 @@ public sealed partial class TalentProcs
         buffs.SourceAttributes = BuffAttributes;
         combat.SkillBuffAllowed = SkillBuffAllowed;
         combat.CastResolved.Add(OnCastResolvedAsync);
+        combat.DealtAsync.Add(RowProcsOnDealtAsync);
         buffs.Changed.Add(OnBuffsChangedAsync);
         combat.TargetCountRow = TargetCountRow;
         combat.TakenAsync.Add(OnTakenAsync);
@@ -384,14 +389,31 @@ public sealed partial class TalentProcs
         if (s.Role == null) return;
         var cast = new SkillConfig(action.Row);
         await PassiveProcsAsync(s, action, cast, processed, hit);
+        await RowProcsAsync(s, action, cast, processed);
+        await LoneEnemyHitAsync(s, cast, processed);
+        await JointDestructionAsync(s, cast, processed);
         if (s.TalentProcBuffs.Count == 0) return;
         await ChargesAsync(s, action, cast, processed);
         await HealProcsAsync(s, action, cast, hit);
         GravityTrap(s, action, cast);
+        await RuleProcsAsync(s, action, cast, processed);
+    }
+
+    /// <summary>The <see cref="Rules"/> of the session's talents that <paramref name="cast"/> triggers.</summary>
+    private async Task RuleProcsAsync(GameSession s, ActiveSkillCast action, SkillConfig cast, IReadOnlyList<MonsterUnit> processed)
+    {
+        if (s.Role == null) return;
         foreach (var (buff, description) in s.TalentProcBuffs)
         {
             if (!Rules.TryGetValue(buff, out var rule)) continue;
-            if (rule.NormalAttack ? cast.IsNormalAtk != 1 : Array.IndexOf(rule.Groups, (int)cast.SkillId) < 0) continue;
+            if (rule.NormalAttack ? !cast.IsNormalAttack(_data) : Array.IndexOf(rule.Groups, (int)cast.SkillId) < 0) continue;
+            if (rule.CastArea)
+            {
+                if (rule.Count is int most && BuffConfig.Get(_data, buff)?.LogicData is { } burst && rule.Logic < burst.Length
+                    && ProcRow(burst[rule.Logic]) is { } burstRow)
+                    await _combat.CastExtraAsync(s, burstRow.Row, [.. _combat.MonstersInCastArea(s, action).Take((int)Value(description, most))]);
+                continue;
+            }
             var target = processed.FirstOrDefault(m => m.Uid == action.Request.TargetId && m.Hp > 0) ?? processed.FirstOrDefault(m => m.Hp > 0)
                 ?? (processed.Count == 0 && rule.Radius is int radius
                     ? _combat.MonstersNear(s, action.Request.TargetPos ?? s.Position, (float)Value(description, radius)).FirstOrDefault()
@@ -432,7 +454,7 @@ public sealed partial class TalentProcs
             }
             if (rule.Recast)
             {
-                await _combat.CastExtraAsync(s, action.Row, Targets(s, rule with { RowArea = true }, description, cast, target, processed));
+                await _combat.CastExtraAsync(s, action.Row, Targets(s, rule with { RowArea = true }, description, cast, target, processed), parametersApplied: true);
                 continue;
             }
             if (BuffConfig.Get(_data, buff)?.LogicData is not { } logic || rule.Logic >= logic.Length) continue;

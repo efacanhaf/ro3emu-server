@@ -5,7 +5,8 @@ using Romsg;
 namespace Ro3Emu.Server.Game;
 
 /// <summary>Shops, mail claims, auctions, player trade and stalls.</summary>
-public sealed class EconomyMessages(ShopService shops, MailService mail, AuctionService auctions, TradeService trade, StallsService stalls) : Messaging.IMessageModule
+public sealed class EconomyMessages(ShopService shops, MailService mail, AuctionService auctions, TradeService trade, StallsService stalls,
+    TimedBattleService timedBattles) : Messaging.IMessageModule
 {
     public void Map(Messaging.MessageRoutes routes)
     {
@@ -14,7 +15,10 @@ public sealed class EconomyMessages(ShopService shops, MailService mail, Auction
         routes.AdmitEconomic(id => id is >= 33401 and <= 33418); // stalls
         routes.AdmitEconomic(id => id is >= 82000 and <= 82020); // auctions
         routes.AdmitEconomic(id => id is MailService.ClaimMail);
+        // Present/Pick reserve the recipient's own "gifts" blob themselves (another role, not the sender's).
+        routes.AdmitEconomic(id => id is ShopService.CommodityPresent or ShopService.CommodityPick);
         routes.AdmitRole(id => id is >= 82332 and <= 82340); // ordinary shops
+        routes.AdmitRole(id => id is ShopService.ItemExchange); // Currency Redemption: the sender's own currencies
         routes.Intercept("trade", id => id is >= 32601 and <= 32630, (session, msgId, body) =>
             session.Role != null && session.Progress != null ? trade.HandleAsync(session, msgId, body) : Task.FromResult(false));
         routes.Intercept("stalls", id => id is >= StallsService.Start and <= StallsService.Share, (session, msgId, body) =>
@@ -22,8 +26,14 @@ public sealed class EconomyMessages(ShopService shops, MailService mail, Auction
 
         routes.Map(ShopService.BuyCommodity, "shops", async (session, msgId, body) =>
         {
-            await shops.BuyAsync(session, BuyCommodityReq.Parser.ParseFrom(body.Span));
+            var buy = BuyCommodityReq.Parser.ParseFrom(body.Span);
+            // A Survivor Battle shop NPC is paid from the match pack (TimedBattleService.ChickenShop).
+            if (!await timedBattles.TryBuyAsync(session, buy)) await shops.BuyAsync(session, buy);
         });
+        routes.Map(TimedBattleService.DungeonShop, "shops", async (session, msgId, body) =>
+            await timedBattles.GetDungeonShopAsync(session, GetDungeonShopReq.Parser.ParseFrom(body.Span)));
+        routes.Map(ShopService.ItemExchange, "shops", async (session, msgId, body) =>
+            await shops.ExchangeCurrencyAsync(session, ItemExchangeReq.Parser.ParseFrom(body.Span)));
         routes.Map(ShopService.BatchBuyCommodity, "shops", async (session, msgId, body) =>
         {
             await shops.BatchBuyAsync(session, BatchBuyCommodityReq.Parser.ParseFrom(body.Span));
@@ -34,7 +44,11 @@ public sealed class EconomyMessages(ShopService shops, MailService mail, Auction
         });
         routes.Map(ShopService.CommodityPresent, "shops", async (session, msgId, body) =>
         {
-            await shops.RefusePresentAsync(session, CommodityPresentReq.Parser.ParseFrom(body.Span));
+            await shops.PresentAsync(session, CommodityPresentReq.Parser.ParseFrom(body.Span));
+        });
+        routes.Map(ShopService.CommodityPick, "shops", async (session, msgId, body) =>
+        {
+            await shops.PickAsync(session, CommodityPickReq.Parser.ParseFrom(body.Span));
         });
         routes.Map(ShopService.CommodityGetInfo, "shops", async (session, msgId, body) =>
         {

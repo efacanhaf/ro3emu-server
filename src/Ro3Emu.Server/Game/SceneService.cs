@@ -10,7 +10,7 @@ namespace Ro3Emu.Server.Game;
 /// destroys all units on a map change). Also NPC interaction (32700: portals, Kafras, dialogs), 30012 / 30131 jumps and
 /// the walk check against the client's nav grid.
 /// </summary>
-public sealed partial class SceneService(IOptions<ServerOptions> options, World world, WorldData worldData, MonsterService monsters, BuffService buffs, Data.GameData data, ILogger<SceneService> log, PublicLineManager lines, TimeProvider clock)
+public sealed partial class SceneService(IOptions<ServerOptions> options, World world, WorldData worldData, MonsterService monsters, BuffService buffs, Data.GameData data, ILogger<SceneService> log, PublicLineManager lines, TimeProvider clock, CheatMonitor cheats)
 {
     public const uint NpcInteraction = 32700;
     public const uint SceneTeleport = 30012;
@@ -27,16 +27,16 @@ public sealed partial class SceneService(IOptions<ServerOptions> options, World 
     private const float InteractSlack = 8f;
 
     /// <summary>Dungeon owners clean up on every exit and start combat only after the loaded-scene handshake.</summary>
-    public List<Func<GameSession, Task>> Leaving { get; } = new();
+    public List<Func<GameSession, Task>> Leaving { get; } = [];
     /// <summary>Reconcile destination-dependent appearance before ENTITYSELF and the first AOI snapshot.</summary>
-    public List<Func<GameSession, Task>> BeforeSelf { get; } = new();
-    public List<Func<GameSession, Task>> Loaded { get; } = new();
+    public List<Func<GameSession, Task>> BeforeSelf { get; } = [];
+    public List<Func<GameSession, Task>> Loaded { get; } = [];
     /// <summary>Replays require the entity bases installed by JoinAsync.</summary>
-    public List<Func<GameSession, Task>> AfterLoaded { get; } = new();
-    private readonly HashSet<Func<GameSession, Task>> _ownedAfterLoaded = new();
+    public List<Func<GameSession, Task>> AfterLoaded { get; } = [];
+    private readonly HashSet<Func<GameSession, Task>> _ownedAfterLoaded = [];
     /// <summary>Shared keys a loaded hook writes for this session (a hook that writes beyond the role declares them
     /// here when it registers).</summary>
-    public List<Func<GameSession, Ownership.ReservationKey[]>> LoadedKeys { get; } = new();
+    public List<Func<GameSession, Ownership.ReservationKey[]>> LoadedKeys { get; } = [];
 
     /// <summary>C/D 15: the loaded hooks and unowned after-loaded hooks reserve the role's own keys plus what the hooks
     /// declare, not Realm. SceneHookScopeAuditTests guards that nothing else is needed.</summary>
@@ -65,7 +65,7 @@ public sealed partial class SceneService(IOptions<ServerOptions> options, World 
         Func<GameSession, bool>? Valid = null);
     public Func<GameSession, long, MapPoint?, int, TransferStart?, Task<bool>>? QueuePublicAdmission { get; set; }
     public Func<GameSession, long, int>? PreferredLine { get; set; }
-    public List<Action<RuntimeMapKey>> PublicLineOpened { get; } = new();
+    public List<Action<RuntimeMapKey>> PublicLineOpened { get; } = [];
 
     /// <summary>
     /// Sends the player to <paramref name="scene"/> at <paramref name="at"/> (default: the map's born point). Walks are
@@ -99,6 +99,8 @@ public sealed partial class SceneService(IOptions<ServerOptions> options, World 
         if (map == null && data.Table("MapConfig").Count > 0) return false;
         // Dungeon admission belongs to 30400 / 32801; a generic teleport must not create a public dungeon.
         if (data.Row("DungeonConfig", scene) != null && instanceId == 0) return false;
+        // (inferred) A scene the client lacks a Unity scene or its scene-editor module for never loads.
+        if (map != null && !worldData.ClientCanEnter(scene)) return false;
         if (s.SceneRecoveryRequired || s.Handoff is { Completing: false }) return false;
         if (s.Handoff is { Completing: true } completing && completing.Destination.SceneEntry == scene)
         {
@@ -161,6 +163,8 @@ public sealed partial class SceneService(IOptions<ServerOptions> options, World 
             s.Position = new Vec3 { X = arrival.X, Y = arrival.Y, Z = arrival.Z };
             s.PreviousPosition = s.Position;
             s.Face = arrival.Face;
+            s.LastWalkUtc = DateTime.UtcNow; // the walk before the switch is over (GameSession.WalkReportLag)
+            s.Walking = false;
             s.SceneLoading = true;
             if (instanceId == 0)
             {
@@ -195,6 +199,17 @@ public sealed partial class SceneService(IOptions<ServerOptions> options, World 
             finally { RequireReconnect(s, handoff); }
             throw;
         }
+    }
+
+    /// <summary>
+    /// Why a plain map change (warp, login) cannot place a player on <paramref name="scene"/>, or null when it can:
+    /// the same rules <see cref="EnterSceneAsync"/> applies before it sends 70010.
+    /// </summary>
+    public string? Unplaceable(long scene)
+    {
+        if (worldData.Map(scene) == null) return data.Table("MapConfig").Count > 0 ? "there is no such scene" : null;
+        if (data.Row("DungeonConfig", scene) != null) return "it is a dungeon scene, entered only through its dungeon";
+        return worldData.WhyClientCannotEnter(scene);
     }
 
     /// <summary>A server-chosen position for a login: the saved one when it is walkable, else the map's born point.</summary>
@@ -305,7 +320,7 @@ public sealed partial class SceneService(IOptions<ServerOptions> options, World 
 
     /// <summary>Presentation-only replays after a silent reconnect (map-scoped views a service pushes in
     /// <see cref="Loaded"/>). Unlike Loaded/AfterLoaded they must not persist anything.</summary>
-    public List<Func<GameSession, Task>> Resync { get; } = new();
+    public List<Func<GameSession, Task>> Resync { get; } = [];
 
     /// <summary>
     /// The scene part of the silent-reconnect resync, after 1011: the own actor, its buffs,
@@ -359,6 +374,7 @@ public sealed partial class SceneService(IOptions<ServerOptions> options, World 
         // (inferred from the codes' texts).
         int code = npc == null || npc.SceneEntry != s.SceneEntry ? ErrorCodes.NpcMissing
             : s.SceneLoading ? ErrorCodes.SwitchingScenes
+            : s.Dead && req.InteractionId is InteractPortal or InteractKafraTeleport ? ErrorCodes.TeleportDead
             : req.SceneConfigId != 0 && req.SceneConfigId != s.SceneEntry ? ErrorCodes.NpcParameter
             : req.Pos != null && !WorldCoreService.Finite(req.Pos) ? ErrorCodes.NpcParameter
             : !Near(s, npc) ? ErrorCodes.NpcTooFar
@@ -400,7 +416,10 @@ public sealed partial class SceneService(IOptions<ServerOptions> options, World 
         || row.TryGetProperty("_iInteractID", out var ids) && ids.ValueKind == System.Text.Json.JsonValueKind.Array
             && ids.EnumerateArray().Any(x => Data.GameData.Number(x) == id);
 
-    /// <summary>30012: travel to a map's born point (world-map travel, failed scene load).</summary>
+    /// <summary>
+    /// 30012: travel to a map's born point, for the requests the client really sends one (SceneService.Travel.cs). (inferred)
+    /// A dead role gets the client's own "Cannot teleport while dead", except to its map or the town a failed load falls back to.
+    /// </summary>
     public async Task SceneTeleportAsync(GameSession s, SceneTeleportReq req)
     {
         if (s.Handoff is { Completing: false } pending)
@@ -409,16 +428,33 @@ public sealed partial class SceneService(IOptions<ServerOptions> options, World 
             RequireReconnect(s, pending); // failed load has no nonce: do not arm an ambiguous same-map retry
             return;
         }
-        bool ok = data.Row("MapConfig", req.TargetMapId) != null && worldData.Map(req.TargetMapId) != null;
-        await s.SendGameAsync(SceneTeleport, new SceneTeleportRsp { Result = ok ? 0 : ErrorCodes.SceneMissing });
-        if (ok) await EnterSceneAsync(s, req.TargetMapId);
+        bool known = data.Row("MapConfig", req.TargetMapId) != null && worldData.Map(req.TargetMapId) != null
+            && worldData.ClientCanEnter(req.TargetMapId);
+        int result = !known ? ErrorCodes.SceneMissing : s.Dead && !RescueTarget(s, req.TargetMapId) ? ErrorCodes.TeleportDead : 0;
+        if (result == 0 && !TravelPasses(s, TravelAllowed(s, req.TargetMapId),
+            $"30012 scene {s.SceneEntry} -> {req.TargetMapId}, reason {req.TeleportReason?.EType}"))
+            result = ErrorCodes.Parameter;
+        await s.SendGameAsync(SceneTeleport, new SceneTeleportRsp { Result = result });
+        if (result == 0) await EnterSceneAsync(s, req.TargetMapId);
     }
 
-    /// <summary>30131: a dialog option jumping to a numbered point of a map (e.g. the palace guard).</summary>
+    /// <summary>The role's own map or the main city.</summary>
+    private bool RescueTarget(GameSession s, long target) => target == s.SceneEntry || IsMainCity(target);
+
+    /// <summary>30131: an authored jump to a numbered point of a map (e.g. the palace guard), AuthoredJumps. A dialog needs a
+    /// living role in a loaded scene.</summary>
     public async Task CustomJumpAsync(GameSession s, ClientCustomJumpMapReq req)
     {
+        if (s.Dead || s.SceneLoading)
+        {
+            await s.SendGameAsync(CustomJumpMap, new ClientCustomJumpMapResp { Result = s.Dead ? ErrorCodes.TeleportDead : ErrorCodes.SwitchingScenes });
+            return;
+        }
         var map = data.Row("MapConfig", req.SceneId) != null ? worldData.Map(req.SceneId) : null;
         var point = map?.Points.GetValueOrDefault(req.PointId);
+        if (point != null && !TravelPasses(s, AuthoredJumps().Contains((req.SceneId, req.PointId)),
+            $"30131 scene {s.SceneEntry} -> {req.SceneId} point {req.PointId}"))
+            point = null;
         await s.SendGameAsync(CustomJumpMap, new ClientCustomJumpMapResp { Result = point != null ? 0 : map == null ? ErrorCodes.SceneMissing : ErrorCodes.Parameter });
         if (point is { } p) await EnterSceneAsync(s, req.SceneId, p);
     }
@@ -471,38 +507,17 @@ public sealed partial class SceneService(IOptions<ServerOptions> options, World 
         await world.MoveAsync(s, new WalkReq { Pos = pos, Face = at.Face, BStop = true, SpeedRate = 1 }, forceTeleport: true);
     }
 
+    /// <summary>Set by TerritoryWarsService: whether a walk from a point to another crosses an air wall its dungeon has
+    /// switched on (dungeon var 133); the nav grid does not hold them.</summary>
+    public Func<GameSession, Vec3, Vec3, bool>? WalkBlocked { get; set; }
+
+    /// <summary>Set by TerritoryWarsService: whether a walk crosses something the nav grid does not hold that carries it
+    /// over blocked cells (a siege ladder against the city wall); such a walk is not held to the grid.</summary>
+    public Func<GameSession, Vec3, Vec3, bool>? WalkBridged { get; set; }
+
     /// <summary>
-    /// Checks a client walk against the nav grid and the speed attribute. ServerOptions.WalkCheck:
-    /// "off", "log" (default: report only) or "enforce" (snap the client back to the last good position).
+    /// The player sits on a scripted ride: the client reports the carrier's walk as its own, up the walls of a surface scene and at
+    /// the carrier's speed, neither of which is the player's (LC_Movement_Controller_NavMesh._getAreaMask). The route is the server's.
     /// </summary>
-    public async Task<bool> AcceptWalkAsync(GameSession s, WalkReq walk)
-    {
-        var mode = options.Value.WalkCheck;
-        if (mode == "off" || worldData.Map(s.SceneEntry)?.Nav is not { } nav) return true;
-        var now = DateTime.UtcNow;
-        var from = s.Position;
-        float dx = walk.Pos.X - from.X, dz = walk.Pos.Z - from.Z, dist = MathF.Sqrt(dx * dx + dz * dz);
-        double seconds = Math.Clamp((now - s.LastWalkUtc).TotalSeconds, 0.05, 5);
-        float maxDist = (float)(s.Speed / 100.0 * seconds * 1.5) + 1.5f;
-        string? problem = !nav.IsWalkable(walk.Pos.X, walk.Pos.Y, walk.Pos.Z) ? "unwalkable cell"
-            : dist > maxDist ? $"too fast ({dist:F1} m in {seconds:F2} s, max {maxDist:F1})"
-            : !nav.CanWalk(from.X, from.Y, from.Z, walk.Pos.X, walk.Pos.Z) ? "path crosses unwalkable cells"
-            : null;
-        if (problem == null)
-        {
-            s.LastWalkUtc = now;
-            return true;
-        }
-        // A client off the grid repeats on every walk: the first and every hundredth refusal per session are enough.
-        if (++s.WalkCheckWarnings % 100 == 1)
-            log.LogWarning("Walk check {Name} scene {Scene} {FromX:F1},{FromZ:F1} -> {X:F1},{Y:F1},{Z:F1}: {Problem} ({Count} so far)",
-                s.Role?.Name, s.SceneEntry, from.X, from.Z, walk.Pos.X, walk.Pos.Y, walk.Pos.Z, problem, s.WalkCheckWarnings);
-        if (mode != "enforce")
-        {
-            s.LastWalkUtc = now;
-            return true;
-        }
-        await TeleportInMapAsync(s, new MapPoint(from.X, from.Y, from.Z, s.Face));
-        return false;
-    }
+    public Func<GameSession, bool>? WalkOnRide { get; set; }
 }

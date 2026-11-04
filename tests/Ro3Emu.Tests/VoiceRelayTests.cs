@@ -24,13 +24,14 @@ public sealed class VoiceRelayTests : IAsyncLifetime
         _app = ServerHost.Create([], o =>
         {
             o.DataDir = _dataDir;
+            o.GameDataDir = SyntheticData.Dir;
             o.HttpPort = httpPort;
             o.MicroGatePort = microPort;
             o.GameGatePort = gamePort;
             o.Voice.Port = _voicePort;
-            // Short enough that the "no Auth in time" / idle tests do not need to wait the production defaults.
+            // Short enough that the "no Auth in time" test does not need to wait the production default. The idle
+            // timeout keeps its default: these tests leave a listener silent for seconds, and 2 s closed it (#198).
             o.Voice.FirstFrameTimeoutSeconds = 2;
-            o.Voice.IdleTimeoutSeconds = 2;
         }, _clock);
         await _app.StartAsync();
         _http = $"http://127.0.0.1:{httpPort}";
@@ -179,7 +180,7 @@ public sealed class VoiceRelayTests : IAsyncLifetime
             Assert.Equal(VoiceDown.Audio, type);
             Assert.Equal(aliceRole, BitConverter.ToInt64(payload));
             Assert.Equal(seq, BitConverter.ToUInt16(payload, 8));
-            Assert.Equal(new byte[] { (byte)seq, (byte)seq, (byte)seq }, payload[10..]);
+            Assert.Equal([(byte)seq, (byte)seq, (byte)seq], payload[10..]);
         }
         // Alice never hears her own voice.
         await aliceVoice.ExpectNoneAsync((t, _) => t == VoiceDown.Audio, TimeSpan.FromMilliseconds(300));
@@ -254,7 +255,7 @@ public sealed class VoiceRelayTests : IAsyncLifetime
         var notSeated = await carolVoice.WaitTypeAsync(VoiceDown.JoinResult, Wait);
         Assert.Equal(VoiceJoinCode.NotMember, notSeated.Payload[0]);
 
-        // Tavern rooms (talk type 3) are not served.
+        // No talk type sends this shape (a Tavern room is its guid in decimal: TavernTests).
         await carolVoice.JoinAsync("3_5_1");
         var unsupported = await carolVoice.WaitTypeAsync(VoiceDown.JoinResult, Wait);
         Assert.Equal(VoiceJoinCode.UnsupportedRoom, unsupported.Payload[0]);
@@ -538,6 +539,7 @@ public sealed class VoiceRelayTests : IAsyncLifetime
         Assert.Equal(VoiceKickCode.Flood, kicked.Payload[0]);
         await Wait200UntilAsync(() => aliceVoice.Closed, Wait);
         Assert.True(aliceVoice.Closed);
+        Assert.False(bobVoice.Closed, "Bob's connection closed before Alice's leave");
         await bobVoice.WaitAsync((t, p) => t == VoiceDown.MemberChange && BitConverter.ToInt64(p) == aliceRole && p[8] == 0, Wait);
 
         Assert.False(bobVoice.Closed);
@@ -632,6 +634,7 @@ public sealed class VoiceRelayTests : IAsyncLifetime
         var off = ServerHost.Create([], o =>
         {
             o.DataDir = dataDir;
+            o.GameDataDir = SyntheticData.Dir;
             o.HttpPort = httpPort;
             o.MicroGatePort = microPort;
             o.GameGatePort = gamePort;

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using Google.Protobuf;
 using Romsg;
@@ -28,7 +29,9 @@ public sealed partial class CharacterService
                 goods: next > previous ? [(entry, checked((int)(next - previous)))] : []);
             await SyncItemsAsync(session);
             if (next != previous) foreach (var handler in StateChanged) handler(session);
-            return $"{data.ItemName(entry)}: {next}";
+            return previous > next
+                ? $"Removed {(previous - next).ToString("N0", CultureInfo.InvariantCulture)} {data.ItemName(entry)}; {next.ToString("N0", CultureInfo.InvariantCulture)} left."
+                : $"{data.ItemName(entry)}: {next}";
         }
         var staged = session.Items.Select(i => i.Clone()).ToList();
         int stacks = 0;
@@ -47,7 +50,7 @@ public sealed partial class CharacterService
             costs: consumed > 0 ? [(entry, consumed)] : []);
         await SyncItemsAsync(session);
         if (stacks > 0) foreach (var handler in StateChanged) handler(session);
-        return $"Removed {stacks} stack(s) of {data.ItemName(entry)}.";
+        return consumed > 0 ? $"Removed {consumed.ToString("N0", CultureInfo.InvariantCulture)} {data.ItemName(entry)}." : $"No {data.ItemName(entry)} to remove.";
     }
 
     /// <summary>Owned amount of a currency, or of an item in the bag (not worn or socketed).</summary>
@@ -214,6 +217,7 @@ public sealed partial class CharacterService
         var p = session.Progress!;
         var reward = new Romsg.GetRewardNotify { TargetUid = session.Role!.Id };
         var granted = new List<InvItem>();
+        var shown = new List<ShownGood>();
         var postCommitHooks = new List<(int Entry, int Count)>();
         var decomposed = new ItemAutoDecomposeTipsNtf();
         // Stage under the checked owner and old StateLock, but restore the published owner before
@@ -243,12 +247,10 @@ public sealed partial class CharacterService
             foreach (var (entry, count, bind) in goods.Select(g => (g.Entry, g.Count, Bind: 0)).Concat(boundGoods ?? []).Where(g => g.Count > 0))
             {
                 bool currency;
-                foreach (var item in AddItemCore(session, entry, count, out currency, persist: false, notifyItemGained: false, bind: bind))
-                {
-                    granted.Add(item);
-                }
+                var pieces = AddItemCore(session, entry, count, out currency, persist: false, notifyItemGained: false, bind: bind);
+                granted.AddRange(pieces);
                 if (!currency) postCommitHooks.Add((entry, count));
-                reward.Rewards.Add(ItemInfo(new InvItem { Entry = entry, Stack = count, BindType = bind }));
+                shown.Add(new ShownGood(entry, count, bind, IsEquipment(entry) ? pieces : []));
                 reward.RewardType.Add(1);
             }
             foreach (var grant in attributedGoods ?? [])
@@ -272,6 +274,7 @@ public sealed partial class CharacterService
                 session.Items.Add(item);
                 granted.Add(item);
                 postCommitHooks.Add((item.Entry, item.Stack));
+                shown.Add(new ShownGood(item.Entry, item.Stack, item.BindType, [item]));
             }
             foreach (var (entry, amount) in currencyGoods ?? new Dictionary<int, long>())
                 stagedProgress.Currency[entry] = checked(stagedProgress.Currency.GetValueOrDefault(entry) + amount);
@@ -298,7 +301,7 @@ public sealed partial class CharacterService
             builder.Progress(session.Role.Id, stagedProgress);
             persist?.Invoke(builder);
             lifeUse?.Persist(builder);
-            cardSight = StageFirstCardSight?.Invoke(session, postCommitHooks.Select(g => g.Entry).ToList(),
+            cardSight = StageFirstCardSight?.Invoke(session, [.. postCommitHooks.Select(g => g.Entry)],
                 rewardSettlement?.LibraryMonster ?? 0);
             cardSight?.Persist(builder);
             if (builder.HasCharacterFamilyEconomy && (prunedPlans = PrunedEquipmentPlans(session, stagedItems)) != null)
@@ -309,8 +312,7 @@ public sealed partial class CharacterService
             if (economy != null) builder.WithEconomy(economy);
             if (rewardSettlement != null)
                 builder.WithEconomy(RewardMutation(session, rewardSettlement, beforeProgress, stagedProgress,
-                    need, goods.Concat((boundGoods ?? []).Select(g => (g.Entry, g.Count)))
-                        .Concat(rewardSettlement.AdditionalGoods).ToArray(),
+                    need, [.. goods, .. (boundGoods ?? []).Select(g => (g.Entry, g.Count)), .. rewardSettlement.AdditionalGoods],
                     baseExp, jobExp, decomposed));
         }
         finally
@@ -339,6 +341,7 @@ public sealed partial class CharacterService
                 }
                 for (int i = 0; i < granted.Count; i++) granted[i] = mapped[granted[i]];
                 CopyProgress(p, stagedProgress);
+                if (baseExp > 0 || jobExp > 0) foreach (var credited in ExpCredited) credited(session, baseExp, jobExp);
                 if (rewardSettlement != null) rewardSettlement.Committed = true;
                 foreach (var item in granted) session.NewItems.Add(item.Guid);
                 cardSight?.Apply();
@@ -413,6 +416,10 @@ public sealed partial class CharacterService
             if (sync) await SyncItemsAsync(session); // else the caller sends 5009 (ItemsChangedAsync) when it fits
             if (decomposed.DecomposeItemInfo.Count > 0)
                 await session.SendGameAsync(EquipmentService.ItemAutoDecomposeNotice, decomposed);
+            // Built after commit: only then does a new piece carry the bag instance id the quick-equip offer needs.
+            foreach (var good in shown) reward.Rewards.AddRange(GainedInfos(granted, good));
+            foreach (var (entry, amount) in currencyGoods ?? new Dictionary<int, long>()) AddVirtualReward(reward, entry, amount);
+            if (reward.Rewards.Count > 0 && reward.RewardType.Count == 0) reward.RewardType.Add(1);
             if (baseExp > 0 || jobExp > 0)
             {
                 if (rewardSettlement?.CommandKind == "monster-kill")
@@ -431,12 +438,32 @@ public sealed partial class CharacterService
             if (popup && reward.Rewards.Count > 0) await session.SendGameAsync(GetRewardNotify, reward);
             // LifeJob publishes its committed life/restriction state after Exchange returns. Its ItemsChangedAsync
             // runs this first notification once those fields agree with the already committed bag and cooldown.
-            if (lifeUse != null) lifeUse.PendingStateChanged = StateChanged.ToArray();
+            if (lifeUse != null) lifeUse.PendingStateChanged = [.. StateChanged];
             else foreach (var handler in StateChanged) handler(session);
         }
         if (rewardSettlement?.DeferPresentation == true) rewardSettlement.Presentation = PresentExchangeAsync;
         else await PresentExchangeAsync();
         return granted;
+    }
+
+    /// <summary>One granted good of an exchange's 31322 notice, with the bag pieces that describe it.</summary>
+    private readonly record struct ShownGood(int Entry, int Count, int Bind, List<InvItem> Pieces);
+
+    /// <summary>
+    /// A good's 31322 entries, as the drop notice's (RewardService.DropInfos): the client hands ManifestTypeFloat infos
+    /// to FastUseManager.AddFastUse (LC_TipHelper.PopRewardTip), and LC_EquipmentHelper.CanFastEquip offers to wear a
+    /// piece only when it has an instance id, an appraised kEquipInfo and an iScore. So each committed piece is
+    /// described as the bag item itself; the rest (stackables, pieces auto-decomposed) stays entry and count.
+    /// </summary>
+    private IEnumerable<ItemBaseInfo> GainedInfos(List<InvItem> granted, ShownGood good)
+    {
+        int left = good.Count;
+        foreach (var piece in good.Pieces.Where(piece => granted.Any(item => ReferenceEquals(item, piece))))
+        {
+            left -= piece.Stack;
+            yield return ItemInfo(piece);
+        }
+        if (left > 0) yield return ItemInfo(new InvItem { Entry = good.Entry, Stack = left, BindType = good.Bind });
     }
 
     private void PayExchange(GameSession session, List<(int Entry, long Count)> need, List<(InvItem Item, int Count)> picked,
@@ -568,7 +595,7 @@ public sealed partial class CharacterService
             return Task.FromResult<List<InvItem>?>(null);
         var before = session.Items;
         var currency = session.Progress!.Currency.ToDictionary();
-        session.Items = before.Select(i => i.Clone()).ToList(); // every per-instance field survives the staging
+        session.Items = [.. before.Select(i => i.Clone())]; // every per-instance field survives the staging
         var granted = new List<InvItem>();
         try
         {

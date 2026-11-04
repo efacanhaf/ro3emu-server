@@ -14,8 +14,18 @@ public sealed class DatabaseBackupTests : IDisposable
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ro3-backup-" + Guid.NewGuid().ToString("N"));
     private ServerOptions Options() => new() { DataDir = _dir };
     private AccountStore Store() => new(Microsoft.Extensions.Options.Options.Create(Options()));
-    private DatabaseBackup Backup(AccountStore accounts) =>
-        new(Microsoft.Extensions.Options.Options.Create(Options()), accounts, NullLogger<DatabaseBackup>.Instance);
+    private DatabaseBackup Backup(AccountStore accounts, BackupOptions? settings = null) =>
+        new(Microsoft.Extensions.Options.Options.Create(new ServerOptions { DataDir = _dir, Backup = settings ?? new() }), accounts, NullLogger<DatabaseBackup>.Instance);
+
+    /// <summary>A plain copy as is; a compressed one unpacked beside the test data, then checked like a plain one.</summary>
+    private string Unpacked(string copy)
+    {
+        if (!DatabaseBackup.IsCompressed(copy)) return copy;
+        string plain = Path.Combine(_dir, Path.GetFileNameWithoutExtension(copy) + ".unpacked");
+        using (var gzip = new System.IO.Compression.GZipStream(File.OpenRead(copy), System.IO.Compression.CompressionMode.Decompress))
+        using (var to = File.Create(plain)) gzip.CopyTo(to);
+        return plain;
+    }
 
     private static (double X, long Revision) PositionAndRevision(string path, long role)
     {
@@ -61,7 +71,8 @@ public sealed class DatabaseBackupTests : IDisposable
         long previous = 0;
         foreach (var copy in copies)
         {
-            var (x, revision) = PositionAndRevision(copy, role.Id);
+            // Later backups compressed the older copies.
+            var (x, revision) = PositionAndRevision(File.Exists(copy) ? copy : Unpacked(copy[..^3] + DatabaseBackup.CompressedExtension), role.Id);
             Assert.Equal(offset, (long)x - revision); // the row and its revision come from the same commit
             Assert.True(revision >= previous, "later backups never go back in time");
             previous = revision;
@@ -84,9 +95,158 @@ public sealed class DatabaseBackupTests : IDisposable
         var made = Enumerable.Range(0, 22).Select(_ => backup.Backup()).ToList();
         var kept = DatabaseBackup.Completed(backup.Directory).ToList();
         Assert.Equal(20, kept.Count);
-        Assert.Equal(made.TakeLast(20).OrderBy(f => f), kept.OrderBy(f => f));
-        foreach (var file in kept) DatabaseRestore.Validate(file);
+        // The newest two stay plain, the other eighteen are their compressed selves.
+        Assert.Equal(made.TakeLast(2).OrderBy(f => f), kept.Take(2).OrderBy(f => f));
+        Assert.Equal(made.Skip(2).Take(18).Select(f => f[..^3] + DatabaseBackup.CompressedExtension).OrderBy(f => f),
+            kept.Skip(2).OrderBy(f => f));
+        foreach (var file in kept) DatabaseRestore.Validate(Unpacked(file));
         Assert.True(File.Exists(stale)); // only the service's startup removes it (no backup can be running then)
+    }
+
+    [Fact]
+    public void ACopyThatRunsOutOfDiskLeavesNoPartialFileBehind()
+    {
+        using var accounts = Store();
+        new RoleStore(accounts).Create("full", 1, "Full", 1, 1000, 1);
+        var backup = Backup(accounts);
+        // The destination cannot grow past one page: SQLite reports the disk full mid-copy.
+        backup.BeforeCopyForTest = destination =>
+        {
+            using var cap = destination.CreateCommand();
+            cap.CommandText = "PRAGMA max_page_count=1";
+            cap.ExecuteNonQuery();
+        };
+        Assert.Throws<SqliteException>(() => backup.Backup());
+        Assert.Empty(Directory.GetFiles(backup.Directory));
+        backup.BeforeCopyForTest = null;
+        DatabaseRestore.Validate(backup.Backup());
+    }
+
+    [Fact]
+    public void ABackupRemovesTheOldestCopiesToLeaveTheLiveDatabaseItsReserve()
+    {
+        using var accounts = Store();
+        new RoleStore(accounts).Create("room", 1, "Room", 1, 1000, 1);
+        var backup = Backup(accounts, new BackupOptions { Uncompressed = 20 });
+        long disk = long.MaxValue / 2;
+        backup.FreeBytes = dir => disk - Directory.GetFiles(dir).Sum(f => new FileInfo(f).Length);
+        var made = Enumerable.Range(0, 5).Select(_ => backup.Backup()).ToList();
+        long copy = new FileInfo(made[0]).Length;
+
+        // The next copy fits beside the reserve only once the two oldest copies are gone.
+        disk = 5 * copy + backup.RequiredFreeBytes() - 2 * copy;
+        var next = backup.Backup();
+        Assert.Equal(made.Skip(2).Append(next).OrderBy(f => f), DatabaseBackup.Completed(backup.Directory).OrderBy(f => f));
+    }
+
+    [Fact]
+    public void ABackupThatCannotFitKeepsTheNewestCopiesAndSkips()
+    {
+        using var accounts = Store();
+        new RoleStore(accounts).Create("skip", 1, "Skip", 1, 1000, 1);
+        var backup = Backup(accounts, new BackupOptions { Uncompressed = 20 });
+        long disk = long.MaxValue / 2;
+        backup.FreeBytes = dir => disk - Directory.GetFiles(dir).Sum(f => new FileInfo(f).Length);
+        var made = Enumerable.Range(0, 4).Select(_ => backup.Backup()).ToList();
+        long copy = new FileInfo(made[0]).Length;
+
+        // Removing every copy but the newest two would still leave less than a copy and the reserve: nothing is
+        // removed and no copy is started.
+        disk = 4 * copy + backup.RequiredFreeBytes() - 3 * copy;
+        Assert.Contains("free", Assert.Throws<IOException>(() => backup.Backup()).Message);
+        Assert.Equal(made.OrderBy(f => f), Directory.GetFiles(backup.Directory).OrderBy(f => f));
+    }
+
+    [Fact]
+    public void TheReserveFollowsTheSetting()
+    {
+        using var accounts = Store();
+        long big = Backup(accounts, new BackupOptions { ReserveMegabytes = 2 }).RequiredFreeBytes();
+        long none = Backup(accounts, new BackupOptions { ReserveMegabytes = 0 }).RequiredFreeBytes();
+        Assert.InRange(big - none, 2L * 1024 * 1024 - 1024 * 1024, 2L * 1024 * 1024 + 1024 * 1024);
+    }
+
+    [Fact]
+    public void ASmallDatabaseKeepsItsStartupCopyAndEveryCheck()
+    {
+        using var accounts = Store();
+        var backup = Backup(accounts);
+        backup.Backup();
+        Assert.Equal(TimeSpan.Zero, backup.UntilNextBackup(DateTime.UtcNow));
+        Assert.True(backup.IntegrityCheckDue(DateTime.UtcNow));
+    }
+
+    [Fact]
+    public void ABigDatabaseRestartWaitsForTheIntervalSinceTheNewestCopy()
+    {
+        using var accounts = Store();
+        var backup = Backup(accounts);
+        backup.DatabaseBytes = () => 5L << 30;
+        Assert.Equal(TimeSpan.Zero, backup.UntilNextBackup(DateTime.UtcNow)); // no copy yet
+        var copy = backup.Backup();
+        var now = DateTime.UtcNow;
+        Assert.InRange(backup.UntilNextBackup(now), TimeSpan.FromHours(5.9), TimeSpan.FromHours(6));
+        File.SetLastWriteTimeUtc(copy, now - TimeSpan.FromHours(7));
+        Assert.Equal(TimeSpan.Zero, backup.UntilNextBackup(now));
+    }
+
+    [Fact]
+    public void ABigDatabaseChecksAScheduledCopyOnceADay()
+    {
+        using var accounts = Store();
+        var backup = Backup(accounts);
+        backup.DatabaseBytes = () => 5L << 30;
+        var now = DateTime.UtcNow;
+        Assert.True(backup.IntegrityCheckDue(now)); // never checked
+
+        // An unchecked copy is still a good copy and doesn't count as a check.
+        DatabaseRestore.Validate(backup.Backup(verify: false));
+        Assert.True(backup.IntegrityCheckDue(now));
+
+        backup.Backup();
+        Assert.False(backup.IntegrityCheckDue(DateTime.UtcNow));
+        Assert.True(backup.IntegrityCheckDue(DateTime.UtcNow + TimeSpan.FromHours(25)));
+    }
+
+    [Fact]
+    public void CompressedCopiesKeepTheirTimeAndRestoreLikePlainOnes()
+    {
+        string first;
+        long id;
+        using (var accounts = Store())
+        {
+            var roles = new RoleStore(accounts);
+            id = roles.Create("packed", 1, "Before", 1, 1000, 1)!.Id;
+            var backup = Backup(accounts, new BackupOptions { Keep = 5, Uncompressed = 1 });
+            first = backup.Backup();
+            var time = File.GetLastWriteTimeUtc(first);
+            roles.Create("packed", 1, "After", 1, 1000, 1);
+            backup.Backup();
+            string packed = first[..^3] + DatabaseBackup.CompressedExtension;
+            Assert.False(File.Exists(first));
+            Assert.Equal(time, File.GetLastWriteTimeUtc(packed));
+            Assert.True(new FileInfo(packed).Length < new FileInfo(DatabaseBackup.Completed(backup.Directory).First()).Length);
+            first = packed;
+        }
+        SqliteConnection.ClearAllPools();
+
+        Assert.NotNull(DatabaseRestore.Restore(_dir, first));
+        Assert.False(File.Exists(Path.Combine(_dir, "ro3emu.db.restoring")));
+        using var restored = Store();
+        Assert.Equal(["Before"], new RoleStore(restored).ForAccount("packed").Select(r => r.Name).ToList());
+        Assert.NotNull(new RoleStore(restored).Get(id));
+    }
+
+    [Fact]
+    public void KeepAndUncompressedSetHowManyCopiesStayAndHowManyArePlain()
+    {
+        using var accounts = Store();
+        new RoleStore(accounts).Create("count", 1, "Count", 1, 1000, 1);
+        var backup = Backup(accounts, new BackupOptions { Keep = 4, Uncompressed = 4 });
+        for (int i = 0; i < 6; i++) backup.Backup();
+        var kept = DatabaseBackup.Completed(backup.Directory).ToList();
+        Assert.Equal(4, kept.Count);
+        Assert.All(kept, f => Assert.False(DatabaseBackup.IsCompressed(f)));
     }
 
     [Fact]
@@ -125,7 +285,11 @@ public sealed class DatabaseBackupTests : IDisposable
         Directory.CreateDirectory(Path.GetDirectoryName(stale)!);
         File.WriteAllText(stale, "half a database");
         var (http, micro, game) = TestPorts.FreePorts();
-        void Configure(ServerOptions o) { o.DataDir = _dir; o.HttpPort = http; o.MicroGatePort = micro; o.GameGatePort = game; }
+        void Configure(ServerOptions o)
+        {
+            o.DataDir = _dir; o.GameDataDir = SyntheticData.Dir;
+            o.HttpPort = http; o.MicroGatePort = micro; o.GameGatePort = game;
+        }
         var app = ServerHost.Create([], Configure);
         await app.StartAsync();
         string copy;
@@ -150,7 +314,11 @@ public sealed class DatabaseBackupTests : IDisposable
     public async Task LoopWaitInventoryCountsOnlySynchronousWaitsOnTheLoopByLabel()
     {
         var (http, micro, game) = TestPorts.FreePorts();
-        await using var app = ServerHost.Create([], o => { o.DataDir = _dir; o.HttpPort = http; o.MicroGatePort = micro; o.GameGatePort = game; });
+        await using var app = ServerHost.Create([], o =>
+        {
+            o.DataDir = _dir; o.GameDataDir = SyntheticData.Dir;
+            o.HttpPort = http; o.MicroGatePort = micro; o.GameGatePort = game;
+        });
         await app.StartAsync();
         var accounts = app.Services.GetRequiredService<AccountStore>();
         var roles = app.Services.GetRequiredService<RoleStore>();
@@ -180,7 +348,7 @@ public sealed class DatabaseBackupTests : IDisposable
         using (var accounts = Store()) new RoleStore(accounts).Create("keep", 1, "Keep", 1, 1000, 1);
         SqliteConnection.ClearAllPools();
         string junk = Path.Combine(_dir, "junk.db");
-        File.WriteAllBytes(junk, Enumerable.Repeat((byte)0x5A, 8192).ToArray());
+        File.WriteAllBytes(junk, [.. Enumerable.Repeat((byte)0x5A, 8192)]);
         Assert.ThrowsAny<Exception>(() => DatabaseRestore.Restore(_dir, junk));
         string foreign = Path.Combine(_dir, "foreign.db");
         using (var db = new SqliteConnection($"Data Source={foreign};Pooling=False"))
@@ -260,7 +428,7 @@ public sealed class DatabaseBackupTests : IDisposable
         Assert.False(Directory.Exists(Path.Combine(_dir, "restore-saved")));
         Assert.Equal(["After", "Before"], RoleNames(Live));
         using var accounts = Store();
-        Assert.Equal(2, new RoleStore(accounts).ForAccount("fault").Count());
+        Assert.Equal(2, new RoleStore(accounts).ForAccount("fault").Count);
     }
 
     [Theory]
@@ -276,7 +444,7 @@ public sealed class DatabaseBackupTests : IDisposable
         Assert.False(File.Exists(DatabaseRestore.MarkerPath(_dir)));
         Assert.False(File.Exists(Live + DatabaseRestore.IncomingSuffix));
         Assert.Equal(["After", "Before"], RoleNames(Live));
-        using (var accounts = Store()) Assert.Equal(2, new RoleStore(accounts).ForAccount("fault").Count());
+        using (var accounts = Store()) Assert.Equal(2, new RoleStore(accounts).ForAccount("fault").Count);
         SqliteConnection.ClearAllPools();
         Assert.NotNull(DatabaseRestore.Restore(_dir, copy)); // nothing was left half-done: a clean retry works
         Assert.Equal(["Before"], RoleNames(Live));
@@ -302,7 +470,8 @@ public sealed class DatabaseBackupTests : IDisposable
         Assert.Contains("unfinished database restore", Assert.Throws<InvalidOperationException>(() => ServerHost.Create([], o =>
         {
             var (http, micro, game) = TestPorts.FreePorts();
-            o.DataDir = _dir; o.HttpPort = http; o.MicroGatePort = micro; o.GameGatePort = game;
+            o.DataDir = _dir; o.GameDataDir = SyntheticData.Dir;
+            o.HttpPort = http; o.MicroGatePort = micro; o.GameGatePort = game;
         })).Message);
         Assert.False(File.Exists(Live));
 

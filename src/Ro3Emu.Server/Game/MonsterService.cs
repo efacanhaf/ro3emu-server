@@ -10,7 +10,7 @@ namespace Ro3Emu.Server.Game;
 /// skill, spawning the scene-editor groups when a map is first entered, the AI (roam, chase, attack, leash) on the map
 /// tick, death, corpse removal and respawn. Combat math and hits go through CombatService.
 /// </summary>
-public sealed partial class MonsterService : MonsterBrain, IGameTicker
+public sealed partial class MonsterService : IMonsterBrain, IGameTicker
 {
     private readonly World _world;
     private readonly WorldData _worldData;
@@ -19,12 +19,18 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
     private readonly ILogger<MonsterService> _log;
     private readonly ReconstructedDungeons? _reconstructed;
     private readonly BossSkillOptions _bossOptions;
+    private readonly Dictionary<(long Scene, int Npc), int> _spawnLimits;
 
     public MonsterService(World world, WorldData worldData, GameData data, GameLoop loop, ILogger<MonsterService> log,
         ReconstructedDungeons? reconstructed = null, Microsoft.Extensions.Options.IOptions<ServerOptions>? options = null)
     {
         this._reconstructed = reconstructed;
         _bossOptions = options?.Value.BossSkills ?? new BossSkillOptions();
+        _ro1Aggressive = Ro1Aggressive(options?.Value); // MonsterService.Ro1Aggression
+        _ro1MaxLevelGap = options?.Value.Ro1AggressiveMaxLevelGap ?? 0;
+        _spawnLimits = (options?.Value.SpawnLimits ?? []).Where(r => r.Npc > 0 && r.Max >= 0)
+            .GroupBy(r => (r.Scene, r.Npc)).ToDictionary(g => g.Key, g => g.Last().Max);
+        _ro1Hp = Ro1Hp(options?.Value); // MonsterService.Ro1Hp
         this._world = world;
         this._worldData = worldData;
         this._data = data;
@@ -36,27 +42,42 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
                 owner.Units.Remove(monster);
             return unit is MonsterUnit { BossSkills: not null } boss ? EndBossSkillsTask(boss, interrupt: false) ?? Task.CompletedTask : Task.CompletedTask;
         });
+        world.UnitRemoved.Add(ForgetCompanionTargets);
+        world.UnitRemoved.Add(ForgetSurroundSlot);
     }
 
     private const long UidBase = 1L << 41;
+    /// <summary>
+    /// (inferred) The only AI whose monsters attack on sight (Familiar, Thief Bug Male, Poison Spore). The client does not
+    /// establish it: AIConfig 20000004 and 20000001 (the passive field monsters) are identical in all their fields.
+    /// </summary>
     private const int AggressiveAi = 20000004;
 
     /// <summary>A walk segment is capped so a monster seen mid-way is re-synchronized soon.</summary>
     private const float MaxSegment = 12f;
 
-    private readonly Dictionary<int, MonsterTemplate?> _templates = new();
+    /// <summary>A chasing monster re-paths toward its target this often, or when its segment ended.</summary>
+    private const int ChaseRepathMs = 400;
+
+    /// <summary>A chase step shorter than this is not walked.</summary>
+    internal const float MinChaseStep = 0.2f;
+
+    /// <summary>The chase stops this share of the attack range away from the target.</summary>
+    private const float ApproachShare = 0.8f;
+
+    private readonly Dictionary<int, MonsterTemplate?> _templates = [];
     private sealed class SpawnState
     {
         public bool InitialSpawned;
         public bool Retired;
         public int Pending;
-        public readonly Dictionary<int, HashSet<int>> UsedPoints = new();
-        public readonly HashSet<MonsterUnit> Units = new();
-        public readonly List<(TimeSpan Due, Func<Task> Work)> Deadlines = new();
+        public readonly Dictionary<int, HashSet<int>> UsedPoints = [];
+        public readonly HashSet<MonsterUnit> Units = [];
+        public readonly List<(TimeSpan Due, Func<Task> Work)> Deadlines = [];
         public readonly TaskCompletionSource Quiesced = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
-    private readonly Dictionary<RuntimeMapKey, SpawnState> _spawns = new();
+    private readonly Dictionary<RuntimeMapKey, SpawnState> _spawns = [];
     private readonly Random _random = new();
     private long _serial;
 
@@ -68,21 +89,45 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
 
     public MonsterTemplate? Template(int npcId)
     {
-        if (!_templates.TryGetValue(npcId, out var t)) _templates[npcId] = t = Build(npcId);
+        if (!_templates.TryGetValue(npcId, out var t)) _templates[npcId] = t = Build(npcId, machine: false);
         return t;
     }
 
-    private MonsterTemplate? Build(int npcId)
+    private readonly Dictionary<int, MonsterTemplate?> _machineTemplates = [];
+
+    /// <summary>
+    /// A siege war machine's stats: the cannons and vehicles are NPCConfig _iNPCType 2 rows (sub types 102 and 103), whose
+    /// _iAttributeVariated and _iLevel select an AttriMonsterConfig row as a monster's do (222059: 69 170 HP). The client
+    /// shows its HP bar from properties 101 and 2000 like a monster's.
+    /// </summary>
+    public MonsterTemplate? MachineTemplate(int npcId)
     {
-        if (_data.Row("NPCConfig", npcId) is not { } npc || GameData.Int(npc, "_iNPCType") != 1) return null;
-        int level = (int)GameData.Int(npc, "_iLevel");
+        if (!_machineTemplates.TryGetValue(npcId, out var t)) _machineTemplates[npcId] = t = Build(npcId, machine: true);
+        return t;
+    }
+
+    /// <summary>
+    /// A monster's attributes by AttributeConfig id (101 HP, 103 PATK, ...): its AttriMonsterConfig row (_iAttribute,
+    /// else _iAttributeVariated * 1000 + level), each value scaled by the NPC's _kAttriScale per 10000. The web panel's
+    /// monster database shows the same numbers.
+    /// </summary>
+    internal static Dictionary<long, double> TemplateAttributes(GameData data, JsonElement npc, int level)
+    {
         long attrId = GameData.Int(npc, "_iAttribute");
         if (attrId == 0) attrId = GameData.Int(npc, "_iAttributeVariated") * 1000 + level;
         var attr = new Dictionary<long, double>();
-        if (_data.Row("AttriMonsterConfig", attrId) is { } am)
+        if (data.Row("AttriMonsterConfig", attrId) is { } am)
             foreach (var (id, v) in GameData.Pairs(am, "_kAttri")) attr[id] = v;
         foreach (var (id, scale) in GameData.Pairs(npc, "_kAttriScale"))
-            if (attr.ContainsKey(id)) attr[id] = attr[id] * scale / 10000;
+            if (attr.TryGetValue(id, out var value)) attr[id] = value * scale / 10000;
+        return attr;
+    }
+
+    private MonsterTemplate? Build(int npcId, bool machine)
+    {
+        if (_data.Row("NPCConfig", npcId) is not { } npc || !machine && GameData.Int(npc, "_iNPCType") != 1) return null;
+        int level = (int)GameData.Int(npc, "_iLevel");
+        var attr = TemplateAttributes(_data, npc, level);
         long A(long id) => (long)Math.Round(attr.GetValueOrDefault(id));
 
         int ai = (int)GameData.Int(npc, "_iAI");
@@ -113,11 +158,11 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
                 attr[id] = attr[id] * (id == 101 ? solo.Hp : solo.Attack) / 10000;
         }
         return new MonsterTemplate(
-            npcId, level, Math.Max(1, A(101)), A(102), A(103), A(104), A(105), A(106),
+            npcId, level, _ro1Hp.TryGetValue(npcId, out int ro1Hp) ? ro1Hp : Math.Max(1, A(101)), A(102), A(103), A(104), A(105), A(106),
             Hit: attr.ContainsKey(109) ? A(109) : level + 1, Flee: attr.ContainsKey(110) ? A(110) : level, Cri: A(111),
             speed, (int)GameData.Int(npc, "_iElement"), (int)GameData.Int(npc, "_iRace"), (int)GameData.Int(npc, "_iSize"),
             Math.Max(1, (int)GameData.Int(npc, "_iCamp")),
-            Aggressive: ai == AggressiveAi,
+            Aggressive: ai == AggressiveAi || _ro1Aggressive.Contains(npcId), // the RO1 reference (inferred), when switched on
             RoamDistance: speed > 0 ? Cm("_iRoamDis", 0) : 0, RoamTimeMs: aiRow is { } r2 ? (int)Math.Max(2000, GameData.Int(r2, "_iRoamTime")) : 8000,
             ViewRange: Cm("_iViewRange", 5), LeashDistance: aiRow is { } r3 && r3.TryGetProperty("_iUnFightParam", out var uf) && uf.ValueKind == JsonValueKind.Array
                 && uf.GetArrayLength() > 0 && GameData.Number(uf[0]) is { } leash ? (float)leash / 100 : Cm("_iChaseDistance", 18),
@@ -125,7 +170,19 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
         {
             Skills = BossBook(npcId, npc, skill),
             CastSpeed = A(AttributeId.CastSpeed),
+            SurroundDistance = SurroundSpacing(_data, ai),
+            BattleCallRange = aiRow is { } call && new Data.Config.AIConfig(call).BattleCallType == 1 ? new Data.Config.AIConfig(call).BattleCallDistance / 100f : 0,
+            DamageRadius = DamageRadiusOf(npc),
+            IsBoss = new Data.Config.NPCConfig(npc).NPCSubType is 3 or 4 or 6,
+            AnswersBattleCall = aiRow is { } answer && new Data.Config.AIConfig(answer).BattleCallResponse == 1,
         };
+    }
+
+    private float DamageRadiusOf(JsonElement npc)
+    {
+        var config = new Data.Config.NPCConfig(npc);
+        long min = _data.Table("PublicParamConfig").TryGetValue("MinCollisionCircleRadius", out var v) ? (long)(GameData.Number(v) ?? 110) : 110;
+        return Data.Config.UnitConfig.Get(_data, config.UnitId)?.DamageRadius(config, min) ?? 0;
     }
 
     private BossNormalAttacks? _bossAttacks;
@@ -152,6 +209,9 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
 
     // ---- spawning ----
 
+    /// <summary>A pool group's rolled count under a <see cref="ServerOptions.SpawnLimits"/> rule (a negative limit: none).</summary>
+    internal static int LimitedCount(int count, int limit) => limit < 0 ? count : Math.Min(count, limit);
+
     /// <summary>Compatibility entry point for the original public map, line 1.</summary>
     public Task EnsureSpawnedAsync(long scene) => EnsureSpawnedAsync(RuntimeMapKey.Public(scene));
 
@@ -176,7 +236,7 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
                     {
                         if (state.Retired) break;
                         if (Template(npcId) == null) continue;
-                        int n = _random.Next(min, max + 1);
+                        int n = LimitedCount(_random.Next(min, max + 1), _spawnLimits.GetValueOrDefault((runtime.SceneEntry, npcId), -1));
                         for (int i = 0; i < n && !state.Retired; i++) count += await SpawnAsync(runtime, state, map, group, npcId) ? 1 : 0;
                     }
                 }
@@ -196,11 +256,12 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
     private async Task<bool> SpawnAsync(RuntimeMapKey runtime, SpawnState state, MapWorld map, SpawnGroup group, int npcId, SpawnPoint? at = null)
     {
         if (state.Retired) return false;
-        if (!state.UsedPoints.TryGetValue(group.Id, out var used)) state.UsedPoints[group.Id] = used = new();
+        if (!state.UsedPoints.TryGetValue(group.Id, out var used)) state.UsedPoints[group.Id] = used = [];
         var point = at ?? group.Points.Where(p => !used.Contains(p.Id)).OrderBy(_ => _random.Next()).FirstOrDefault();
         if (point == null || Template(npcId) is not { } template) return false;
         used.Add(point.Id);
-        var pos = map.Grounded(new MapPoint(point.X, point.Y, point.Z, point.Face));
+        // Some of a map's spawn points sit in a blocked cell, where the monster could neither walk nor be walked to.
+        var pos = map.Standable(map.Grounded(new MapPoint(point.X, point.Y, point.Z, point.Face)));
         var monster = new MonsterUnit
         {
             Uid = UidBase | ++_serial,
@@ -244,7 +305,7 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
         // every spawn state on every tick, due or not.
         List<SpawnState>? ready = null;
         foreach (var state in _spawns.Values)
-            if (!state.Retired && state.Deadlines.Count > 0 && state.Deadlines.Exists(d => d.Due <= time.Now)) (ready ??= new()).Add(state);
+            if (!state.Retired && state.Deadlines.Count > 0 && state.Deadlines.Exists(d => d.Due <= time.Now)) (ready ??= []).Add(state);
         if (ready != null) foreach (var state in ready) RunDue(state, time.Now);
     }
 
@@ -288,13 +349,14 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
     /// A monster outside the map's spawn groups (field MVPs): no group respawn, the caller decides when it comes back.
     /// </summary>
     public async Task<MonsterUnit?> SpawnSingleAsync(long scene, int npcId, MapPoint at, long instanceId = 0,
-        int hpRatio = 10000, int damageRatio = 10000, MonsterTemplate? customTemplate = null)
+        int hpRatio = 10000, int damageRatio = 10000, MonsterTemplate? customTemplate = null, bool grounded = true)
         => await SpawnSingleAsync(instanceId == 0 ? RuntimeMapKey.Public(scene) : RuntimeMapKey.Private(scene, instanceId),
-            npcId, at, hpRatio, damageRatio, customTemplate);
+            npcId, at, hpRatio, damageRatio, customTemplate, grounded);
 
-    /// <summary>Spawn an independent actor on an explicit public line/private room/event runtime.</summary>
+    /// <summary>Spawn an independent actor on an explicit public line/private room/event runtime; <paramref name="grounded"/>
+    /// false keeps the given height (NpcLevelPointRespawnConfig _iNotGroundBorn).</summary>
     public async Task<MonsterUnit?> SpawnSingleAsync(RuntimeMapKey runtime, int npcId, MapPoint at,
-        int hpRatio = 10000, int damageRatio = 10000, MonsterTemplate? customTemplate = null)
+        int hpRatio = 10000, int damageRatio = 10000, MonsterTemplate? customTemplate = null, bool grounded = true)
     {
         if ((customTemplate ?? Template(npcId)) is not { } template || template.NpcId != npcId
             || _worldData.Map(runtime.SceneEntry) is not { } map
@@ -313,7 +375,7 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
                 + (template.MaxHp % 10000 * hpRatio + 5000) / 10000);
             template = template with { MaxHp = hp };
             var point = new SpawnPoint(-1, at.X, at.Y, at.Z, at.Face, npcId);
-            var pos = map.Grounded(at);
+            var pos = grounded ? map.Grounded(at) : at;
             var monster = new MonsterUnit
             {
                 Uid = UidBase | ++_serial, SceneEntry = runtime.SceneEntry, RuntimeMap = runtime,
@@ -351,7 +413,7 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
         float best = float.MaxValue;
         foreach (var p in m.Viewers)
         {
-            if (p.Role == null || p.Dead || TargetVisible?.Invoke(m, p) == false) continue;
+            if (p.Role == null || p.Dead || TargetVisible?.Invoke(m, p) == false || Spares?.Invoke(m, p) == true) continue;
             float d = Distance(m, p);
             if (d <= m.Template.ViewRange && d < best) { best = d; near = p; }
         }
@@ -359,6 +421,10 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
     }
 
     internal Func<MonsterUnit, GameSession, bool>? TargetVisible { get; set; }
+
+    /// <summary>Set by a gameplay: a player the monster never takes as its target (the siege castle spares its own
+    /// camp, TerritoryWarsService.SiegeUnits).</summary>
+    internal Func<MonsterUnit, GameSession, bool>? Spares { get; set; }
 
     internal Func<WorldUnit, int, bool>? Forbidden { get; set; }
 
@@ -399,7 +465,8 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
             if (now >= m.EndMs)
             {
                 m.Moving = false;
-                if (m.Target == null) SendStop(m, now);
+                // A marching monster's next leg starts below in this tick: no stop in between.
+                if (m.Target == null && m.March is not { Arrived: false }) SendStop(m, now);
             }
         }
         if (m.PetTarget != null)
@@ -412,7 +479,8 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
             Fight(m, map, now);
             return;
         }
-        if (m.Template.Aggressive && m.Viewers.Count > 0 && !m.Returning)
+        if (_companionTargets.Count > 0 && FightsCompanion(m, map, now)) return; // MonsterService.Companions
+        if (m.Viewers.Count > 0 && !m.Returning && AttacksOnSight(m))
         {
             var near = NearestTarget(m);
             if (near != null)
@@ -421,10 +489,15 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
                 return;
             }
         }
+        if (m.March is { } march)
+        {
+            March(m, map, march, now); // MonsterService.March
+            return;
+        }
         if (m.Returning && !m.Moving)
         {
             m.Returning = false;
-            if (m.Hp < m.Template.MaxHp)
+            if (m.Hp < m.Template.MaxHp && !m.KeepsDamage)
             {
                 m.Hp = m.Template.MaxHp;
                 SendHealth(m);
@@ -481,23 +554,49 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
         await _world.ToUnitViewersAsync(monster, CombatService.AoiAttrChange, SpeedChange(monster, now));
     }
 
-    /// <summary>A player hit it (or came into view of an aggressive one): chase and attack.</summary>
-    public void Engage(MonsterUnit m, GameSession target)
+    /// <summary>A player hit it (or came into view of an aggressive one): chase and attack. A monster that enters the
+    /// fight calls its own into it (<see cref="CallIntoBattle"/>).</summary>
+    public void Engage(MonsterUnit m, GameSession target) => Engage(m, target, called: false);
+
+    private void Engage(MonsterUnit m, GameSession target, bool called)
     {
-        if (m.Dead || m.WorldScene != target.WorldScene || TargetVisible?.Invoke(m, target) == false || m.Template.SpeedCm == 0 && m.Template.AttackRange <= 0) return;
-        if (m.Target == null) m.NextSwingMs = NowMs + 300;
+        if (m.Dead || m.StaysOutOfBattle || m.WorldScene != target.WorldScene || TargetVisible?.Invoke(m, target) == false
+            || Spares?.Invoke(m, target) == true || m.Template.SpeedCm == 0 && m.Template.AttackRange <= 0) return;
+        bool entering = m.Target == null;
+        if (entering) m.NextSwingMs = NowMs + 300;
+        if (!m.Hated.Contains(target)) m.Hated.Add(target);
         SetTarget(m, target);
         m.Returning = false;
+        if (entering && !called && m.Template.BattleCallRange > 0) CallIntoBattle(m, target);
+    }
+
+    /// <summary>
+    /// AIConfig battle call (server-only fields; the client never reads them): a monster whose AI has _iBattleCallType
+    /// 1 calls, as it enters a fight, the monsters within _iBattleCallDistance whose AI has _iBattleCallResponse 1.
+    /// Inferred: those of its camp in its instance, alive and not fighting yet, take on the same player; a called
+    /// monster does not call in turn (one call per fight, not a chain across the map).
+    /// </summary>
+    private void CallIntoBattle(MonsterUnit caller, GameSession target)
+    {
+        int camp = caller.CampOverride ?? caller.Template.Camp;
+        foreach (var unit in _world.Map(caller.WorldScene).Near(caller.X, caller.Z, caller.Template.BattleCallRange).ToArray())
+            if (unit is MonsterUnit ally && !ReferenceEquals(ally, caller) && !ally.Dead && ally.Hp > 0 && ally.Target == null
+                && ally.Template.AnswersBattleCall && ally.InstanceId == caller.InstanceId
+                && (ally.CampOverride ?? ally.Template.Camp) == camp
+                && Distance(ally.X, ally.Z, caller.X, caller.Z) <= caller.Template.BattleCallRange)
+                Engage(ally, target, called: true);
     }
 
     /// <summary>Authoritative target transitions, consumed by hatred/lock notifications and facing effects.</summary>
-    public List<Func<MonsterUnit, GameSession?, GameSession?, Task>> TargetChanged { get; } = new();
+    public List<Func<MonsterUnit, GameSession?, GameSession?, Task>> TargetChanged { get; } = [];
 
     private void SetTarget(MonsterUnit monster, GameSession? target)
     {
         var previous = monster.Target;
         if (ReferenceEquals(previous, target)) return;
         monster.Target = target;
+        if (previous == null && target != null) LeaveRoute(monster); // MonsterService.March
+        ReleaseSurroundSlot(monster);
         foreach (var handler in TargetChanged) _loop.TrackRuntimeDetached("monster target change", () => handler(monster, previous, target));
     }
 
@@ -505,7 +604,11 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
     public void Engage(MonsterUnit m, TowerPetUnit target)
     {
         if (m.Dead || m.Hp <= 0 || target.Dead || target.Hp <= 0 || m.InstanceId == 0 || m.WorldScene != target.WorldScene) return;
-        if (m.PetTarget == null) m.NextSwingMs = NowMs + 300;
+        if (m.PetTarget == null)
+        {
+            m.NextSwingMs = NowMs + 300;
+            if (m.Target == null) LeaveRoute(m); // MonsterService.March
+        }
         m.PetTarget = target;
         m.Returning = false;
     }
@@ -514,7 +617,7 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
     {
         var target = m.PetTarget!;
         if (target.Dead || target.Hp <= 0 || target.Owner.SceneLoading || target.WorldScene != m.WorldScene
-            || Distance(m.Home.X, m.Home.Z, target.X, target.Z) > m.Template.LeashDistance)
+            || Distance(LeashX(m), LeashZ(m), target.X, target.Z) > m.Template.LeashDistance)
         {
             m.PetTarget = null;
             if (m.Target == null) Disengage(m, map);
@@ -553,7 +656,7 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
             m.NextChaseMs = now + 400;
             float dx = target.X - m.X, dz = target.Z - m.Z;
             float go = Math.Min(MaxSegment, dist - m.Template.AttackRange * 0.8f);
-            if (go > 0.2f) WalkTo(m, map, m.X + dx / dist * go, m.Z + dz / dist * go, 1f);
+            if (go > 0.2f && !WalkTo(m, map, m.X + dx / dist * go, m.Z + dz / dist * go, 1f)) WalkAround(m, map, target.X, target.Z, now);
         }
     }
 
@@ -561,10 +664,12 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
     {
         var target = m.Target!;
         bool lost = target.Role == null || target.Dead || target.SceneLoading || TargetVisible?.Invoke(m, target) == false || target.WorldScene != m.WorldScene
-                    || Distance(m.Home.X, m.Home.Z, target.Position.X, target.Position.Z) > m.Template.LeashDistance;
+                    || Distance(LeashX(m), LeashZ(m), target.Position.X, target.Position.Z) > m.Template.LeashDistance;
         if (lost)
         {
-            Disengage(m, map);
+            // Attackers still near: it fights on, instead of resetting while it is being hit (inferred: nearest first).
+            if (NextHated(m, target) is { } next) SetTarget(m, next);
+            else Disengage(m, map);
             return;
         }
         if (m.BusyUntilMs > now)
@@ -579,39 +684,79 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
         }
         float dist = Distance(m, target);
         if (m.Template.Skills != null && !m.SpecialsOwnedByMvp && TryBossSkill(m, target, null, dist, now)) return;
-        float reach = m.Template.AttackRange + 0.5f;
-        if (dist <= reach)
+        bool inReach = dist <= m.Template.AttackRange + 0.5f;
+        // AIConfig _iIsSurround: walk to a slot around the target instead, between swings (MonsterService.Surround).
+        if (!(inReach && SwingHolds(m, now)) && SurroundSlot(m, target) is { } slot
+            && WalksToSlot(m, map, slot, inReach, now)) return;
+        if (inReach)
         {
-            if (m.Moving)
-            {
-                m.Moving = false;
-                SendStop(m, now);
-            }
-            if (now >= m.NextSwingMs && Attack != null)
-            {
-                m.NextSwingMs = now + m.Template.SwingIntervalMs;
-                m.Face = Angle(m.X, m.Z, target.Position.X, target.Position.Z);
-                _loop.TrackRuntimeDetached("monster attack", () => Attack(m, target));
-            }
+            Swing(m, target, now);
             return;
         }
         if (m.Template.SpeedCm <= 0) return;
         // Chase: re-path toward the target every 400 ms or when the segment ended.
         if (!m.Moving || now >= m.NextChaseMs)
         {
-            m.NextChaseMs = now + 400;
+            m.NextChaseMs = now + ChaseRepathMs;
             float dx = target.Position.X - m.X, dz = target.Position.Z - m.Z;
             float len = MathF.Sqrt(dx * dx + dz * dz);
-            float go = Math.Min(MaxSegment, len - m.Template.AttackRange * 0.8f);
-            if (go > 0.2f) WalkTo(m, map, m.X + dx / len * go, m.Z + dz / len * go, 1f);
+            float go = Math.Min(MaxSegment, len - m.Template.AttackRange * ApproachShare);
+            if (go > MinChaseStep) WalkTo(m, map, m.X + dx / len * go, m.Z + dz / len * go, 1f);
         }
     }
 
+    /// <summary>In reach of its player: stand and swing when the swing interval allows.</summary>
+    private void Swing(MonsterUnit m, GameSession target, long now)
+    {
+        if (m.Moving)
+        {
+            m.Moving = false;
+            SendStop(m, now);
+        }
+        if (now >= m.NextSwingMs && Attack != null)
+        {
+            m.NextSwingMs = now + m.Template.SwingIntervalMs;
+            m.Face = Angle(m.X, m.Z, target.Position.X, target.Position.Z);
+            _loop.TrackRuntimeDetached("monster attack", () => Attack(m, target));
+        }
+    }
+
+    private GameSession? NextHated(MonsterUnit m, GameSession lost)
+    {
+        m.Hated.Remove(lost);
+        m.Hated.RemoveAll(p => p.Role == null || p.Dead || p.SceneLoading || p.WorldScene != m.WorldScene || TargetVisible?.Invoke(m, p) == false
+            || Distance(LeashX(m), LeashZ(m), p.Position.X, p.Position.Z) > m.Template.LeashDistance);
+        return m.Hated.Count == 0 ? null : m.Hated.MinBy(p => Distance(m.X, m.Z, p.Position.X, p.Position.Z));
+    }
+
+    /// <summary>A straight walk failed: the first leg of a route around the obstacle, at most once in <see cref="PathBackoffMs"/>, as the search runs inside the monster tick.</summary>
+    private bool WalkAround(MonsterUnit m, MapInstance map, float x, float z, long now)
+    {
+        if (now < m.NextPathMs || _worldData.Map(m.SceneEntry)?.Nav is not { } nav) return false;
+        m.NextPathMs = now + PathBackoffMs;
+        var route = nav.FindPath(m.X, m.Y, m.Z, x, z, MaxSegment);
+        if (route == null) return false;
+        foreach (var (toX, _, toZ) in route)
+            if (Distance(m.X, m.Z, toX, toZ) > 0.2f) return WalkTo(m, map, toX, toZ, 1f);
+        return false;
+    }
+
+    private const int PathBackoffMs = 1000;
+
     private void Disengage(MonsterUnit m, MapInstance map)
     {
+        m.Hated.Clear();
         EndBossSkills(m, interrupt: true);
         SetTarget(m, null);
         m.PetTarget = null;
+        if (m.March is { } march)
+        {
+            // Back on its way from where the fight ended, not home, and to the goal again if the fight drew it off.
+            march.Route.Clear();
+            march.Arrived = false;
+            march.Failures = 0;
+            return;
+        }
         m.Returning = true;
         if (m.Template.SpeedCm > 0) WalkTo(m, map, m.Home.X, m.Home.Z, 2f); // buff 901501: +100 % MSPD on the way back
     }
@@ -623,15 +768,15 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
         WalkTo(m, map, m.Home.X + (float)Math.Cos(angle) * r, m.Home.Z + (float)Math.Sin(angle) * r, 1f);
     }
 
-    /// <summary>One straight Walk segment when the nav grid allows it.</summary>
-    private void WalkTo(MonsterUnit m, MapInstance map, float x, float z, float speedFactor)
+    /// <summary>One straight Walk segment when the nav grid allows it; false when none started.</summary>
+    private bool WalkTo(MonsterUnit m, MapInstance map, float x, float z, float speedFactor)
     {
-        if (Forbidden?.Invoke(m, ForbiddenState.Walk) == true) return;
+        if (m.Dead || Forbidden?.Invoke(m, ForbiddenState.Walk) == true) return false;
         var nav = _worldData.Map(m.SceneEntry)?.Nav;
         float? y = nav?.WalkHeight(x, z, m.Y) ?? m.Y;
-        if (y == null || nav != null && !nav.CanWalk(m.X, m.Y, m.Z, x, z)) return;
+        if (y == null || nav != null && !nav.CanWalk(m.X, m.Y, m.Z, x, z)) return false;
         float dx = x - m.X, dz = z - m.Z, len = MathF.Sqrt(dx * dx + dz * dz);
-        if (len < 0.1f) return;
+        if (len < 0.1f) return false;
         long now = NowMs;
         float speed = m.SpeedCm(now) / 100f * speedFactor;
         m.FromX = m.X; m.FromY = m.Y; m.FromZ = m.Z;
@@ -655,6 +800,7 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
                 MovementWalk = new MovementWalk { Dir = m.Face, Speed = speed, Acc = 0, EndHeight = y.Value },
             },
         }));
+        return true;
     }
 
     private static MovementChangeNtf Stop(MonsterUnit m, long now) => new()
@@ -679,8 +825,17 @@ public sealed partial class MonsterService : MonsterBrain, IGameTicker
     public async Task KillAsync(MonsterUnit m)
     {
         if (m.Dead) return;
+        // A corpse must not slide on: stop it where it is, and tell the viewers before they see it die.
+        if (m.Moving)
+        {
+            long stoppedAt = NowMs;
+            m.Advance(stoppedAt);
+            m.Moving = false;
+            await _world.MoveUnitAsync(m, new MovementChangeNtf { Uid = m.Uid, MovementInfo = m.CurrentMovement(stoppedAt) });
+        }
         m.Dead = true;
         m.Moving = false;
+        m.Hated.Clear();
         EndBossSkills(m, interrupt: true);
         SetTarget(m, null);
         m.PetTarget = null;

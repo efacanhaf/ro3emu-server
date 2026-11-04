@@ -123,8 +123,14 @@ public sealed class AwardTests : IAsyncLifetime
         Assert.Throws<AwardResolutionException>(() => awards.Resolve(null!, 920160)); // absent group
         Assert.Throws<AwardResolutionException>(() => awards.Resolve(null!, 21)); // type 1, NPC drop route
         Assert.Throws<AwardResolutionException>(() => awards.Resolve(null!, 40007)); // multirow day selector
-        Assert.Throws<AwardResolutionException>(() => awards.Resolve(null!, 1005)); // AwardConfig _kEXP
-        Assert.Throws<AwardResolutionException>(() => awards.Resolve(null!, 1002)); // AwardConfig _kCondition
+        Assert.Equal(new[] { new AwardGrant(100, 10000), new AwardGrant(1200000, 1) },
+            awards.Resolve(null!, 1005).Grants.ToArray()); // AwardConfig _kEXP [1, 10000] is base EXP
+        Assert.Throws<AwardResolutionException>(() => awards.Resolve(null!, 1007)); // _kEXP [2, 100]: unresolved kind
+        // _kCondition [[2, 11, 99]]: base level 11-99, so it needs a recipient
+        Assert.Throws<AwardResolutionException>(() => awards.Resolve(null!, 1002));
+        Assert.Throws<AwardConditionException>(() => awards.ResolveForProgress(new RoleProgress { Level = 10 }, 1002));
+        Assert.Equal(new[] { new AwardGrant(1200000, 1), new AwardGrant(1420100, 1) },
+            awards.ResolveForProgress(new RoleProgress { Level = 11 }, 1002).Grants.ToArray());
         Assert.Throws<AwardResolutionException>(() => awards.Resolve(null!, 25001)); // restriction replacement
     }
 
@@ -249,6 +255,73 @@ public sealed class AwardTests : IAsyncLifetime
     }
 
     [ClientDataFact]
+    public async Task AWeaponKitGivesEachWeaponOfTheClassOnce()
+    {
+        // DropPoolConfig 31121, the reward of quest 10101210: [121121, 100%, 1, 10] over one row per weapon, by class.
+        var rewards = _app.Services.GetRequiredService<RewardService>();
+        var swordsman = rewards.RollPoolBound(31121, new RoleProgress { Level = 20, Career = 1100 });
+        Assert.Equal(4, swordsman.Count); // Sword, Two-Handed Sword, Knight Spear, Guard
+        Assert.All(swordsman, grant => Assert.Equal(1, grant.Count));
+        var novice = rewards.RollPoolBound(31121, new RoleProgress { Level = 20, Career = 1000 });
+        Assert.Equal(2, Assert.Single(novice).Count); // the row's own 2 daggers, not ten times that
+    }
+
+    [ClientDataFact]
+    public async Task AwardedGearRowCarriesTheCommittedGuidForTheQuickEquipPrompt()
+    {
+        // LC_EquipmentHelper.CanFastEquip reads the GetRewardNotify row itself: itemGuid, appraised (3) and score (2).
+        // Quest awards stage gear before the commit assigns GUIDs, so the row must be built after it.
+        await using var bot = await InWorld("GearAlice");
+        await Next(bot, CharacterService.ItemsSync, DBItemsInfoIncrement.Parser);
+        var session = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Role?.Name == "GearAlice");
+        var loop = _app.Services.GetRequiredService<GameLoop>();
+        var character = _app.Services.GetRequiredService<CharacterService>();
+        Assert.True(await loop.InvokeAsync(() => character.ApplyAwardAsync(session,
+            new AwardPlan(0, 0, [new AwardGrant(2010120, 2), new AwardGrant(1000000, 1)]))));
+        var notify = await Next(bot, CharacterService.GetRewardNotify, GetRewardNotify.Parser, m => m.Rewards.Count > 0);
+        var gear = session.Items.Where(i => i.Entry == 2010120).Select(i => i.Guid).Order().ToList();
+        var rows = notify.Rewards.Where(r => r.ItemEntry == 2010120).ToList();
+        Assert.Equal(gear, [.. rows.Select(r => r.ItemGuid).Order()]);
+        Assert.All(rows, r => { Assert.True(r.ItemGuid > 0); Assert.Equal(1, r.ItemInfos[3].LongVal); Assert.True(r.ItemInfos[2].LongVal > 0); });
+        Assert.Equal(0, Assert.Single(notify.Rewards, r => r.ItemEntry == 1000000).ItemGuid);
+    }
+
+    [ClientDataFact]
+    public async Task FirstGearInAnUnsentPackResendsTheWholeBag()
+    {
+        // Once the starter weapon and shirt are worn, a later login's 5009 has no equipment pack (2). The client
+        // builds a pack's grid only from a full sync, so the first loose gear must bring 5009 whole again.
+        await using var bot = await InWorld("PackAlice");
+        await Next(bot, CharacterService.ItemsSync, DBItemsInfoIncrement.Parser);
+        var session = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Role?.Name == "PackAlice");
+        var loop = _app.Services.GetRequiredService<GameLoop>();
+        var character = _app.Services.GetRequiredService<CharacterService>();
+        // Stand-in for that later login: the kit gear worn, then a fresh full 5009 (no pack 2).
+        await loop.InvokeAsync(async () =>
+        {
+            int grid = 1;
+            foreach (var worn in session.Items.Where(i => i.Pack == 2)) worn.Grid = grid++;
+            session.Synced.Remove(CharacterService.ItemsSync);
+            Assert.True(await character.ApplyAwardAsync(session, new AwardPlan(0, 0, [new AwardGrant(1000000, 1)])));
+        });
+        var relogin = await Next(bot, CharacterService.ItemsSync, DBItemsInfoIncrement.Parser, m => m.SyncAllMark);
+        Assert.False(relogin.PackInfo.ContainsKey(2));
+        Assert.True(await loop.InvokeAsync(() => character.ApplyAwardAsync(session,
+            new AwardPlan(0, 0, [new AwardGrant(2010120, 2)]))));
+        var bag = await Next(bot, CharacterService.ItemsSync, DBItemsInfoIncrement.Parser, m => m.PackInfo.ContainsKey(2));
+        Assert.True(bag.SyncAllMark);
+        Assert.Equal(2, bag.PackInfo[2].All.Items.Values.Count(i => i.ItemEntry == 2010120));
+        Assert.True(bag.PackInfo.ContainsKey(1)); // the whole bag, not just the new pack
+
+        // Once the client has the pack, more gear travels as an increment again.
+        Assert.True(await loop.InvokeAsync(() => character.ApplyAwardAsync(session,
+            new AwardPlan(0, 0, [new AwardGrant(2010120, 1)]))));
+        var more = await Next(bot, CharacterService.ItemsSync, DBItemsInfoIncrement.Parser,
+            m => m.PackInfo.TryGetValue(2, out var p) && p.Inc != null);
+        Assert.False(more.SyncAllMark);
+    }
+
+    [ClientDataFact]
     public async Task NoviceAndSwordsmanPoolGiftKeepsActualPermanentBind()
     {
         var loop = _app.Services.GetRequiredService<GameLoop>();
@@ -314,6 +387,185 @@ public sealed class AwardTests : IAsyncLifetime
         await bot.SendGameAsync(CharacterService.ItemUse, new ItemUseReq { ItemGuid = unsupported, ItemCount = 1 });
         Assert.Equal(ErrorCodes.FeatureUnavailable, (await Next(bot, CharacterService.ItemUse, ItemUseResp.Parser)).Result);
         Assert.Equal(1, store.Load(session.Role.Id).Single(i => i.Guid == unsupported).Stack);
+    }
+
+    /// <summary>Job Advance asks Base 30 and Job 40 together: the Base EXP up to Base 30 from quests alone reaches Job 40.</summary>
+    [ClientDataFact]
+    public async Task QuestExpUpToBaseThirtyReachesJobFortyOfTheSecondRank()
+    {
+        await using var bot = await InWorld("JobAlice");
+        var session = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Role?.Name == "JobAlice");
+        var data = _app.Services.GetRequiredService<GameData>();
+        long toBaseThirty = Enumerable.Range(1, 29).Sum(level => GameData.Int(data.Row("BaseLvConfig", level)!.Value, "_iBaseExp"));
+        Assert.True(await _app.Services.GetRequiredService<GameLoop>().InvokeAsync(() =>
+        {
+            session.Progress!.Career = 1100;
+            session.Progress.Level = 1; session.Progress.Exp = 0; session.Progress.JobLevel = 1; session.Progress.JobExp = 0;
+            return _app.Services.GetRequiredService<CharacterService>()
+                .ApplyAwardAsync(session, new AwardPlan(0, 0, []), taskBaseExp: toBaseThirty);
+        }));
+        Assert.Equal(30, session.Progress!.Level);
+        Assert.Equal(40, session.Progress.JobLevel);
+    }
+
+    /// <summary>An older role's first login pays what its Base EXP should have brought, once, even without its marker.</summary>
+    [ClientDataFact]
+    public async Task AnOlderRoleGetsItsMissingJobExpOnceAtLogin()
+    {
+        await using var bot = await InWorld("CatchAlice");
+        Assert.Equal(40, await RelogAs(bot, "CatchAlice", level: 30, jobLevel: 1, older: true)); // Base 30's share fills the rank
+        Assert.Equal(1, await RelogAs(bot, "CatchAlice", level: 30, jobLevel: 1, older: false)); // the marker holds
+        Assert.Equal(1, await RelogAs(bot, "CatchAlice", level: 30, jobLevel: 1, older: true)); // and the natural source without it
+    }
+
+    /// <summary>The catch-up's receipt commits the marker with the EXP, and the ledger certifies it like any other grant.</summary>
+    [ClientDataFact]
+    public async Task TheLedgerAcceptsAJobExpCatchUpReceipt()
+    {
+        await using var bot = await InWorld("LedgerAlice");
+        var session = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Role?.Name == "LedgerAlice");
+        var roles = _app.Services.GetRequiredService<RoleStore>();
+        var loop = _app.Services.GetRequiredService<GameLoop>();
+        long role = session.Role!.Id;
+        await loop.InvokeAsync(() =>
+        {
+            var progress = session.Progress!;
+            progress.Career = 1100; progress.Level = 30; progress.Exp = 0; progress.JobLevel = 1; progress.JobExp = 0;
+            roles.SaveProgress(role, progress);
+            roles.SaveJobExpCatchUp(role, []);
+            return Task.CompletedTask;
+        });
+        var catalog = EconomyCatalog.Load(Path.Combine(RepoRoot(), "data"));
+        await bot.SwitchRoleAsync();
+        var opening = S3EconomyReader.Read(_dataDir, catalog);
+        await bot.EnterWorldAsync(role); await WorldSettle.StallsAsync(_app.Services);
+        Assert.Equal(40, await loop.InvokeAsync(() => Task.FromResult(session.Progress!.JobLevel)));
+
+        var closing = S3EconomyReader.Read(_dataDir, catalog);
+        var ledger = S3EconomyReader.ReadLedger(_dataDir, catalog, opening, closing)!;
+        Assert.True(ledger.CompleteHistory, string.Join("; ", ledger.Issues.Select(x => x.Detail)));
+        Assert.Contains(ledger.Receipts, receipt => receipt.SourceKeys!.Contains($"job-exp-catchup/{role}"));
+        var check = EconomyExactnessChecker.Check(opening, closing, ledger);
+        Assert.DoesNotContain(check.Issues, issue => issue.Kind == EconomyIssueKind.Corruption);
+    }
+
+    /// <summary>A role above its share loses nothing, and its one chance is used up all the same.</summary>
+    [ClientDataFact]
+    public async Task ARoleAboveItsShareKeepsItsJobExpAndIsDecided()
+    {
+        await using var bot = await InWorld("KeepAlice");
+        Assert.Equal(30, await RelogAs(bot, "KeepAlice", level: 1, jobLevel: 30, older: true));
+        Assert.Equal(1, await RelogAs(bot, "KeepAlice", level: 30, jobLevel: 1, older: false));
+    }
+
+    /// <summary>What does not fit the current rank is frozen and paid by the next advances, never worked out again.</summary>
+    [ClientDataFact]
+    public async Task TheRestOfTheJobExpDebtIsPaidByLaterAdvances()
+    {
+        await using var bot = await InWorld("RestAlice");
+        var data = _app.Services.GetRequiredService<GameData>();
+        long JobTotal(int rank) => Enumerable.Range(1, 39).Sum(level => GameData.Int(data.Row("JobLvConfig", rank * 100L + level)!.Value, "_iJobeExp"));
+        long baseTotal = Enumerable.Range(1, 39).Sum(level => GameData.Int(data.Row("BaseLvConfig", level)!.Value, "_iBaseExp"));
+        long firstRank = Enumerable.Range(1, 9).Sum(level => GameData.Int(data.Row("JobLvConfig", 100L + level)!.Value, "_iJobeExp"));
+        long owed = baseTotal * 2000 / 10000 - firstRank;
+
+        // Rank 2 at Base 40: the rank is filled, and what used to be lost stays owed.
+        Assert.Equal(40, await RelogAs(bot, "RestAlice", level: 40, jobLevel: 1, older: true));
+        var state = CatchUpState("RestAlice");
+        Assert.Equal(JobTotal(2), state.Granted);
+        long rest = owed - JobTotal(2);
+        Assert.Equal(rest, state.Remaining);
+        Assert.Equal(40, await Relog(bot, "RestAlice"));
+        Assert.Equal(rest, CatchUpState("RestAlice").Remaining);
+
+        // The second job change: rank 3 takes all it has room for.
+        await Advance(bot, 1200);
+        Assert.Equal(40, Progress("RestAlice").JobLevel);
+        rest -= JobTotal(3);
+        Assert.Equal(rest, CatchUpState("RestAlice").Remaining);
+        Assert.Equal(40, await Relog(bot, "RestAlice"));
+        Assert.Equal(rest, CatchUpState("RestAlice").Remaining);
+
+        // The third: rank 4 has room for more than is left, so the debt ends, and the role keeps what it got.
+        await Advance(bot, 1300);
+        var progress = Progress("RestAlice");
+        long earned = progress.JobExp + Enumerable.Range(1, progress.JobLevel - 1).Sum(level => GameData.Int(data.Row("JobLvConfig", 400L + level)!.Value, "_iJobeExp"));
+        Assert.Equal(rest, earned);
+        Assert.Equal(0, CatchUpState("RestAlice").Remaining);
+        Assert.Equal(owed, CatchUpState("RestAlice").Granted);
+        int jobLevel = progress.JobLevel;
+        Assert.Equal(jobLevel, await Relog(bot, "RestAlice"));
+    }
+
+    /// <summary>A crash after the job change and before its payment: the next login pays it, and only once.</summary>
+    [ClientDataFact]
+    public async Task AnAdvanceLeftUnpaidIsPaidAtTheNextLoginOnce()
+    {
+        await using var bot = await InWorld("CrashAlice");
+        Assert.Equal(40, await RelogAs(bot, "CrashAlice", level: 40, jobLevel: 1, older: true));
+        long before = CatchUpState("CrashAlice").Remaining;
+        Assert.Equal(40, await RelogAs(bot, "CrashAlice", level: 40, jobLevel: 1, older: false, career: 1200));
+        var state = CatchUpState("CrashAlice");
+        Assert.True(state.Remaining < before);
+        Assert.Equal(1, await RelogAs(bot, "CrashAlice", level: 40, jobLevel: 1, older: false, career: 1200));
+        Assert.Equal(state.Remaining, CatchUpState("CrashAlice").Remaining);
+    }
+
+    /// <summary>The last rank has no advance after it: the role takes what fits, keeps it, and nothing is taken away.</summary>
+    [ClientDataFact]
+    public async Task ARoleOfTheLastRankLosesNothing()
+    {
+        await using var bot = await InWorld("TopAlice");
+        Assert.Equal(40, await RelogAs(bot, "TopAlice", level: 99, jobLevel: 15, older: true, career: 1400));
+        var state = CatchUpState("TopAlice");
+        Assert.True(state.Granted > 0);
+        Assert.Equal(40, await Relog(bot, "TopAlice"));
+        Assert.Equal(state.Granted, CatchUpState("TopAlice").Granted);
+    }
+
+    private RoleProgress Progress(string name) =>
+        _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Role?.Name == name).Progress!;
+
+    private CharacterService.JobExpCatchUpState CatchUpState(string name)
+    {
+        long role = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Role?.Name == name).Role!.Id;
+        return JsonSerializer.Deserialize<CharacterService.JobExpCatchUpState>(_app.Services.GetRequiredService<RoleStore>().LoadJobExpCatchUp(role)!)!;
+    }
+
+    private static async Task Advance(BotClient bot, int job)
+    {
+        using var paid = bot.Inbox.Expect(e => e.IsGame(CharacterService.GetRewardNotify));
+        await bot.SendGameAsync(CharacterService.PlayerTransformJob, new PlayerTransformJobReq { JobId = job });
+        Assert.Equal(0, (await Next(bot, CharacterService.PlayerTransformJob, PlayerTransformJobResp.Parser, r => r.JobId == job)).Result);
+        await paid.WaitAsync(Wait);
+    }
+
+    private async Task<int> Relog(BotClient bot, string name)
+    {
+        var session = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Role?.Name == name);
+        long role = session.Role!.Id;
+        await bot.SwitchRoleAsync();
+        await bot.EnterWorldAsync(role); await WorldSettle.StallsAsync(_app.Services);
+        return await _app.Services.GetRequiredService<GameLoop>().InvokeAsync(() => Task.FromResult(session.Progress!.JobLevel));
+    }
+
+    private async Task<int> RelogAs(BotClient bot, string name, int level, int jobLevel, bool older, int career = 1100)
+    {
+        var session = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Role?.Name == name);
+        var roles = _app.Services.GetRequiredService<RoleStore>();
+        var loop = _app.Services.GetRequiredService<GameLoop>();
+        long role = session.Role!.Id;
+        await loop.InvokeAsync(() =>
+        {
+            var progress = session.Progress!;
+            progress.Career = career; progress.Level = level; progress.Exp = 0; progress.JobLevel = jobLevel; progress.JobExp = 0;
+            roles.SaveProgress(role, progress);
+            if (older) roles.SaveJobExpCatchUp(role, []);
+            return Task.CompletedTask;
+        });
+        await bot.SwitchRoleAsync();
+        await bot.EnterWorldAsync(role); await WorldSettle.StallsAsync(_app.Services);
+        return await loop.InvokeAsync(() => Task.FromResult(session.Progress!.JobLevel));
     }
 
     private async Task<BotClient> InWorld(string name)

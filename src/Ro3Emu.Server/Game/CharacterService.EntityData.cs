@@ -4,6 +4,7 @@ using Romsg;
 using Ro3Emu.Server.Accounts;
 using Ro3Emu.Server.Accounts.Persistence;
 using Ro3Emu.Server.Data;
+using Ro3Emu.Server.Data.Config;
 using Ro3Emu.Server.Economy;
 using Ro3Emu.Server.Maps;
 
@@ -20,7 +21,7 @@ public sealed partial class CharacterService
     public void Refresh(GameSession session)
     {
         var stats = Stats(session);
-        session.EntityProperties = PropertyIds(stats).Select(id => (Id: (long)id, Value: stats[id])).ToArray();
+        session.EntityProperties = [.. PropertyIds(stats).Select(id => (Id: (long)id, Value: stats[id]))];
         session.EquipLook = EquipInfo(session);
         session.Speed = stats[Speed];
     }
@@ -95,12 +96,15 @@ public sealed partial class CharacterService
                 foreach (var (id, v) in buff.Changes) Add(id, v);
         }
         else AddOwnAttributes(session, p, Add);
+        foreach (int grouped in GroupedAttributes)
+            if (AttributeConversionConfig.Get(data, grouped) is { } conversion) AddGroupedConversion(raw, grouped, conversion);
         if (!raw.ContainsKey(Speed)) raw[Speed] = RoleSessionService.DefaultSpeed;
         raw[Speed] += session.SpeedBonus;
         if (!raw.ContainsKey(BaseAspd)) raw[BaseAspd] = 100;
 
         var sheet = EquipmentStunts.ApplyConversions(session, raw, data);
         if (matchAttributes == null) sheet = EmblemService.ApplyResonanceConversions(session, raw, sheet, data);
+        sheet = ApplySpeedOverflow(raw, sheet);
         long maxHp = sheet[MaxHp], maxSp = sheet[MaxSp];
         sheet[Hp] = Math.Clamp(session.CurrentHp ?? maxHp, 0, maxHp);
         sheet[Sp] = Math.Clamp(session.CurrentSp ?? maxSp, 0, maxSp);
@@ -113,6 +117,50 @@ public sealed partial class CharacterService
             }
         sheet[Lv] = p.Level;
         return sheet;
+    }
+
+    /// <summary>AttributeConfig 30 "Other Elemental Damage Reduction%" and 31 "Crowd Control Resistance". Rows 20-24 of the
+    /// conversion table are not here: no data gives those ids.</summary>
+    private static readonly int[] GroupedAttributes = [23, 24, 30, 31]; // 23 "PATK/MATK" and 24 "PDEF/MDEF" the same way
+
+    /// <summary>
+    /// A grouped attribute is read through its members only (_kTips "Converted to other elemental damage", "Converted to
+    /// other crowd-control debuff attributes"): AttributeConversionConfig 30 gives 312-320, 31 gives 702 ... 728, each 1:1 and
+    /// the same in both columns. It counts whatever gave it, including a negative value (Shadow Card: Deviling's 30 is -200;
+    /// LC_TotemHelper multiplies a conversion by the value as it is).
+    /// </summary>
+    internal static void AddGroupedConversion(Dictionary<int, double> raw, int grouped, AttributeConversionConfig conversion)
+    {
+        if (!raw.TryGetValue(grouped, out double value)) return;
+        foreach (var pair in conversion.Attribute1)
+            if (pair is [var id, var perPoint]) raw[(int)id] = raw.GetValueOrDefault((int)id) + perPoint * value;
+    }
+
+    /// <summary>
+    /// Speed past its cap turns into damage: ASPD (115) above FinalAtkSpdThdAndCastSpdThd[0] (500) adds Physical ATK%
+    /// (OverflowAtkSpd2PhysDmgR [115, 1, 1034, 10, 2000]) and cast speed (116) above [1] (400) adds Magic ATK%
+    /// (OverflowCastSpd2MagicDmgR [116, 1, 1044, 10, 2000]): every step of excess gives perStep, up to the cap. The
+    /// client's own tooltips say so (AttributeConfig 115/116 _kTips: "Every 1 excess ASPD is converted to 0.1% Physical
+    /// ATK (Max: 20%)") and its panel shows the excess (LC_PlayerInfoHelper._doFormulaOverThreshold).
+    /// </summary>
+    internal StatSheet ApplySpeedOverflow(Dictionary<int, double> raw, StatSheet sheet)
+    {
+        var parameters = data.Table("PublicParamConfig");
+        if (!parameters.TryGetValue("FinalAtkSpdThdAndCastSpdThd", out var limits) || limits.ValueKind != JsonValueKind.Array
+            || limits.GetArrayLength() < 2) return sheet;
+        bool changed = false;
+        foreach (var (key, index) in new[] { ("OverflowAtkSpd2PhysDmgR", 0), ("OverflowCastSpd2MagicDmgR", 1) })
+        {
+            if (!parameters.TryGetValue(key, out var rule) || rule.ValueKind != JsonValueKind.Array || rule.GetArrayLength() < 5
+                || GameData.Number(limits[index]) is not { } threshold) continue;
+            var r = rule.EnumerateArray().Select(v => GameData.Number(v) ?? 0).ToArray();
+            (int source, double step, int target, double perStep, double cap) = ((int)r[0], r[1], (int)r[2], r[3], r[4]);
+            double excess = sheet[source] - threshold;
+            if (excess <= 0 || step <= 0) continue;
+            raw[target] = raw.GetValueOrDefault(target) + Math.Min(Math.Floor(excess / step) * perStep, cap);
+            changed = true;
+        }
+        return changed ? StatCalculator.Compute(raw, data) : sheet;
     }
 
     /// <summary>The character's own raw contributions (gear, cards, talents, buffs, level and job rows, conversions).</summary>
@@ -133,10 +181,18 @@ public sealed partial class CharacterService
             if (EquipRow(item.Entry) is not { } equip) continue;
             foreach (var (id, v) in BaseAttributes(item, equip).Concat(EquipmentAffixes.Entries(item))) Give(id, v);
             // enchant stats are per instance; base stats also feed their derived conversions.
-            _attributeSource = "encantamento";
-            foreach (var enchant in item.Enchantments.Values)
-                foreach (var (id, v) in enchant.Attr) Give(id, v);
-            _attributeSource = "equipe";
+            foreach (var (enchantId, enchant) in item.Enchantments)
+                foreach (var (id, v) in enchant.Attr.Select(a => (a.Key, (double)a.Value))
+                    .Concat(EnchantService.SkillAttributes(session, enchantId, data).Select(a => (a.Id, a.Value))))
+                {
+                    if (id is >= 1 and <= 6) baseStats[id - 1] += v;
+                    else Add(id, v);
+                }
+        }
+        foreach (var (id, value) in EquipmentStunts.FlatAttributes(session, data))
+        {
+            if (id is >= 1 and <= 6) baseStats[id - 1] += value;
+            else Add(id, value);
         }
         _attributeSource = "stunt";
         foreach (var (id, value) in EquipmentStunts.FlatAttributes(session, data)) Give(id, value);
@@ -158,9 +214,8 @@ public sealed partial class CharacterService
         _attributeSource = "ressonancia";
         foreach (var table in new[] { "StrengthenEffectTable", "RefiningEffectTable" })
             if (ResonanceRow(session, table) is { } effect)
-                foreach (var (id, v) in GameData.Pairs(effect, "_kEffect")) Give(id, v);
-        _attributeSource = "cartas";
-        foreach (var card in session.Items.Where(i => i.Grid < 0))
+                foreach (var (id, v) in GameData.Pairs(effect, "_kEffect")) Add(id, v);
+        foreach (var card in EquipmentStunts.ActiveCards(session, data))
         {
             int tier = (int)(card.Attrs?.GetValueOrDefault(AttrCardStar) ?? 0);
             int level = (int)(card.Attrs?.GetValueOrDefault(AttrCardLevel) ?? 0);
@@ -183,18 +238,19 @@ public sealed partial class CharacterService
         _attributeSource = "talentos";
         foreach (var (id, value) in TalentAttributes?.Invoke(session) ?? []) Give(id, value);
         foreach (var provider in ExtraAttributes)
-        {
-            // The declaring type names the owner; the method keeps two providers of one service apart (passives vs a
-            // resonance, food vs a mount) so the diagnostic table can name the exact source.
-            _attributeSource = "extra:" + (provider.Method.DeclaringType?.Name ?? "?") + "." + provider.Method.Name;
-            foreach (var (id, value) in provider(session)) Give(id, value);
-        }
-        _attributeSource = "pontos";
-        for (int i = 0; i < 6; i++) Add(i + 1, baseStats[i]);
-        _attributeSource = "buff";
+            foreach (var (id, value) in provider(session))
+            {
+                if (id is >= 1 and <= 6) baseStats[id - 1] += value;
+                else Add(id, value);
+            }
+        // (inferred) STR..LUK from a buff count like gear's toward the conversions below (owner's decision 2.11).
         foreach (var buff in session.Buffs)
-            foreach (var (id, v) in buff.Changes) Add(id, v);
-        _attributeSource = "nivel";
+            foreach (var (id, v) in buff.Changes)
+            {
+                if (id is >= 1 and <= 6) baseStats[id - 1] += v;
+                else Add(id, v);
+            }
+        for (int i = 0; i < 6; i++) Add(i + 1, baseStats[i]);
         if (BaseRow(p.Career, p.Level) is { } flat)
             foreach (var (id, v) in GameData.Pairs(flat, "_kAttri")) Add(id, v);
         _attributeSource = "job";
@@ -204,11 +260,7 @@ public sealed partial class CharacterService
         for (int stat = 1; stat <= 6; stat++)
         {
             if (data.Row("AttributeConversionConfig", stat) is not { } conversion) continue;
-            // (official evidence) each conversion instance contributes its whole part only: the naked official's HIT 1
-            // (DEX 1 -> [[109,1]] + [[109,0.5]]), FLEE 1 and RESP 135 (INT 1 -> [[108,0.2]]) show the fraction dropped per
-            // row, while the level line, gear and talents keep theirs.
-            foreach (var (id, perPoint) in GameData.Pairs(conversion, ranged ? "_kAttribute2" : "_kAttribute1"))
-                Add(id, Math.Floor(perPoint * baseStats[stat - 1]));
+            foreach (var (id, perPoint) in GameData.Pairs(conversion, ranged ? "_kAttribute2" : "_kAttribute1")) Add(id, perPoint * Math.Max(0, baseStats[stat - 1]));
         }
         _attributeSource = "outros";
     }
@@ -230,18 +282,26 @@ public sealed partial class CharacterService
     public Func<GameSession, long>? TitleOf { get; set; }
 
     /// <summary>Configured contributions from other owned systems (pet lineup/collection).</summary>
-    public List<Func<GameSession, IEnumerable<(long Id, double Value)>>> ExtraAttributes { get; } = new();
+    public List<Func<GameSession, IEnumerable<(long Id, double Value)>>> ExtraAttributes { get; } = [];
 
     /// <summary>A match owner's replacement build (null: the character's own), e.g. a Survivor Battle career.</summary>
     public Func<GameSession, IReadOnlyList<(long Id, double Value)>?>? MatchAttributes { get; set; }
 
     /// <summary>Runtime properties such as an absorb shield, projected on full stats and late AOI snapshots.</summary>
-    public List<Func<GameSession, IEnumerable<(int Id, long Value)>>> DynamicProperties { get; } = new();
+    public List<Func<GameSession, IEnumerable<(int Id, long Value)>>> DynamicProperties { get; } = [];
 
     /// <summary>Set by BuffService: puts a buff on the player (item use action 203).</summary>
     public Func<GameSession, int, int, Task>? GiveBuff { get; set; }
 
-    private async Task SendStatsAsync(GameSession session)
+    /// <summary>
+    /// EAttrModType.EAttrModTypeBase in 31008 attrModTypes: the client (LC_DAL_PlayerInfo._changeProperty) then floats
+    /// each changed attribute ("HP 37" with an up arrow, UI_Sys_Main_PowerChangeWidget). It shows the popups only for
+    /// types listed in PublicParamConfig.AttrChangeCoverdType, which includes 0.
+    /// </summary>
+    private const int AttrModTypeBase = 0;
+
+    /// <param name="showChange">Base level up or committed stat points: the client floats the attribute changes.</param>
+    private async Task SendStatsAsync(GameSession session, bool showChange = false)
     {
         var oldIds = session.EntityProperties.Select(p => (int)p.Id).ToHashSet();
         Refresh(session);
@@ -253,7 +313,9 @@ public sealed partial class CharacterService
             all.Propertys.Add(new Property { PropertyId = id, Data = value, BaseData = stats.Base.GetValueOrDefault(id, value), Vd64 = value });
             session.SentPropertyIds.Add(id);
         }
-        await session.SendGameAsync(OnePropertyChange, new Romsg.OnePropertyChange { Property = all });
+        var change = new Romsg.OnePropertyChange { Property = all };
+        if (showChange) change.AttrModTypes.Add(AttrModTypeBase);
+        await session.SendGameAsync(OnePropertyChange, change);
 
         var aoi = new AOIAttrChange { EntityUuid = (ulong)session.Role.Id };
         foreach (var id in AoiProperties) aoi.Property.Add(new AoIProperty { Idx = id, Data = stats[id], BaseData = stats[id] });
@@ -270,7 +332,7 @@ public sealed partial class CharacterService
         if (hp is { } h) session.CurrentHp = Math.Clamp(h, 0, before[MaxHp]);
         if (sp is { } s) session.CurrentSp = Math.Clamp(s, 0, before[MaxSp]);
         var stats = Stats(session);
-        session.EntityProperties = PropertyIds(stats).Select(id => (Id: (long)id, Value: stats[id])).ToArray();
+        session.EntityProperties = [.. PropertyIds(stats).Select(id => (Id: (long)id, Value: stats[id]))];
         var all = new AllProperty { EntityID = session.Role!.Id };
         var aoi = new AOIAttrChange { EntityUuid = (ulong)session.Role.Id };
         foreach (var id in new[] { Hp, Sp })

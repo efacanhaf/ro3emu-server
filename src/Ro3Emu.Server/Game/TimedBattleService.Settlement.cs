@@ -36,10 +36,10 @@ public sealed partial class TimedBattleService
 
     /// <summary>Freeze every admitted result and its payment before any participant sees terminal success.</summary>
     private static ReservationKey[] SettlementKeys(Match match, long matchId) =>
-        new[] { ReservationKey.Entity("timed_match", matchId.ToString(CultureInfo.InvariantCulture)) }
+        [.. new[] { ReservationKey.Entity("timed_match", matchId.ToString(CultureInfo.InvariantCulture)) }
             .Concat(match.Participants.Values.Select(participant => ReservationKey.Role(participant.Id)))
             .Concat(match.Participants.Values.Select(participant => Obligations.Key(
-                $"timed_battle/{matchId}/{participant.Id}"))).Distinct().ToArray();
+                $"timed_battle/{matchId}/{participant.Id}"))).Distinct()];
 
     private async Task SettleMatchCoreAsync(Match match)
     {
@@ -195,9 +195,9 @@ public sealed partial class TimedBattleService
                     new TimedBattleObligationRow(source, match.Room.Id, match.Entry, original.Id,
                         JsonSerializer.SerializeToUtf8Bytes(grants), JsonSerializer.SerializeToUtf8Bytes(costs),
                         JsonSerializer.SerializeToUtf8Bytes(next), result),
-                    _tasks.StageTimedBattleSettlement(player, match.Entry, source)));
+                    _tasks.StageTimedBattleSettlement(player, match.Entry, source, ChickenWeekly(match, player))));
             }
-            frozen = staged.ToArray();
+            frozen = [.. staged];
             var tx = _roles.NewTransaction();
             foreach (var item in frozen)
             {
@@ -275,6 +275,7 @@ public sealed partial class TimedBattleService
         {
             try
             {
+                if (match.Chicken != null) ClearChickenCustom(player);
                 if (match.Room != null && player.InstanceId == match.Room.Id)
                     await _instances.LeaveAsync(player, recoverDeadOnReturn: match.Chicken != null);
             }

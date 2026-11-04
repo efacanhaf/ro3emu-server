@@ -2,75 +2,265 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>RO3Emu</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Launcher</title>
+<link rel="icon" href="data:,">
+<link rel="preload" href="assets/fonts/young-serif-400-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="assets/fonts/zen-maru-gothic-700-latin.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="app.css">
 </head>
-<body>
-<header class="topbar" id="drag">
-  <span class="logo">RO3Emu</span>
-  <nav class="tabs">
-    <span class="star">✦</span>
-    <button class="tab active" data-tab="home">Home</button>
-    <button class="tab" data-tab="news">News</button>
-    <button class="tab" data-tab="settings">Settings</button>
-    <span class="star">✦</span>
-  </nav>
-  <div class="right">
-    <span class="server" id="server"><i></i><span id="server-text">Connecting…</span></span>
-    <span class="vsep"></span>
-    <button class="wbtn" id="btn-min" title="Minimize"><svg viewBox="0 0 16 16"><path d="M3 8h10"/></svg></button>
-    <button class="wbtn" id="btn-close" title="Close"><svg viewBox="0 0 16 16"><path d="M3.5 3.5l9 9M12.5 3.5l-9 9"/></svg></button>
+<body data-phase="checking">
+
+<!-- Icons drawn for the launcher. -->
+<svg class="sprite" width="0" height="0" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="i-star" viewBox="0 0 24 24"><path d="M12 1.5c.9 5.6 4.9 9.6 10.5 10.5-5.6.9-9.6 4.9-10.5 10.5C11.1 16.9 7.1 12.9 1.5 12 7.1 11.1 11.1 7.1 12 1.5z" fill="#ffb547" stroke="#1d1b4f" stroke-width="1.4" stroke-linejoin="round"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><g fill="none" stroke="currentColor"><circle cx="12" cy="12" r="8.4" stroke-width="2.8" stroke-dasharray="3.3 3.3"/><circle cx="12" cy="12" r="6.4" stroke-width="2"/><circle cx="12" cy="12" r="2.3" stroke-width="1.9"/></g></symbol>
+    <symbol id="i-min" viewBox="0 0 24 24"><path d="M6 12.5h12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M7 7l10 10M17 7L7 17" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.5v13a1 1 0 0 0 1.5.86l10.4-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5z" fill="currentColor"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 10.5l5 5 5-5M5 19.5h14"/></g></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3"/><path d="M19.5 4.5v4.2h-4.2"/></g></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><g fill="currentColor"><rect x="6.5" y="5" width="4" height="14" rx="1.3"/><rect x="13.5" y="5" width="4" height="14" rx="1.3"/></g></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M5.5 12.5l4 4 9-9" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 7v6"/><circle cx="12" cy="17" r=".6" fill="currentColor"/></g></symbol>
+    <symbol id="i-cloud-off" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7.5 18.5h9.8a3.7 3.7 0 0 0 .6-7.35A5.5 5.5 0 0 0 8 9.2a4.7 4.7 0 0 0-.5 9.3z"/><path d="M4 4l16 16"/></g></symbol>
+    <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3c.6 4.3 2.7 6.4 7 7-4.3.6-6.4 2.7-7 7-.6-4.3-2.7-6.4-7-7 4.3-.6 6.4-2.7 7-7z" fill="currentColor"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3.5 7.5a2 2 0 0 1 2-2h4l2 2.2h7a2 2 0 0 1 2 2v7.8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/></symbol>
+    <symbol id="i-wrench" viewBox="0 0 24 24"><path d="M14.6 4.2a4.6 4.6 0 0 0-5.3 6.1l-5.6 5.6a1.9 1.9 0 0 0 2.7 2.7l5.6-5.6a4.6 4.6 0 0 0 6.1-5.3l-2.8 2.8-2.6-.6-.6-2.6z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h13M13 7l5 5-5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-globe" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.4 2.4 3.5 5.3 3.5 8.5s-1.1 6.1-3.5 8.5c-2.4-2.4-3.5-5.3-3.5-8.5s1.1-6.1 3.5-8.5z"/></g></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M5.5 5h13a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-7l-4.5 3.5V17h-1.5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><g fill="currentColor"><circle cx="8.6" cy="11" r="1.1"/><circle cx="12" cy="11" r="1.1"/><circle cx="15.4" cy="11" r="1.1"/></g></symbol>
+    <symbol id="i-flag" viewBox="0 0 24 24"><path d="M6 20.5V4.5M6 5h10.5l-2 3.6 2 3.6H6" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-book" viewBox="0 0 24 24"><path d="M12 6.5c-1.8-1.3-4.3-1.9-7.5-1.8v12.6c3.2-.1 5.7.5 7.5 1.8m0-12.6c1.8-1.3 4.3-1.9 7.5-1.8v12.6c-3.2-.1-5.7.5-7.5 1.8m0-12.6v12.6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+    <symbol id="i-trophy" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7.5 4.5h9v4.2a4.5 4.5 0 0 1-9 0z"/><path d="M7.5 6.5H4.8a2.6 2.6 0 0 0 2.9 3.4M16.5 6.5h2.7a2.6 2.6 0 0 1-2.9 3.4M12 13.2v3.3M8.5 19.5h7M9.8 16.5h4.4"/></g></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="M8.5 7.5L4 12l4.5 4.5M15.5 7.5L20 12l-4.5 4.5M13.4 5.5l-2.8 13" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-panel" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="M3.5 9h17M7.5 13h4M7.5 16h7"/></g><g fill="currentColor"><circle cx="6.3" cy="6.8" r=".8"/><circle cx="8.8" cy="6.8" r=".8"/></g></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M10.2 13.8a3.6 3.6 0 0 0 5.1 0l3-3a3.6 3.6 0 0 0-5.1-5.1l-1.1 1.1"/><path d="M13.8 10.2a3.6 3.6 0 0 0-5.1 0l-3 3a3.6 3.6 0 0 0 5.1 5.1l1.1-1.1"/></g></symbol>
+  </defs>
+</svg>
+
+<!-- the sky -->
+<div class="sky" aria-hidden="true">
+  <i class="cloud c1"></i><i class="cloud c2"></i><i class="cloud c3"></i>
+</div>
+
+<!-- the artwork, framed: the server's hero picture, else the built-in sky -->
+<figure class="art no-hero" id="art" aria-hidden="true">
+  <img id="art-img" alt="" draggable="false" hidden>
+  <i class="cloud c4"></i><i class="cloud c5"></i>
+</figure>
+
+<!-- custom title bar: the whole strip drags the window; controls opt out -->
+<header class="titlebar" data-drag>
+  <div class="brand"><svg class="i"><use href="#i-star"/></svg><span id="brand-name"></span></div>
+  <nav class="links" id="links" aria-label="Links"></nav>
+  <div class="winctl">
+    <button type="button" class="ctl" id="btn-settings" title="Settings" aria-label="Settings"><svg class="i"><use href="#i-gear"/></svg></button>
+    <button type="button" class="ctl" id="btn-min" title="Minimize" aria-label="Minimize"><svg class="i"><use href="#i-min"/></svg></button>
+    <button type="button" class="ctl close" id="btn-close" title="Close" aria-label="Close"><svg class="i"><use href="#i-x"/></svg></button>
   </div>
 </header>
 
-<section class="card notices" id="notices">
-  <div class="card-head">
-    <h2><span class="star">✦</span>Notices</h2>
-    <span class="pill green">Test server</span>
+<!-- news on the sky -->
+<main class="col" id="news">
+  <div class="feature">
+    <p class="kicker" id="feat-kicker" hidden></p>
+    <h1 id="feat-title"></h1>
+    <p class="excerpt" id="feat-excerpt" hidden></p>
+    <button type="button" class="more" id="feat-more" hidden>Read more<svg class="i"><use href="#i-arrow"/></svg></button>
   </div>
-  <p class="card-sub">News from the RO3Emu team.</p>
-  <hr class="gem">
-  <ul class="list" id="news-list"></ul>
-  <p class="card-foot">RO3Emu · private test realm</p>
-</section>
-
-<section class="card settings" id="settings" hidden>
-  <div class="card-head"><h2><span class="star">✦</span>Settings</h2></div>
-  <p class="card-sub">Where the game lives on this PC.</p>
-  <hr class="gem">
-  <label class="field-label">Game folder</label>
-  <div class="field" id="set-dir"></div>
-  <div class="row">
-    <button class="cream small" id="set-dir-change">Change folder</button>
-    <button class="cream small" id="set-open">Open folder</button>
+  <section class="list" id="news-list-wrap" hidden>
+    <h2 class="label">More news</h2>
+    <ul id="news-list"></ul>
+  </section>
+  <div class="under">
+    <div class="server" id="server" data-state="unknown">
+      <i class="dot"></i><span id="server-text">Checking server…</span>
+    </div>
   </div>
-  <p class="hint">Already have the RO3 PC client? Point this at its ROO_PC folder and only the changed files are downloaded.</p>
-  <p class="card-foot" id="set-version"></p>
-</section>
+</main>
 
-<section class="panel steps-panel">
-  <div class="steps">
-    <div class="step" id="step-1"><span class="hex">1</span><div><b>Install</b><small>Download game files</small></div></div>
-    <span class="chev">›</span>
-    <div class="step" id="step-2"><span class="hex">2</span><div><b>Verify</b><small>Check file integrity</small></div></div>
-    <span class="chev">›</span>
-    <div class="step" id="step-3"><span class="hex">3</span><div><b>Ready</b><small>Launch the game</small></div></div>
+<!-- the dock: version, status / progress, the big button -->
+<footer class="dock">
+  <div class="ver">
+    <span class="label">Version</span>
+    <div class="ver-line" id="ver-line"><span class="na">Checking…</span></div>
   </div>
-  <div class="progress" id="progress" hidden>
-    <div class="p-top"><b id="p-stage">Downloading</b><span id="p-pct">0%</span></div>
-    <div class="bar"><div id="p-fill"></div></div>
-    <div class="p-bottom"><span id="p-bytes"></span><span id="p-rate"></span></div>
+
+  <div class="mid">
+    <div class="status" id="status">
+      <span class="badge" id="status-badge"><svg class="i"><use href="#i-sparkle"/></svg><i class="spin"></i></span>
+      <div class="status-text">
+        <b id="status-title">Checking for updates</b>
+        <span id="status-sub">Comparing your files with the latest release…</span>
+        <button type="button" class="linkish" id="status-change" hidden>Change folder</button>
+      </div>
+    </div>
+
+    <div class="progress" id="progress" hidden>
+      <div class="p-top">
+        <b id="p-stage">Downloading</b>
+        <span class="p-file" id="p-file"></span>
+        <span class="p-pct" id="p-pct">0%</span>
+      </div>
+      <div class="bar" id="p-bar"><i id="p-fill"></i></div>
+      <div class="p-meta">
+        <span id="p-bytes"></span>
+        <span id="p-rate"></span>
+      </div>
+    </div>
   </div>
-  <p class="message" id="message"><span id="message-text">Checking for updates…</span></p>
-</section>
 
-<section class="panel actions-panel">
-  <h3>Actions</h3>
-  <button class="blue" id="primary" disabled><img id="primary-icon" alt="" hidden><span id="primary-label">Checking…</span></button>
-  <button class="cream" id="repair"><span>Repair</span></button>
-</section>
+  <button type="button" class="primary" id="primary" disabled>
+    <span class="p-icon"><svg class="i"><use href="#i-download"/></svg><i class="spin"></i></span>
+    <span id="primary-label">Checking…</span>
+  </button>
+</footer>
 
-<footer class="version" id="ver-line"></footer>
+<!-- settings -->
+<div class="scrim" id="settings" hidden>
+  <div class="sheet" tabindex="-1" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="sheet-head">
+      <h2 id="settings-title">Settings</h2>
+      <button type="button" class="ctl plain" id="settings-x" aria-label="Close settings"><svg class="i"><use href="#i-x"/></svg></button>
+    </div>
+
+    <div class="field">
+      <span class="label">Game folder</span>
+      <div class="path-row">
+        <input type="text" id="set-dir" readonly value="" aria-label="Game folder" spellcheck="false">
+        <button type="button" class="btn ghost" id="set-dir-change">Change…</button>
+        <button type="button" class="btn ghost icon" id="set-open" title="Open folder" aria-label="Open folder"><svg class="i"><use href="#i-folder"/></svg></button>
+      </div>
+    </div>
+
+    <div class="field repair" id="set-friends-field" hidden>
+      <div>
+        <span class="label">Play with friends</span>
+        <p class="hint">Host a server friends can join, or join someone else's.</p>
+      </div>
+      <button type="button" class="btn ghost" id="set-friends">Host or join…</button>
+    </div>
+
+    <div class="field repair" id="set-server-field" hidden>
+      <div>
+        <span class="label">Your server</span>
+        <p class="hint" id="set-server-text"></p>
+      </div>
+      <button type="button" class="btn ghost" id="set-server-stop">Stop server</button>
+    </div>
+
+    <div class="field repair">
+      <div>
+        <span class="label">Repair</span>
+        <p class="hint" id="set-repair-hint">Checks every game file and downloads only what is missing or damaged. Your settings and screenshots are kept.</p>
+      </div>
+      <button type="button" class="btn ghost" id="set-repair"><svg class="i"><use href="#i-wrench"/></svg>Repair files</button>
+    </div>
+
+    <div class="field repair">
+      <div>
+        <span class="label">Shortcuts</span>
+        <p class="hint">Desktop and Start menu shortcuts to this launcher.</p>
+      </div>
+      <button type="button" class="btn ghost" id="set-shortcuts">Add shortcuts…</button>
+    </div>
+
+    <div class="field repair" id="set-uninstall-field" hidden>
+      <div>
+        <span class="label">Uninstall</span>
+        <p class="hint">Removes the game folder the launcher installed. The launcher itself stays.</p>
+      </div>
+      <button type="button" class="btn ghost danger" id="set-uninstall">Uninstall</button>
+    </div>
+
+    <div class="sheet-foot">
+      <span id="set-launcher">Launcher</span>
+      <button type="button" class="btn ink" id="settings-done">Done</button>
+    </div>
+  </div>
+</div>
+
+<!-- first run (and Settings): shortcuts; the launcher never moves itself -->
+<div class="scrim" id="shortcuts" hidden>
+  <div class="sheet narrow" tabindex="-1" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title">
+    <div class="sheet-head">
+      <h2 id="shortcuts-title">Add shortcuts?</h2>
+      <button type="button" class="ctl plain" id="shortcuts-x" aria-label="Close"><svg class="i"><use href="#i-x"/></svg></button>
+    </div>
+    <p class="hint lead" id="shortcuts-lead">Start the game from your desktop or the Start menu next time. The launcher stays where it is.</p>
+    <label class="check"><input type="checkbox" id="shortcuts-desktop" checked><span>Desktop</span></label>
+    <label class="check"><input type="checkbox" id="shortcuts-start" checked><span>Start menu</span></label>
+    <div class="sheet-foot">
+      <button type="button" class="btn ghost" id="shortcuts-no">No, thanks</button>
+      <button type="button" class="btn ink" id="shortcuts-yes">Add shortcuts</button>
+    </div>
+  </div>
+</div>
+
+<!-- RO3Emu mode: host a server for friends, or join someone else's -->
+<div class="scrim" id="friends" hidden>
+  <div class="sheet narrow" tabindex="-1" role="dialog" aria-modal="true" aria-labelledby="friends-title">
+    <div class="sheet-head">
+      <h2 id="friends-title">Play with friends</h2>
+      <button type="button" class="ctl plain" id="friends-x" aria-label="Close"><svg class="i"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="field first">
+      <span class="label">Host</span>
+      <div class="path-row stack">
+        <input type="text" class="entry" id="host-address" spellcheck="false" aria-label="Address friends connect to">
+        <input type="text" class="entry" id="host-gm" spellcheck="false" placeholder="GM accounts, comma separated (optional)" aria-label="GM accounts">
+      </div>
+      <p class="hint">Friends join with this address. Players outside your network need TCP ports 5380, 20000 and 33100 forwarded to this PC.</p>
+      <div class="row-end"><button type="button" class="btn ink" id="host-go">Host</button></div>
+    </div>
+    <div class="field">
+      <span class="label">Join</span>
+      <div class="path-row">
+        <input type="text" class="entry" id="join-address" spellcheck="false" placeholder="Server address, for example 203.0.113.10" aria-label="Server address">
+        <button type="button" class="btn ink" id="join-go">Join</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- after an update: the version's notes (channels/<channel>-notes.json) -->
+<div class="scrim" id="notes" hidden>
+  <div class="sheet narrow" tabindex="-1" role="dialog" aria-modal="true" aria-labelledby="notes-title">
+    <div class="sheet-head">
+      <h2 id="notes-title">What's new</h2>
+      <button type="button" class="ctl plain" id="notes-x" aria-label="Close"><svg class="i"><use href="#i-x"/></svg></button>
+    </div>
+    <p class="hint lead" id="notes-version"></p>
+    <ul class="notes-list" id="notes-list"></ul>
+    <div class="sheet-foot">
+      <span></span>
+      <button type="button" class="btn ink" id="notes-ok">Got it</button>
+    </div>
+  </div>
+</div>
+
+<!-- uninstall: removes only the folder the launcher installed -->
+<div class="scrim" id="uninstall" hidden>
+  <div class="sheet narrow" tabindex="-1" role="dialog" aria-modal="true" aria-labelledby="uninstall-title">
+    <div class="sheet-head">
+      <h2 id="uninstall-title">Uninstall the game?</h2>
+      <button type="button" class="ctl plain" id="uninstall-x" aria-label="Close"><svg class="i"><use href="#i-x"/></svg></button>
+    </div>
+    <p class="hint lead">This removes the game folder:</p>
+    <p class="path-note" id="uninstall-path"></p>
+    <p class="hint">Your characters live on the server and are not touched. You can install the game again any time.</p>
+    <p class="form-error" id="uninstall-error" role="alert" hidden></p>
+    <div class="sheet-foot">
+      <button type="button" class="btn ghost" id="uninstall-cancel">Keep it</button>
+      <button type="button" class="btn ink danger" id="uninstall-go">Uninstall</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
 <script src="app.js"></script>
 </body>
 </html>

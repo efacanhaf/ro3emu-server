@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text.Json;
 using Romsg;
 using Ro3Emu.Server.Data;
+using Ro3Emu.Server.Data.Config;
 
 namespace Ro3Emu.Server.Game;
 
@@ -10,9 +11,9 @@ public sealed partial class TaskService
     /// <summary>Preserve action slots, order and string parameters, including the empty sentinel (§1).</summary>
     private static string[][] Actions(JsonElement row, string field) =>
         row.TryGetProperty(field, out var array) && array.ValueKind == JsonValueKind.Array
-            ? array.EnumerateArray().Select(a => a.ValueKind == JsonValueKind.Array
+            ? [.. array.EnumerateArray().Select(a => a.ValueKind == JsonValueKind.Array
                 ? a.EnumerateArray().Select(v => v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : v.ToString()).ToArray()
-                : Array.Empty<string>()).ToArray() : [];
+                : Array.Empty<string>())] : [];
 
     // 0 is a client/no-op slot; -1 is malformed or an unknown action definition.
     private int ServerOpcode(string[] action)
@@ -29,15 +30,20 @@ public sealed partial class TaskService
     /// Host-1 effects. 20's [item,count] is an inferred inventory cost, committed with delivery.
     /// 621 tracks cutscene state; no invented packet, invulnerability or movement rule. The resource semantics of
     /// 54/412 stage mount ride/recycle state with the same award transaction; other unsupported actions hold delivery.
+    /// 115 MarkGuildActivityJoin [activity] marks the role as having joined an activity, named by its DailyActivityConfig
+    /// id (1601000, the guild caravan quest: 3000; all 24 uses have that row, GuildActivityConfig links to them by
+    /// _iDailyActivity and shares only three ids by chance). The client never reads such a mark, so it is reported through
+    /// <see cref="GuildActivityJoined"/> after the delivery commits, for the activity's own bookkeeping (inferred).
     /// This method only builds a plan, so a refusal cannot mutate action state or consume inventory.
     /// </summary>
     private bool TryDeliveryActions(GameSession session, Ownership.OwnerContext context, TaskDef def,
-        out List<(int Entry, int Count)> costs, out bool cutScene, out int? questMount)
+        out List<(int Entry, int Count)> costs, out bool cutScene, out int? questMount, out List<long> guildActivities)
     {
         context.AssertRole(session.Role!.Id);
-        costs = new();
+        costs = [];
         cutScene = false;
         questMount = null;
+        guildActivities = [];
         var actions = def.ExecActions.ToList();
         foreach (var action in actions)
         {
@@ -64,8 +70,15 @@ public sealed partial class TaskService
                     if ((questMount ?? session.MountState.QuestMount) == recycle) questMount = 0;
                     break;
                 case 621 when action.Length == 1: cutScene = true; break;
+                case MarkGuildActivityJoin when action.Length == 2
+                    && long.TryParse(action[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out long activity)
+                    && DailyActivityConfig.Get(_data, activity) != null:
+                    guildActivities.Add(activity);
+                    break;
+                // 116 UpdateSocialityScore [SocialRelationsConfig id]: applied after the commit (TaskService.Connect.cs).
+                case UpdateSocialityScore when SocialityIntimacy(action) >= 0: break;
                 default:
-                    _log.LogWarning("Task {Task} held at server action {Action}: resource semantics not implemented", def.Id, string.Join(',', action));
+                    LogHeldOnce(session, def.Id, $"server action {string.Join(',', action)}: resource semantics not implemented");
                     return false;
             }
         }
@@ -87,12 +100,39 @@ public sealed partial class TaskService
         return true;
     }
 
+    /// <summary>ActionConfig 115 MarkGuildActivityJoin (_iEXECHost 1).</summary>
+    internal const int MarkGuildActivityJoin = 115;
+
+    /// <summary>A delivered task's 115 MarkGuildActivityJoin: the role and the DailyActivityConfig id.</summary>
+    public List<Action<GameSession, long>> GuildActivityJoined { get; } = [];
+
+    private readonly HashSet<(long Role, long Task, string Reason)> _heldLogged = [];
+
+    /// <summary>
+    /// A held delivery is retried by the client every few seconds while the task stays complete: warn once per role,
+    /// task and reason, and log the repeats at debug level.
+    /// </summary>
+    private void LogHeldOnce(GameSession session, long task, string reason)
+    {
+        long role = session.Role?.Id ?? 0;
+        bool first;
+        lock (_heldLogged) first = _heldLogged.Add((role, task, reason));
+        if (first) LogHeld(task, role, reason);
+        else LogHeldAgain(task, role, reason);
+    }
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "Task {Task} held for {Role}: {Reason}")]
+    private partial void LogHeld(long task, long role, string reason);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "Task {Task} still held for {Role}: {Reason}")]
+    private partial void LogHeldAgain(long task, long role, string reason);
+
     private List<(long Id, string[][] Actions)>? _dialogueRows;
 
     /// <summary>Every DialogueConfig row with its _iEXECAction slots (a dialogue id holds an array of rows).</summary>
-    private List<(long Id, string[][] Actions)> DialogueRows() => _dialogueRows ??= _data.Table("DialogueConfig")
+    private List<(long Id, string[][] Actions)> DialogueRows() => _dialogueRows ??= [.. _data.Table("DialogueConfig")
         .SelectMany(kv => kv.Value.ValueKind == JsonValueKind.Array ? kv.Value.EnumerateArray() : Enumerable.Repeat(kv.Value, 1))
-        .Select(r => ((long)GameData.Int(r, "_iID"), Actions(r, "_iEXECAction"))).Where(r => r.Item2.Length > 0).ToList();
+        .Select(r => ((long)GameData.Int(r, "_iID"), Actions(r, "_iEXECAction"))).Where(r => r.Item2.Length > 0)];
 
     /// <summary>32709 exits state only. It never completes a plot objective.</summary>
     public async Task ExitCutSceneAsync(GameSession session)

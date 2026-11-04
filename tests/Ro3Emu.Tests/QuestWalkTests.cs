@@ -54,7 +54,7 @@ public sealed class QuestWalkTests : IAsyncLifetime
     private async Task Gm(string line)
     {
         using var http = new HttpClient();
-        (await http.PostAsync($"{_http}/ro3emu/gm?account=walker", new StringContent(line))).EnsureSuccessStatusCode();
+        (await http.PostAsync($"{_http}/ro3emu/gm?account=walker", Operator.Command(line))).EnsureSuccessStatusCode();
     }
 
     /// <summary>The server's view of the walker: running/finished task ids and the current map.</summary>
@@ -105,8 +105,9 @@ public sealed class QuestWalkTests : IAsyncLifetime
             {
                 switch (t[0])
                 {
-                    case 104003: // reach area [map, area]
+                    case 104003: // reach area [map, area]: the client reports the region it stands in
                         if (scene != t[1]) await WarpAsync(bot, t[1]);
+                        if (world.Map(t[1])?.Regions.GetValueOrDefault(t[2]) is { } region) await WarpAsync(bot, t[1], region.X, region.Z);
                         await bot.SendGameAsync(SceneService.ClientEnterArea, new ClientEnterAreaReq { AreaId = t[2] });
                         break;
                     case 309002: // cutscene ended
@@ -151,9 +152,10 @@ public sealed class QuestWalkTests : IAsyncLifetime
                         break;
                 }
             }
-            // The task must move (delivered) within a moment.
+            // The task must move (delivered). Its targets complete through the loop and the database writer: a fixed
+            // 2 s of polling ran out under suite load, so wait as long as for any message.
             bool moved = false;
-            for (int i = 0; i < 40 && !moved; i++)
+            for (var until = DateTime.UtcNow + Wait; !moved && DateTime.UtcNow < until;)
             {
                 await Task.Delay(50);
                 moved = (await State()).Delivered.Contains(task);
@@ -199,7 +201,7 @@ public sealed class QuestWalkTests : IAsyncLifetime
             var me = sessions.All().Single(x => x.Role != null);
             var m = world.AllUnits().OfType<MonsterUnit>().Where(u => u.SceneEntry == scene && !u.Dead && npc(u.Template.NpcId))
                 .OrderBy(u => (u.X - me.Position.X) * (u.X - me.Position.X) + (u.Z - me.Position.Z) * (u.Z - me.Position.Z)).First();
-            return Task.FromResult((m, skills.NormalAttack(me.Progress!.Career)));
+            return Task.FromResult((m, skills.CurrentAttack(me))); // the row the held weapon gives, as the client sends
         });
         // Like the client: attack again only when the auto-attack stopped (a potion, a jump) and chase a target that
         // roamed out of reach. A new cast cancels the swing in progress, so attacking blindly on a timer starved the

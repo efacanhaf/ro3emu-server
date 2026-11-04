@@ -1,4 +1,5 @@
 using System.Text;
+using Ro3Emu.ClientTools;
 
 namespace Ro3Emu.Setup;
 
@@ -19,11 +20,13 @@ internal static class Program
                                --public <ip>     the address friends connect to (default: this PC's LAN address)
                                --gm <account>    an account that gets GM commands (repeatable)
           join <address>     play on someone else's server: host, host:port or http://host:port
-          install [folder]   download the game from the official Genesis servers (about 24 GB), every file
-                             checked against the publisher's signature
-          update [folder]    bring the game up to date from the official servers (only changed files)
+          panel [address]    open the server's web panel in your browser (and print its address): the
+                             server on this PC (its --panel-port), or the server at the address
+          install [folder]   download the game from Genesis' update servers (about 24 GB), every file
+                             checked against Genesis' signature
+          update [folder]    bring the game up to date from Genesis' update servers (only changed files)
                                --server-files    only what a server needs for its export (Linux hosts)
-          restore            undo the patch (the game talks to the official servers again)
+          restore            undo the patch (the game talks to Genesis' servers again)
           check              check that the game folder fits this RO3Emu, without changing anything
           export <game> <data>  export the game data only (server hosts, Linux)
           diag               write RO3Emu-diagnostics.zip for a bug report
@@ -31,11 +34,17 @@ internal static class Program
         options:
           --client <folder>  the game folder (the one with ro3.exe); remembered for next time
           --reexport         export the game data again
+          --no-icons         no pictures for the web panel (item, monster, class, map and skill images from
+                             the game; about 20 seconds and 120 MB): the panel shows letters instead
           --no-launch        do not start the game (server only)
           --yes              no questions: take the defaults
           --http-port <n> --micro-port <n> --game-port <n>   server ports (default 5380, 20000, 33100)
           --voice-port <n>   turn on party voice chat on this TCP port, for example 33101 (off by default)
+          --panel-port <n>   the server's web panel on this TCP port (default 5381)
+          --no-panel         no web panel
           --home <folder>    where RO3Emu keeps data, logs and settings (default: next to RO3Emu.exe)
+          --purchase-url <address>  the in-game purchase / recharge buttons open this http(s) address (start,
+                             host, join; give it every time). Without it they open nothing, never Genesis' store
         """;
 
     /// <summary>Ctrl+C or Q while the server runs: the wait ends and the server is stopped cleanly.</summary>
@@ -85,6 +94,7 @@ internal static class Program
                 "start" => await Flows.PlayLocalAsync(options, host: false),
                 "host" => await Flows.PlayLocalAsync(options, host: true),
                 "join" => await Flows.JoinAsync(options),
+                "panel" => await Flows.PanelAsync(options),
                 "restore" => Flows.Restore(options),
                 "check" => Flows.Check(options),
                 "export" => Flows.Export(options),
@@ -143,13 +153,15 @@ internal sealed class Options
     public bool NoLaunch { get; private set; }
     public bool Yes { get; private set; }
     public string? PublicHost { get; private set; }
+    public string? PurchaseUrl { get; private set; }
     public List<string> GmAccounts { get; } = [];
     public string? Only { get; private set; }
     public bool ListInputs { get; private set; }
     public bool ServerFiles { get; private set; }
+    public bool NoIcons { get; private set; }
     public ServerProcess.Ports Ports { get; private set; } = new();
 
-    private static readonly HashSet<string> Commands = ["start", "host", "join", "restore", "check", "export", "install", "update", "diag", "help"];
+    private static readonly HashSet<string> Commands = ["start", "host", "join", "panel", "restore", "check", "export", "install", "update", "diag", "help"];
 
     public static Options Parse(string[] args)
     {
@@ -174,14 +186,21 @@ internal sealed class Options
                 case "--no-launch": o.NoLaunch = true; break;
                 case "--yes": case "-y": o.Yes = true; break;
                 case "--public": o.PublicHost = Value("--public"); break;
+                case "--purchase-url":
+                    o.PurchaseUrl = Value("--purchase-url") is var url && OpenUrlPatch.IsPurchaseUrl(url) ? url
+                        : throw new SetupException($"--purchase-url needs an http or https address, not '{url}'.", "Run RO3Emu.exe help.");
+                    break;
                 case "--gm": o.GmAccounts.Add(Value("--gm")); break;
                 case "--only": o.Only = Value("--only"); break;
                 case "--list-inputs": o.ListInputs = true; break;
                 case "--server-files": o.ServerFiles = true; break;
+                case "--no-icons": o.NoIcons = true; break;
                 case "--http-port": o.Ports = o.Ports with { Http = Port("--http-port") }; break;
                 case "--micro-port": o.Ports = o.Ports with { MicroGate = Port("--micro-port") }; break;
                 case "--game-port": o.Ports = o.Ports with { GameGate = Port("--game-port") }; break;
                 case "--voice-port": o.Ports = o.Ports with { Voice = Port("--voice-port") }; break;
+                case "--panel-port": o.Ports = o.Ports with { Panel = Port("--panel-port") }; break;
+                case "--no-panel": o.Ports = o.Ports with { Panel = 0 }; break;
                 case "-h": case "--help": o.Command = "help"; break;
                 default:
                     if (args[i].StartsWith("--")) throw new SetupException($"Unknown option {args[i]}.", "Run RO3Emu.exe help.");

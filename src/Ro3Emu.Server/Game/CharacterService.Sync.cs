@@ -52,7 +52,9 @@ public sealed partial class CharacterService
     private async Task SyncItemsAsync(GameSession session, Func<bool>? stillOwner = null)
     {
         var now = BuildItems(session);
-        if (now.StoragePack != null && session.Synced.GetValueOrDefault(ItemsSync) is DBItemsInfo { StoragePack: null }) session.Synced.Remove(ItemsSync);
+        // Rebuild after dropping the old snapshot: retained empty packs have no sortedIndex in a full
+        // protobuf decode, but LC_DAL_Knapsack.InitPackData iterates that map for every supplied pack.
+        if (ResendItemsWholeIfNeeded(session, now)) now = BuildItems(session);
         await SyncAsync(session, ItemsSync, now);
         if (stillOwner?.Invoke() == false) return;
         if (PruneEquipmentPlans(session))
@@ -60,6 +62,23 @@ public sealed partial class CharacterService
             roles.SaveEquipPlans(session.Role!.Id, session.EquipmentPlans.ToByteArray());
             await SyncEquipmentAsync(session);
         }
+    }
+
+    /// <summary>
+    /// 5009 goes out whole again when it carries a part the client only builds from a full sync: storagePack (see
+    /// <see cref="SyncItemsAsync"/>) or a bag pack the client was never sent. LC_DAL_Knapsack.InitPackData -> InitGridInfo
+    /// builds each pack's grid from the full sync only, so gear sent into a pack missing at login (a new character's
+    /// first unequipped gear: the starter weapon and shirt are worn, so pack 2 is absent) is stored but never shown.
+    /// </summary>
+    private static bool ResendItemsWholeIfNeeded(GameSession session, DBItemsInfo now)
+    {
+        if (session.Synced.GetValueOrDefault(ItemsSync) is DBItemsInfo sent
+            && (now.StoragePack != null && sent.StoragePack == null || now.PackInfo.Keys.Any(k => !sent.PackInfo.ContainsKey(k))))
+        {
+            session.Synced.Remove(ItemsSync);
+            return true;
+        }
+        return false;
     }
 
     /// <summary>5066: PlayerBasicInfo (id and career are mandatory); exp is the progress inside the level.</summary>
@@ -98,8 +117,8 @@ public sealed partial class CharacterService
         var info = new DBItemsInfo { AutoDecomposeSetting = session.AutoDecompose.Clone() };
         var preferences = session.BagState.Info;
         info.QuickUseInfos.Add(preferences.QuickUseInfos);
-        info.ShortcutBarInfos.Add(preferences.ShortcutBarInfos);
-        info.MedicinesAutoUse = preferences.MedicinesAutoUse?.Clone();
+        info.ShortcutBarInfos.Add(FullShortcutBar(preferences.ShortcutBarInfos));
+        info.MedicinesAutoUse = WithMedicineDefaults(preferences.MedicinesAutoUse);
         info.CurrentArrowID = preferences.CurrentArrowID;
         info.ItemCds = preferences.ItemCds?.Clone();
         info.ShareCds = preferences.ShareCds?.Clone();
@@ -163,12 +182,12 @@ public sealed partial class CharacterService
     private static async Task<IDisposable?> LockIntentAsync(GameSession session, Func<bool>? stillOwner)
     {
         var cancellation = stillOwner == null ? CancellationToken.None : session.PendingCharacterIntent;
-        try { return await LockAsync(session, cancellation); }
+        try { return await LockAsync(session, cancellation: cancellation); }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested || stillOwner?.Invoke() == false) { return null; }
     }
 
-    private static async Task<IDisposable> LockAsync(GameSession session, CancellationToken cancellation = default,
-        IReadOnlyList<Ownership.ReservationKey>? additionalKeys = null)
+    private static async Task<IDisposable> LockAsync(GameSession session, IReadOnlyList<Ownership.ReservationKey>? additionalKeys = null,
+        CancellationToken cancellation = default)
     {
         if (session.Progress == null) throw new InvalidOperationException("not in game");
         Ownership.LegacyOwnerScope? scope = null;

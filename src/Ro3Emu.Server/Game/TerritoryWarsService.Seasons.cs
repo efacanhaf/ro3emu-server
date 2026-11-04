@@ -8,7 +8,7 @@ namespace Ro3Emu.Server.Game;
 public sealed partial class TerritoryWarsService
 {
     private WorldState? _seasonCleanupState;
-    private readonly HashSet<long> _seasonRoleProjectionPending = new();
+    private readonly HashSet<long> _seasonRoleProjectionPending = [];
 
     private async Task ProjectSeasonRolesAsync()
     {
@@ -34,7 +34,7 @@ public sealed partial class TerritoryWarsService
 
     private async Task CleanupSeasonRuntimeAsync()
     {
-        await RoleFanout.EachAsync(_queue.Keys.ToArray(),
+        await RoleFanout.EachAsync([.. _queue.Keys],
             s => CancelQueueAsync(s, TerritoryWarQueueExitReason.SceneDestroyed));
         foreach (var b in _battles.Values.ToArray())
         {
@@ -137,12 +137,12 @@ public sealed partial class TerritoryWarsService
         var transaction = _accounts.NewTransaction();
         int receipt = transaction.Add(new TerritoryWarsSeasonTransitionPlan(old.Epoch,
             JsonSerializer.SerializeToUtf8Bytes(old), Epoch,
-            JsonSerializer.SerializeToUtf8Bytes(new WorldState { Epoch = Epoch })));
+            JsonSerializer.SerializeToUtf8Bytes(new WorldState { Epoch = Epoch, GlorySettle = [old.Epoch] })));
         foreach (var guild in treasury.Values)
             _guildStore.EnlistSave(guild, transaction, "Guild changed during territory season rollover");
         var beforeArchives = targetBytes is { Length: > 0 }
             ? new[] { (State: restored, Prefix: "archive/" + Epoch + "/") } : [];
-        if (WarsEconomy(original, restored, priorTreasury.Values.ToArray(), treasury.Values.ToArray(),
+        if (WarsEconomy(original, restored, [.. priorTreasury.Values], [.. treasury.Values],
             "season-rollover", $"territory-season-rollover:{old.Epoch}:{Epoch}",
             beforeArchives: beforeArchives,
             afterArchives: [(old, "archive/" + old.Epoch + "/")]) is { } economy)
@@ -160,6 +160,12 @@ public sealed partial class TerritoryWarsService
         }
         finally { PublishCommitted(next); }
         await ProjectSeasonRolesAsync();
+        // A restored archive replaces the fresh state the transition wrote: the old season still owes its Battle Merit mail.
+        if (!state.GlorySettle.Contains(old.Epoch))
+        {
+            state.GlorySettle.Add(old.Epoch);
+            await SaveAsync(state);
+        }
         foreach (long guild in treasury.Keys) await _guilds.RefreshResourceAsync(guild);
         await PublishAsync();
     }

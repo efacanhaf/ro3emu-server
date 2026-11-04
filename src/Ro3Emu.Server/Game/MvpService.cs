@@ -31,7 +31,7 @@ public sealed partial class MvpService : IGameTicker
 
     /// <summary>After a committed kill settlement, once per online participant (achievement 103011). Runs under the
     /// settlement's owner scope: listeners post their own work.</summary>
-    public List<Action<GameSession>> ParticipantSettled { get; } = new();
+    public List<Action<GameSession>> ParticipantSettled { get; } = [];
     private const int RefreshMessage = 603, DieMessage = 604; // PublicParamConfig.MVPRefreshMessage / MVPDieMessage
     private const int TeamCap = 3, JoinCap = 5, FirstCap = 3, EndCap = 3; // TeamAwardNum / PartAwardNum / FirstDamageAward / LastDamage
     private const int ResetHour = 5;                                        // AwardNumRefreshTime
@@ -53,7 +53,7 @@ public sealed partial class MvpService : IGameTicker
         public required RuntimeMapKey Runtime;
         public bool Retired;
         public int Pending;
-        public readonly List<(TimeSpan Due, Func<Task> Work, MonsterUnit? Actor)> Deadlines = new();
+        public readonly List<(TimeSpan Due, Func<Task> Work, MonsterUnit? Actor)> Deadlines = [];
         public readonly TaskCompletionSource Quiesced = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public MVP_STATE Phase = MVP_STATE.Born;
         public long StateTimeMs;
@@ -62,19 +62,20 @@ public sealed partial class MvpService : IGameTicker
         public bool Spawning;
         public bool Transitioning;
         public long FirstPlayer;
-        public readonly Dictionary<long, Stat> Stats = new();
-        public readonly List<long> DeadMs = new();
-        public readonly Dictionary<(long Version, MVPRankType Tp), MVPReportRankInfo> Reports = new();
+        public readonly Dictionary<long, Stat> Stats = [];
+        public readonly List<long> DeadMs = [];
+        public readonly Dictionary<(long Version, MVPRankType Tp), MVPReportRankInfo> Reports = [];
         public long NextCastMs;
         public bool SkillsStopped;
         public long LastFightMs;
         public bool UnFightApplied;
-        public readonly Dictionary<int, long> SkillReadyMs = new();
-        public readonly List<MonsterUnit> Minions = new();
-        public readonly List<MvpFieldUnit> Fields = new();
+        public readonly Dictionary<int, long> SkillReadyMs = [];
+        public readonly List<MonsterUnit> Minions = [];
+        public readonly List<MvpFieldUnit> Fields = [];
     }
 
     private readonly GameData _data;
+    private readonly TestingSwitches _testing;
     private readonly AccountStore _accounts;
     private readonly MonsterService _monsters;
     private readonly WorldData _worldData;
@@ -94,8 +95,8 @@ public sealed partial class MvpService : IGameTicker
     /// <summary>(inferred) Chance in percent that an MVP kill drops a Lord's Mane (ServerOptions.LordsManePercent).</summary>
     internal int LordsManePercent { get; set; } = 10;
     private Dictionary<int, State>? _states;
-    private readonly Dictionary<RuntimeMapKey, Dictionary<int, State>> _lineStates = new();
-    private readonly Dictionary<int, long> _lastDeath = new();
+    private readonly Dictionary<RuntimeMapKey, Dictionary<int, State>> _lineStates = [];
+    private readonly Dictionary<int, long> _lastDeath = [];
     private sealed class PreparedKill
     {
         public required State State;
@@ -106,8 +107,8 @@ public sealed partial class MvpService : IGameTicker
         public bool DeliveryAttempted;
         public bool DeadNoticeSent;
     }
-    private readonly Dictionary<MonsterUnit, PreparedKill> _preparedKills = new();
-    private readonly Dictionary<MonsterUnit, (long RoleId, long Damage, long PreviousFirst, bool NewStat)> _unpublishedLethalHits = new();
+    private readonly Dictionary<MonsterUnit, PreparedKill> _preparedKills = [];
+    private readonly Dictionary<MonsterUnit, (long RoleId, long Damage, long PreviousFirst, bool NewStat)> _unpublishedLethalHits = [];
     private sealed class UnknownKill
     {
         public required State State;
@@ -121,7 +122,7 @@ public sealed partial class MvpService : IGameTicker
         public required long BeforeHp;
         public bool Resolving;
     }
-    private readonly Dictionary<MonsterUnit, UnknownKill> _unknownKills = new();
+    private readonly Dictionary<MonsterUnit, UnknownKill> _unknownKills = [];
     internal Func<string, Task>? BeforeSettlementProbeForTest { get; set; }
     internal Func<string, Task>? AfterSettlementCommitForTest { get; set; }
     internal Func<string, Task>? BeforeRetainedPublicationForTest { get; set; }
@@ -131,8 +132,10 @@ public sealed partial class MvpService : IGameTicker
 
     public MvpService(GameData data, AccountStore accounts, MonsterService monsters, WorldData worldData, CharacterService character,
         RewardService rewards, TaskService tasks, TeamService teams, CombatService combat, BuffService buffs, SessionRegistry sessions,
-        World world, GameLoop loop, SceneService scene, PublicLineManager lines, ILogger<MvpService> log)
+        World world, GameLoop loop, SceneService scene, PublicLineManager lines, ILogger<MvpService> log,
+        TestingSwitches testing)
     {
+        this._testing = testing;
         this._buffs = buffs;
         this._data = data;
         this._accounts = accounts;
@@ -197,6 +200,8 @@ public sealed partial class MvpService : IGameTicker
             builder.Add(new MvpWritePlan(role, CounterRow(info)));
             await builder.CommitAsync(_accounts, "mvp/daily-counter-reset");
         }
+        // Testing UnlimitedRewards (TEST AID, not original): nothing is counted, so nothing shows as used.
+        if (_testing.UnlimitedRewards) info = new MVPPlayerInfo { PlayerId = role, LastTime = info.LastTime };
         await s.SendGameAsync(AwardNum, new MVPAwardNumRsp { Result = 0, Info = info });
     }
 
@@ -287,9 +292,9 @@ public sealed partial class MvpService : IGameTicker
     public async Task RetireLineAsync(RuntimeMapKey runtime)
     {
         if (!_lineStates.Remove(runtime, out var states)) return;
-        foreach (var key in _preparedKills.Where(kv => states.Values.Contains(kv.Value.State)).Select(kv => kv.Key).ToArray())
+        foreach (var key in _preparedKills.Where(kv => states.ContainsValue(kv.Value.State)).Select(kv => kv.Key).ToArray())
             _preparedKills.Remove(key);
-        foreach (var key in _unknownKills.Where(kv => states.Values.Contains(kv.Value.State)).Select(kv => kv.Key).ToArray())
+        foreach (var key in _unknownKills.Where(kv => states.ContainsValue(kv.Value.State)).Select(kv => kv.Key).ToArray())
             _unknownKills.Remove(key);
         foreach (var key in _unpublishedLethalHits.Where(kv => states.Values.Any(s => s.Unit == kv.Key)).Select(kv => kv.Key).ToArray())
             _unpublishedLethalHits.Remove(key);
@@ -541,7 +546,7 @@ public sealed partial class MvpService : IGameTicker
             };
             if (st.Runtime.LineNumber == 1) keys.Add(ReservationKey.Entity("mvp_state", cfg));
             using (var scope = _loop.Owners is { } owners
-                ? await owners.EnterAsync("mvp/resolve-uncertain", keys.ToArray()) : null)
+                ? await owners.EnterAsync("mvp/resolve-uncertain", [.. keys]) : null)
             {
                 var committed = await ProbeSettlementAsync(unknown.Source);
                 if (!_unknownKills.TryGetValue(m, out var current) || !ReferenceEquals(current, unknown) || st.Retired) return;
@@ -629,14 +634,18 @@ public sealed partial class MvpService : IGameTicker
         if (st.Retired) throw new OperationCanceledException("MVP line retired before lethal settlement.");
         online = online.Where(pair => pair.Value.Role?.Id == pair.Key && pair.Value.Progress != null
             && pair.Value.Attachment?.Cancelled != true).ToDictionary();
+        // Connect target 106012 asks for a party-mate among the participants (TaskService.Connect.cs).
         var taskPlans = online.ToDictionary(pair => pair.Key,
-            pair => _tasks.StageMvpParticipant(pair.Value, parentSource));
+            pair => _tasks.StageMvpParticipant(pair.Value, parentSource, st.Def.NpcId, st.Stats.TryGetValue(pair.Key, out var me)
+                && me.TeamId != 0 && st.Stats.Any(other => other.Key != pair.Key && other.Value.TeamId == me.TeamId)));
         var counters = new Dictionary<long, MVPPlayerInfo>();
         foreach (long player in online.Keys)
             counters[player] = (await LoadCountersAsync(player)).Info;
         // Counts before this kill decide the decay; offline participants have no loaded counters (inferred: not capped).
+        // Testing UnlimitedRewards (TEST AID, not original): no count is checked or spent, so nobody is capped.
+        bool unlimited = _testing.UnlimitedRewards;
         var teamsRanked = RankTeams(st.Stats.Select(kv => (kv.Key, kv.Value.TeamId, kv.Value.Leader, scores.GetValueOrDefault(kv.Key))),
-            id => counters.TryGetValue(id, out var c) && (c.TeamNum >= TeamCap || c.JoinNum >= JoinCap), capped => DecayPercent(_data, capped));
+            id => !unlimited && counters.TryGetValue(id, out var c) && (c.TeamNum >= TeamCap || c.JoinNum >= JoinCap), capped => DecayPercent(_data, capped));
 
         void Give(long player, MVP_AWARD_TYPE tp, long awardId)
         {
@@ -651,13 +660,16 @@ public sealed partial class MvpService : IGameTicker
                 _ => 0,
             };
             int cap = tp switch { MVP_AWARD_TYPE.First => FirstCap, MVP_AWARD_TYPE.End => EndCap, MVP_AWARD_TYPE.Team => TeamCap, MVP_AWARD_TYPE.Join => JoinCap, _ => int.MaxValue };
-            if (current >= cap) return; // 26051 "Today's Reward Count has been exhausted"
-            switch (tp)
+            if (current >= cap && !unlimited) return; // 26051 "Today's Reward Count has been exhausted"
+            if (!unlimited)
             {
-                case MVP_AWARD_TYPE.First: counter.FirstNum++; break;
-                case MVP_AWARD_TYPE.End: counter.EndNum++; break;
-                case MVP_AWARD_TYPE.Team: counter.TeamNum++; break;
-                case MVP_AWARD_TYPE.Join: counter.JoinNum++; break;
+                switch (tp)
+                {
+                    case MVP_AWARD_TYPE.First: counter.FirstNum++; break;
+                    case MVP_AWARD_TYPE.End: counter.EndNum++; break;
+                    case MVP_AWARD_TYPE.Team: counter.TeamNum++; break;
+                    case MVP_AWARD_TYPE.Join: counter.JoinNum++; break;
+                }
             }
             foreach (var (entry, count) in _rewards.RollAward(awardId, s))
                 awards.GetValueOrDefault(player)?.Add(new MVPPlayerAwardItem { ItemId = entry, Count = count, Tp = tp });
@@ -754,7 +766,7 @@ public sealed partial class MvpService : IGameTicker
             foreach (var handler in ParticipantSettled)
                 try { handler(participant); }
                 catch (Exception e) { _log.LogError(e, "MVP participant hook failed for {Role}", participant.Role?.Id); }
-        return obligations.ToArray();
+        return [.. obligations];
     }
 
     internal sealed record RankedTeam(long Key, long Leader, List<long> Members, long Score, bool Decayed);
@@ -766,13 +778,13 @@ public sealed partial class MvpService : IGameTicker
     /// </summary>
     internal static List<RankedTeam> RankTeams(IEnumerable<(long Role, long Team, long Leader, long Score)> players,
         Func<long, bool> capped, Func<int, int> decayPercent) =>
-        players.GroupBy(p => p.Team != 0 ? p.Team : -p.Role).Select(g =>
+        [.. players.GroupBy(p => p.Team != 0 ? p.Team : -p.Role).Select(g =>
         {
             var members = g.Select(p => p.Role).ToList();
             long sum = g.Sum(p => p.Score);
             int percent = decayPercent(members.Count(capped));
             return new RankedTeam(g.Key, g.First().Leader, members, sum > 0 ? sum * percent / 100 : sum, percent < 100);
-        }).OrderByDescending(t => t.Score).ToList();
+        }).OrderByDescending(t => t.Score)];
 
     /// <summary>PublicParamConfig RewardDecayRatio [50,60,70,80,90] as the percent kept: one capped member 90, two 80 ...
     /// five or more 50 (order inferred: "the more such members, the greater the decay").</summary>
@@ -826,7 +838,7 @@ public sealed partial class MvpService : IGameTicker
                 RarePlayerId = rarePlayer, RareTeamId = rareTeam,
             };
             var order = tp == MVPRankType.Total ? ranked
-                : ranked.OrderByDescending(t => t.Members.Sum(m => value(st.Stats[m]))).ToList();
+                : [.. ranked.OrderByDescending(t => t.Members.Sum(m => value(st.Stats[m])))];
             foreach (var t in order.Take(100))
             {
                 long teamValue = tp == MVPRankType.Total ? t.Score : t.Members.Sum(m => value(st.Stats[m]));
@@ -990,7 +1002,7 @@ public sealed partial class MvpService : IGameTicker
                 ?? throw new InvalidDataException("Invalid frozen MVP award obligation.");
             var economy = grants.Any(grant => grant.Entry is not (100 or 101))
                 ? EventEconomy.ForRole(_data, session, "mvp-delivery", "mvp/delivery/" + row.SourceKey,
-                    Array.Empty<(int Entry, long Count)>(), Array.Empty<AwardGrant>(),
+                    [], [],
                     new
                     {
                         row.SourceKey, row.PlayerId,

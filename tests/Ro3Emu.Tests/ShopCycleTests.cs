@@ -72,7 +72,7 @@ public sealed class ShopCycleTests : IAsyncLifetime
     private async Task Gm(string command)
     {
         using var client = new HttpClient();
-        (await client.PostAsync($"{_http}/ro3emu/gm?account=cyclealice", new StringContent(command))).EnsureSuccessStatusCode();
+        (await client.PostAsync($"{_http}/ro3emu/gm?account=cyclealice", Operator.Command(command))).EnsureSuccessStatusCode();
     }
 
     private static async Task<int> Buy(BotClient bot)
@@ -141,7 +141,7 @@ public sealed class ShopCycleTests : IAsyncLifetime
         }
         finally { character.StateChanged.Remove(failAfterCommit); }
         Assert.Equal(money - 7500, character.CountOf(session, 1));
-        Assert.Equal(tokens + 1, character.CountOf(session, 1250709));
+        Assert.Equal(tokens + 5, character.CountOf(session, 1250709)); // "Pet Egg x5" (_iIsShowCount 5)
         Assert.Equal(1, session.Shop!.Bought[Offer].Count);
         var persisted = JsonSerializer.Deserialize<ShopService.ShopState>(Service<RoleStore>().LoadShop(session.Role!.Id)!)!;
         Assert.Equal(1, persisted.Bought[Offer].Count);

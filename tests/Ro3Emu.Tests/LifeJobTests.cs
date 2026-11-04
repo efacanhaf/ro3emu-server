@@ -5,6 +5,8 @@ using Romsg;
 using Ro3Emu.Bot;
 using Ro3Emu.Server;
 using Ro3Emu.Server.Accounts;
+using Ro3Emu.Server.Data;
+using Ro3Emu.Server.Data.Config;
 using Ro3Emu.Server.Game;
 
 namespace Ro3Emu.Tests;
@@ -48,7 +50,7 @@ public sealed class LifeJobTests : IAsyncLifetime
     }
     private async Task Gm(string account, string line)
     {
-        using var c = new HttpClient(); var r = await c.PostAsync($"{_http}/ro3emu/gm?account={account}", new StringContent(line)); r.EnsureSuccessStatusCode();
+        using var c = new HttpClient(); var r = await c.PostAsync($"{_http}/ro3emu/gm?account={account}", Operator.Command(line)); r.EnsureSuccessStatusCode();
     }
     private Task<T> OnLoop<T>(string account, Func<GameSession, T> fn) => _app.Services.GetRequiredService<GameLoop>().InvokeAsync(() =>
         Task.FromResult(fn(_app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Account == account))));
@@ -147,7 +149,7 @@ public sealed class LifeJobTests : IAsyncLifetime
             Assert.True(reply.OutputItemMap[1].Items.Where(i => i.ItemEntry is 1001101 or 1001201).Sum(i => i.Stack) >= 2);
             Assert.All(reply.OutputItemMap[1].Items, i => { Assert.NotEqual(112001, i.ItemEntry); Assert.True(i.ItemGuid > 0); });
             var state = await OnLoop("alice", s => (s.LifeJob!.Clone(), s.Restrictions!.Clone(), s.Items.Where(i => i.Entry == 1293022).Sum(i => i.Stack)));
-            Assert.Equal(2, state.Item1.LifeJobInfoMap[2].JobLevel); Assert.Equal(149, state.Item1.LifeJobInfoMap[2].JobExp);
+            Assert.Equal(1, state.Item1.LifeJobInfoMap[2].JobLevel); Assert.Equal(150, state.Item1.LifeJobInfoMap[2].JobExp);
             Assert.Equal(480, state.Item2.RestrictCount[1004].Count); Assert.Equal(8, state.Item3);
             await b.SendGameAsync(LifeJobService.StartForge, new StartForgeReq { ItemUniqueId = 20001, ItemNum = 1 });
             Assert.NotEqual(0, (await Next(b, LifeJobService.StartForge, StartForgeResp.Parser)).Result);
@@ -158,7 +160,7 @@ public sealed class LifeJobTests : IAsyncLifetime
         Assert.True(life.SyncAllMark); Assert.Equal(2, life.ActiveLifejob[2].All);
         var job = life.LifeJobInfoMap[2].All;
         Assert.True(job.BuildInfo.RecipeList[20001]); Assert.NotNull(job.TitleInfo); Assert.NotNull(job.GatherInfo);
-        Assert.Equal(149, job.JobExp);
+        Assert.Equal(150, job.JobExp);
         var persisted = DBRestrictInfo.Parser.ParseFrom(_app.Services.GetRequiredService<RoleStore>().LoadLifeRestrict(role)!);
         Assert.Equal(480, persisted.RestrictCount[1004].Count);
     }
@@ -233,13 +235,13 @@ public sealed class LifeJobTests : IAsyncLifetime
             await b.SendGameAsync(CharacterService.ItemUse, new ItemUseReq { ItemGuid = guid, ItemCount = 4 });
             Assert.Equal(0, (await Next(b, CharacterService.ItemUse, ItemUseResp.Parser)).Result);
             Assert.Equal(4500, await OnLoop("alice", s => s.Restrictions!.RestrictCount[1004].Count));
-            Assert.Equal(1, await OnLoop("alice", s => s.Restrictions!.RestrictCount[1005].Count));
+            Assert.Equal(5, await OnLoop("alice", s => s.Restrictions!.RestrictCount[1005].Count));
             Assert.Equal(2, await OnLoop("alice", s => s.Items.Single(i => i.Entry == 1291002).Stack));
         }
         await using var again = await InWorld("Alice", false);
         var energy = await Next(again, LifeJobService.RestrictSync, DBRestrictInfoIncrement.Parser);
         Assert.Equal(4500, energy.RestrictCount[1004].All.Count);
-        Assert.Equal(1, energy.RestrictCount[1005].All.Count);
+        Assert.Equal(5, energy.RestrictCount[1005].All.Count);
         Assert.Equal(0, await OnLoop("alice", s => LifeJobService.DailyEnergyUsed(s, 1004)));
         Assert.Equal(2, await OnLoop("alice", s => s.Items.Single(i => i.Entry == 1291002).Stack));
     }
@@ -282,6 +284,139 @@ public sealed class LifeJobTests : IAsyncLifetime
         Assert.Equal(1, await OnLoop("alice", s => s.LifeJob!.LifeJobInfoMap[1].JobLevel));
     }
 
+    /// <summary>
+    /// #bug-reports "Level 3 mining does not grant access to level 2 resources": the client's Unlock button only walks to
+    /// the gathering area, so Lv. 2 ore (100200, condition 43000000: Mining 3) unlocks with the level, at the next gather.
+    /// </summary>
+    [ClientDataFact]
+    public async Task LevelTwoOreUnlocksWithMiningLevelThree()
+    {
+        await using var b = await InWorld("Alice"); Assert.Equal(0, await Learn(b, "alice", 1, 1));
+        var life = _app.Services.GetRequiredService<LifeJobService>();
+        Assert.Equal(ErrorCodes.LifeRequirements, await OnLoop("alice", s => life.CheckGather(s, 100200))); // Mining 1
+        await _app.Services.GetRequiredService<GameLoop>().InvokeAsync(async () =>
+        {
+            var s = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Account == "alice");
+            using var gate = await CharacterService.Lock(s);
+            s.LifeJob!.LifeJobInfoMap[1].JobLevel = 3;
+            Assert.Equal(0, await life.CompleteGatherAsync(s, 100100, sceneEntry: 10522, pointId: 312));
+        });
+        Assert.Equal(0, await OnLoop("alice", s => life.CheckGather(s, 100200)));
+        Assert.Equal(ErrorCodes.LifeRequirements, await OnLoop("alice", s => life.CheckGather(s, 100300))); // Mining 5
+        var saved = DBLifeJobInfo.Parser.ParseFrom(_app.Services.GetRequiredService<RoleStore>().LoadLifeJob((long)b.Self!.Uuid)!);
+        Assert.True(saved.LifeJobInfoMap[1].GatherInfo.ItemDetails.ContainsKey(100200));
+    }
+
+    /// <summary>
+    /// #bug-reports "Any Life Skill level 2 and above didn't get any item reward except EXP". From Lv. 2 up every
+    /// LifeDropConfig row of a resource has a level condition and no cost, so the client shows no unlock button
+    /// (UI_Sys_Life_ProductItemWidgetCtrl m_kGetIsShowButton): the server unlocks them with the level.
+    /// </summary>
+    [ClientDataTheory]
+    [InlineData(100100, 1, 1)]
+    [InlineData(100200, 1, 3)]
+    [InlineData(100300, 1, 5)]
+    [InlineData(100400, 1, 7)]
+    [InlineData(300100, 5, 1)]
+    [InlineData(300200, 5, 3)]
+    [InlineData(300300, 5, 5)]
+    [InlineData(300400, 5, 7)]
+    public async Task EveryGatheringTierYieldsItsMainDropAtItsLevel(int collection, int job, int level)
+    {
+        await using var b = await InWorld("Alice"); Assert.Equal(0, await Learn(b, "alice", job, 1));
+        var life = _app.Services.GetRequiredService<LifeJobService>();
+        var data = _app.Services.GetRequiredService<GameData>();
+        var mainItems = new LifeCollectionConfig(data.Row("LifeCollectionConfig", collection)!.Value).DropId
+            .Select(id => new LifeDropConfig(data.Row("LifeDropConfig", id)!.Value)).Where(d => d.IsMain == 1)
+            .SelectMany(d => d.ItemId).ToHashSet();
+        await _app.Services.GetRequiredService<GameLoop>().InvokeAsync(async () =>
+        {
+            var s = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Account == "alice");
+            using var gate = await CharacterService.Lock(s);
+            s.LifeJob!.LifeJobInfoMap[job].JobLevel = level;
+            // The first gather of the first tier is what brings the level's unlocks in.
+            Assert.Equal(0, await life.CompleteGatherAsync(s, job == 1 ? 100100 : 300100));
+            long before = s.Items.Where(i => mainItems.Contains(i.Entry)).Sum(i => (long)i.Stack);
+            Assert.Equal(0, await life.CompleteGatherAsync(s, collection));
+            Assert.True(s.Items.Where(i => mainItems.Contains(i.Entry)).Sum(i => (long)i.Stack) > before,
+                $"Collection {collection} at level {level} paid no main drop");
+        });
+    }
+
+    /// <summary>
+    /// A level row holds what it takes to reach that level: the client asks row level + 1 for its bar
+    /// (LC_LifeJobHelper.GetLevelNextNeedEXP) and for the gate (CheckJobLevelUpCondition). Miner: Lv. 2 takes 5000 EXP and
+    /// base level 40, Lv. 3 takes 15000 and base level 50.
+    /// </summary>
+    [ClientDataFact]
+    public async Task LifeLevelRowsHoldWhatItTakesToReachThem()
+    {
+        await using var b = await InWorld("Alice");
+        await Gm("alice", "!lvl 39");
+        Assert.Equal(0, await Learn(b, "alice", 1, 1));
+        var life = _app.Services.GetRequiredService<LifeJobService>();
+        async Task<(long Level, long Exp)> Gather(long exp) => await _app.Services.GetRequiredService<GameLoop>().InvokeAsync(async () =>
+        {
+            var s = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Account == "alice");
+            using var gate = await CharacterService.Lock(s);
+            s.LifeJob!.LifeJobInfoMap[1].JobExp = exp;
+            Assert.Equal(0, await life.CompleteGatherAsync(s, 100100));
+            return (s.LifeJob.LifeJobInfoMap[1].JobLevel, s.LifeJob.LifeJobInfoMap[1].JobExp);
+        });
+
+        Assert.Equal((1L, 220L), await Gather(0));
+        Assert.Equal(1L, (await Gather(5000)).Level); // below base level 40
+        await Gm("alice", "!lvl 40");
+        Assert.Equal(2L, (await Gather(4000)).Level); // the raised base level let the kept EXP through
+        Assert.Equal(2L, (await Gather(14000)).Level);
+        await Gm("alice", "!lvl 50");
+        Assert.Equal((3L, 219L), await Gather(14999));
+    }
+
+    /// <summary>A character that earned the resource before the fix has it in ItemDetails and none of its drops.</summary>
+    [ClientDataFact]
+    public async Task EarlierCharacterGetsItsEarnedDropsAtLogin()
+    {
+        long role;
+        await using (var b = await InWorld("Alice"))
+        {
+            role = (long)b.Self!.Uuid; Assert.Equal(0, await Learn(b, "alice", 1, 1));
+            await OnLoop("alice", s =>
+            {
+                s.LifeJob!.LifeJobInfoMap[1].JobLevel = 3;
+                s.LifeJob.LifeJobInfoMap[1].GatherInfo.ItemDetails[100200] = 1;
+                var store = _app.Services.GetRequiredService<RoleStore>();
+                store.SaveLifeJob(role, s.LifeJob.ToByteArray(), s.Restrictions!.ToByteArray(),
+                    System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(s.LifeRuntime));
+                return 0;
+            });
+        }
+        await using var again = await InWorld("Alice", false);
+        var sync = await Next(again, LifeJobService.LifeSync, DBLifeJobInfoIncrement.Parser);
+        foreach (long drop in new long[] { 122, 123, 124, 121, 116 }) Assert.True(sync.LifeJobUnLockDrop.ContainsKey(drop), $"drop {drop}");
+        Assert.False(sync.LifeJobUnLockDrop.ContainsKey(132)); // Mining 5
+        var saved = DBLifeJobInfo.Parser.ParseFrom(_app.Services.GetRequiredService<RoleStore>().LoadLifeJob(role)!);
+        Assert.True(saved.LifeJobUnLockDrop.ContainsKey(122));
+    }
+
+    /// <summary>What a gathered drop and a crafted recipe pay comes from AwardConfig groups: none may resolve to nothing.</summary>
+    [ClientDataFact]
+    public async Task EveryLifeDropAndRecipeOutputResolvesToAnAward()
+    {
+        await using var b = await InWorld("Alice");
+        var data = _app.Services.GetRequiredService<GameData>();
+        var awards = _app.Services.GetRequiredService<AwardService>();
+        var seasons = _app.Services.GetRequiredService<SeasonService>();
+        var groups = data.Table("LifeDropConfig").Values.Select(r => new LifeDropConfig(r).MultiGroupIdId)
+            .Concat(data.Table("LifeFormulaConfig").Values.SelectMany(r => r.GetProperty("_iSuccessOutput").EnumerateArray()
+                .Select(o => o[2].GetInt64()))).Distinct().ToArray();
+        await OnLoop("alice", s =>
+        {
+            foreach (long group in groups) Assert.True(awards.Resolve(s, group, seasons.PlayBook).Grants.Count > 0, $"group {group}");
+            return 0;
+        });
+    }
+
     [ClientDataTheory]
     [InlineData(1001801)]
     [InlineData(1291002)]
@@ -315,7 +450,7 @@ public sealed class LifeJobTests : IAsyncLifetime
             else
             {
                 Assert.Equal(1500, await OnLoop("alice", s => s.Restrictions!.RestrictCount[1004].Count));
-                Assert.Equal(4, await OnLoop("alice", s => s.Restrictions!.RestrictCount[1005].Count));
+                Assert.Equal(5, await OnLoop("alice", s => s.Restrictions!.RestrictCount[1005].Count));
             }
             await b.SendGameAsync(CharacterService.ShortcutBarUse, new ShortcutBarUseReq { SlotIndex = 0 });
             Assert.Equal(ErrorCodes.ItemMissing, (await Next(b, CharacterService.ShortcutBarUse, ShortcutBarUseRes.Parser)).Result);
@@ -331,6 +466,94 @@ public sealed class LifeJobTests : IAsyncLifetime
         else Assert.Equal(1500, await OnLoop("alice", s => s.Restrictions!.RestrictCount[1004].Count));
     }
 
+    [ClientDataFact]
+    public async Task VigorCurrencyCountsUpToTheLimitAndTheRestWaits()
+    {
+        await using var b = await InWorld("Alice");
+        await Gm("alice", "!lvl 34");
+        Assert.Equal(0, await Learn(b, "alice", 1, 1));
+        await Gm("alice", $"!item {LifeJobService.VigorCurrencyId} 6000");
+        var life = _app.Services.GetRequiredService<LifeJobService>();
+        await _app.Services.GetRequiredService<GameLoop>().InvokeAsync(async () =>
+        {
+            var s = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Account == "alice");
+            using var gate = await CharacterService.Lock(s);
+            s.Restrictions!.RestrictCount[LifeJobService.VigorId].Count = 0;
+            await life.SyncRestrictionsAsync(s);
+            Assert.Equal(5000, ((DBRestrictInfo)s.Synced[LifeJobService.RestrictSync]).RestrictCount[LifeJobService.VigorId].Count);
+            Assert.Equal(0, await life.CompleteGatherAsync(s, 100100, sceneEntry: 10522, pointId: 312));
+        });
+
+        var spent = await OnLoop("alice", s => (
+            Currency: s.Progress!.Currency.GetValueOrDefault(LifeJobService.VigorCurrencyId),
+            Vigor: s.Restrictions!.RestrictCount[LifeJobService.VigorId].Count,
+            Shown: ((DBRestrictInfo)s.Synced[LifeJobService.RestrictSync]).RestrictCount[LifeJobService.VigorId].Count));
+        Assert.Equal(5980, spent.Currency);
+        Assert.Equal(0, spent.Vigor);
+        Assert.Equal(5000, spent.Shown);
+    }
+
+    // The tooltip counts the potion's _kUseTimes [week, 10]; five uses used to end at restriction 1005, which the client never reads.
+    [ClientDataFact]
+    public async Task VivifyPotionStopsAtTheWeeklyUsesItsTooltipCounts()
+    {
+        await using var b = await InWorld("Alice");
+        await Gm("alice", "!lvl 34");
+        await Gm("alice", "!item 1291002 11");
+        long guid = await OnLoop("alice", s => s.Items.Single(i => i.Entry == 1291002).Guid);
+        var loop = _app.Services.GetRequiredService<GameLoop>();
+        var session = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Account == "alice");
+        for (int use = 1; use <= 11; use++)
+        {
+            await loop.InvokeAsync(() => { session.Restrictions!.RestrictCount[LifeJobService.VigorId].Count = 0; return Task.CompletedTask; });
+            await b.SendGameAsync(CharacterService.ItemUse, new ItemUseReq { ItemGuid = guid, ItemCount = 1 });
+            Assert.Equal(use <= 10 ? 0 : CharacterService.ErrUseTimes, (await Next(b, CharacterService.ItemUse, ItemUseResp.Parser)).Result);
+        }
+        Assert.Equal(1, await OnLoop("alice", s => s.Items.Single(i => i.Entry == 1291002).Stack));
+    }
+
+    [ClientDataFact]
+    public async Task GatheringShowsTheItemsItGave()
+    {
+        await using var b = await InWorld("Alice");
+        await Gm("alice", "!lvl 34");
+        Assert.Equal(0, await Learn(b, "alice", 1, 1));
+        var life = _app.Services.GetRequiredService<LifeJobService>();
+        await _app.Services.GetRequiredService<GameLoop>().InvokeAsync(async () =>
+        {
+            var s = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Account == "alice");
+            using var gate = await CharacterService.Lock(s);
+            Assert.Equal(0, await life.CompleteGatherAsync(s, 100100, sceneEntry: 10522, pointId: 312));
+        });
+        Assert.NotEmpty((await Next(b, CharacterService.GetRewardNotify, GetRewardNotify.Parser)).Rewards);
+    }
+
+    [ClientDataFact]
+    public async Task VigorCurrencyFromRewardsCanBeSpentGathering()
+    {
+        await using var b = await InWorld("Alice");
+        await Gm("alice", "!lvl 34");
+        Assert.Equal(0, await Learn(b, "alice", 1, 1));
+        await Gm("alice", $"!item {LifeJobService.VigorCurrencyId} 20");
+        var life = _app.Services.GetRequiredService<LifeJobService>();
+        await _app.Services.GetRequiredService<GameLoop>().InvokeAsync(async () =>
+        {
+            var s = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Account == "alice");
+            using var gate = await CharacterService.Lock(s);
+            s.Restrictions!.RestrictCount[LifeJobService.VigorId].Count = 0;
+            Assert.Equal(0, await life.CompleteGatherAsync(s, 100100, sceneEntry: 10522, pointId: 312));
+        });
+
+        var spent = await OnLoop("alice", s => (
+            Currency: s.Progress!.Currency.GetValueOrDefault(LifeJobService.VigorCurrencyId),
+            Vigor: s.Restrictions!.RestrictCount[LifeJobService.VigorId].Count,
+            Used: s.Restrictions.RestrictCount[LifeJobService.VigorId].HistoryUseCount,
+            Daily: LifeJobService.DailyEnergyUsed(s, LifeJobService.VigorId)));
+        Assert.Equal(0, spent.Currency);
+        Assert.Equal(0, spent.Vigor);
+        Assert.Equal(20, spent.Used);
+        Assert.Equal(20, spent.Daily);
+    }
     [ClientDataTheory]
     [InlineData(1001801)]
     [InlineData(1291002)]

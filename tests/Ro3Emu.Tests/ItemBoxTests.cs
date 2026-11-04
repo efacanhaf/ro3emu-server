@@ -64,7 +64,7 @@ public sealed class ItemBoxTests : IAsyncLifetime
     private async Task Gm(BotClient bot, string command)
     {
         using var client = new HttpClient();
-        (await client.PostAsync($"{_http}/ro3emu/gm?account={bot.Account}", new StringContent(command))).EnsureSuccessStatusCode();
+        (await client.PostAsync($"{_http}/ro3emu/gm?account={bot.Account}", Operator.Command(command))).EnsureSuccessStatusCode();
     }
 
     private static async Task<T> Next<T>(BotClient bot, uint id, MessageParser<T> parser, Func<T, bool>? match = null) where T : IMessage<T>
@@ -115,9 +115,9 @@ public sealed class ItemBoxTests : IAsyncLifetime
         Assert.Equal(0, used.Result);
         Assert.Equal((1300008, 1, 0), (used.ItemId, used.ItemCount, used.ItemTimes));
         var shown = await Next(bot, CharacterService.GetRewardNotify, GetRewardNotify.Parser, m => !m.RewardType.Contains(1));
-        Assert.Equal(new[] { 2 }, shown.RewardType.ToArray());
-        Assert.Equal(new[] { (1, 500), (1200500, 100), (1430400, 1) },
-            shown.Rewards.Select(r => (r.ItemEntry, r.Stack)).Order().ToArray());
+        Assert.Equal([2], [.. shown.RewardType]);
+        Assert.Equal([(1, 500), (1200500, 100), (1430400, 1)],
+            [.. shown.Rewards.Select(r => (r.ItemEntry, r.Stack)).Order()]);
         Assert.Equal(2, Count(bot, 1300008));
         Assert.Equal(1, Count(bot, 1430400));
         Assert.Equal(100, Count(bot, 1200500));
@@ -169,7 +169,7 @@ public sealed class ItemBoxTests : IAsyncLifetime
         Assert.Equal(1, Count(bot, 2030120));
         Assert.Equal(0, Count(bot, 2020120));
         var shown = await Next(bot, CharacterService.GetRewardNotify, GetRewardNotify.Parser, m => !m.RewardType.Contains(1));
-        Assert.Equal(new[] { 2 }, shown.RewardType.ToArray());
+        Assert.Equal([2], [.. shown.RewardType]);
         Assert.Equal(3, shown.Rewards.Count); // each weapon instance with its own roll
     }
 
@@ -184,7 +184,7 @@ public sealed class ItemBoxTests : IAsyncLifetime
         long potions = Count(bot, 1000000);
         Assert.Equal(0, (await Use(bot, 1300018, 1, new ItemUseParamInfo { IsFirstHeartBox = true })).Result);
         var shown = await Next(bot, CharacterService.GetRewardNotify, GetRewardNotify.Parser, m => !m.RewardType.Contains(1));
-        Assert.Equal(new[] { 5 }, shown.RewardType.ToArray());
+        Assert.Equal([5], [.. shown.RewardType]);
         Assert.Equal(0, Count(bot, 1300018));
         Assert.Equal(1, Count(bot, 1300019)); // the next chest
         Assert.Equal(potions + 5, Count(bot, 1000000));
@@ -193,35 +193,35 @@ public sealed class ItemBoxTests : IAsyncLifetime
     [ClientDataFact]
     public async Task ADailyUseLimitResetsAtFiveInTheRealmZoneAndSurvivesRelog()
     {
-        // 1300000 _kUseTimes [1,10]: ten a day (enum_ItemUseLimit.Day); level 10, sex 1, jobs [1000,5100,5200,5300].
+        // 1300089 _kUseTimes [1,10]: ten a day (enum_ItemUseLimit.Day), with no end of its own.
         await using (var bot = await Enter("Daily"))
         {
             await Gm(bot, "!lvl 10");
-            await Gm(bot, "!item 1300000 12");
+            await Gm(bot, "!item 1300089 12");
             for (int n = 1; n <= 10; n++)
             {
-                var used = await Use(bot, 1300000);
+                var used = await Use(bot, 1300089);
                 Assert.Equal(0, used.Result);
                 Assert.Equal(n, used.ItemTimes);
             }
-            await UseTimesSync(bot, 1300000, 10);
-            Assert.Equal(CharacterService.ErrUseTimes, (await Use(bot, 1300000)).Result);
-            Assert.Equal(2, Count(bot, 1300000));
-            Assert.Equal(10, SavedBag(bot).UseTimes[1300000]);
+            await UseTimesSync(bot, 1300089, 10);
+            Assert.Equal(CharacterService.ErrUseTimes, (await Use(bot, 1300089)).Result);
+            Assert.Equal(2, Count(bot, 1300089));
+            Assert.Equal(10, SavedBag(bot).UseTimes[1300089]);
         }
 
         await using var again = await Enter("Daily", create: false);
-        await UseTimesSync(again, 1300000, 10);
-        Assert.Equal(CharacterService.ErrUseTimes, (await Use(again, 1300000)).Result);
+        await UseTimesSync(again, 1300089, 10);
+        Assert.Equal(CharacterService.ErrUseTimes, (await Use(again, 1300089)).Result);
         _clock.Now = _clock.Now.AddHours(5).AddMinutes(29); // Wednesday 04:59: still Tuesday's game day
-        Assert.Equal(CharacterService.ErrUseTimes, (await Use(again, 1300000)).Result);
+        Assert.Equal(CharacterService.ErrUseTimes, (await Use(again, 1300089)).Result);
 
         _clock.Now = _clock.Now.AddMinutes(2); // 05:01: the online role is told the count is gone
-        await UseTimesSync(again, 1300000, null);
-        var fresh = await Use(again, 1300000);
+        await UseTimesSync(again, 1300089, null);
+        var fresh = await Use(again, 1300089);
         Assert.Equal(0, fresh.Result);
         Assert.Equal(1, fresh.ItemTimes);
-        await UseTimesSync(again, 1300000, 1);
+        await UseTimesSync(again, 1300089, 1);
     }
 
     [ClientDataFact]
@@ -259,24 +259,16 @@ public sealed class ItemBoxTests : IAsyncLifetime
         await Gm(other, "!item 1300000 1"); // _iSexNeed 1
         Assert.Equal(CharacterService.ErrSexNeed, (await Use(other, 1300000)).Result);
 
-        // Fly Wing 1002001 _kUseLimit [1001]: ItemUseLimitConfig 1001 _iLimitType 1, maps [10110,10111]. Not enforced: no client
-        // code reads it, so the direction (forbidden or only allowed) is unknown; the wing works on the starting maps.
-        await Gm(bot, "!item 1002001 1");
-        using (var sw = bot.Inbox.Expect(e => e.IsGame(MsgId.SwitchSceneLine)))
-        {
-            await Gm(bot, "!warp 10110");
-            await sw.WaitAsync(Wait);
-        }
-        using (var self = bot.Inbox.Expect(e => e.IsGame(MsgId.EntitySelf)))
-        {
-            await bot.SendGameAsync(MsgId.SceneLoaded, new SceneLoadedReq { SceneId = 10110 });
-            await self.WaitAsync(Wait);
-        }
-        Assert.Equal(10110, await Service<GameLoop>().InvokeAsync(() => Task.FromResult(
-            Service<SessionRegistry>().All().Single(s => s.Account == bot.Account && s.Role != null).SceneEntry)));
+        // Fly Wing 1002001 _kUseLimit [1001] names maps [10110,10111], which is not enforced (ItemMapLimit): it works on
+        // the starting map 10111 (SpawnSceneEntry).
+        await Gm(bot, "!item 1002001 2");
+        Assert.Equal(RoleStore.SpawnSceneEntry, await SceneOf(bot));
         Assert.Equal(0, (await Use(bot, 1002001)).Result);
-        Assert.Equal(0, Count(bot, 1002001));
+        Assert.Equal(1, Count(bot, 1002001));
     }
+
+    private Task<long> SceneOf(BotClient bot) => Service<GameLoop>().InvokeAsync(() => Task.FromResult(
+        Service<SessionRegistry>().All().Single(s => s.Account == bot.Account && s.Role != null).SceneEntry));
 
     private static string RepoRoot()
     {

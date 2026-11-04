@@ -62,10 +62,21 @@ public sealed class DungeonMatchTests : IAsyncLifetime
         return parser.ParseFrom(e.Body);
     }
 
+    /// <summary>State the reply does not vouch for: a timed battle's start answers before its entrant joins the queue.</summary>
+    private async Task Until(Func<bool> state, string what)
+    {
+        var deadline = DateTime.UtcNow + Wait;
+        while (!await Service<GameLoop>().InvokeAsync(() => Task.FromResult(state())))
+        {
+            Assert.True(DateTime.UtcNow < deadline, "Timed out waiting for " + what);
+            await Task.Delay(10);
+        }
+    }
+
     private async Task Gm(BotClient bot, string command)
     {
         using var client = new HttpClient();
-        (await client.PostAsync($"{_http}/ro3emu/gm?account={bot.Account}", new StringContent(command))).EnsureSuccessStatusCode();
+        (await client.PostAsync($"{_http}/ro3emu/gm?account={bot.Account}", Operator.Command(command))).EnsureSuccessStatusCode();
     }
 
     private GameSession Session(BotClient bot) => Service<SessionRegistry>().All()
@@ -124,8 +135,8 @@ public sealed class DungeonMatchTests : IAsyncLifetime
     [Fact]
     public void PartyPackingCanSkipAnEarlyIncompatibleGroup()
     {
-        Assert.Equal(new[] { 1, 2 }, DungeonMatchService.PickGroupIndices([4, 3, 2], 5));
-        Assert.Equal(new[] { 0, 1 }, DungeonMatchService.PickGroupIndices([2, 3, 1], 5));
+        Assert.Equal([1, 2], DungeonMatchService.PickGroupIndices([4, 3, 2], 5));
+        Assert.Equal([0, 1], DungeonMatchService.PickGroupIndices([2, 3, 1], 5));
     }
 
     [ClientDataFact]
@@ -258,7 +269,7 @@ public sealed class DungeonMatchTests : IAsyncLifetime
             r => r.MatchEntryId == 2);
         Assert.Equal(0, firstTimed.Result);
         Assert.Equal(_clock.GetUtcNow().ToUnixTimeSeconds(), firstTimed.MatchStartTime);
-        Assert.True(Service<TimedBattleService>().IsMatching(Session(alice)));
+        await Until(() => Service<TimedBattleService>().IsMatching(Session(alice)), "the timed queue");
         await Start(alice, expected: ErrorCodes.DungeonBusy);
         await alice.SendGameAsync(TimedBattleService.CancelMatch, new CancelMatchReq
         { MatchEntryId = 2, NextMatchEntry = Entry, NextMatchData = Request().MatchData });
@@ -278,7 +289,7 @@ public sealed class DungeonMatchTests : IAsyncLifetime
         Assert.Equal(0, switchedTimed.Result);
         Assert.Equal(_clock.GetUtcNow().ToUnixTimeSeconds(), switchedTimed.MatchStartTime);
         Assert.False(Service<DungeonMatchService>().Owns(Session(alice)));
-        Assert.True(Service<TimedBattleService>().IsMatching(Session(alice)));
+        await Until(() => Service<TimedBattleService>().IsMatching(Session(alice)), "the timed queue after the switch");
         await alice.SendGameAsync(TimedBattleService.CancelMatch, new CancelMatchReq { MatchEntryId = 2 });
         Assert.Equal(0, (await Next(alice, TimedBattleService.CancelMatch, CancelMatchResp.Parser, r => r.MatchEntryId == 2)).Result);
 

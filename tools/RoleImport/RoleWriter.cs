@@ -11,6 +11,8 @@ using RoleImport;
 /// it only fills the rows the server would have written after the same play. Every write is one SQLite
 /// transaction, so a failed import leaves the previous character untouched.
 /// </summary>
+namespace RoleImport;
+
 public static class RoleWriter
 {
     public sealed record Result(long RoleId, bool Created, int Items, IReadOnlyList<string> Parts);
@@ -45,7 +47,7 @@ public static class RoleWriter
         foreach (var (column, bytes) in plan.Blobs) WriteBlob(connection, transaction, role, column, bytes);
         foreach (string column in plan.ClearedBlobs) WriteBlob(connection, transaction, role, column, null);
         ReplaceItems(connection, transaction, role, plan.Items);
-        var parts = plan.Blobs.Keys.Concat(new[] { "progress", "inventory" }).ToArray();
+        string[] parts = [.. plan.Blobs.Keys, "progress", "inventory"];
         foreach (string part in parts) BumpRevision(connection, transaction, role, part);
 
         if (dryRun) { transaction.Rollback(); return new Result(role, created, plan.Items.Count, parts); }

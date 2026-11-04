@@ -19,6 +19,8 @@ public sealed partial class CombatService
         DealtAsync.Add((_, target, _, damage) => damage > 0 ? _buffs.ConsumeGuardianGroupAsync(target, GuardianGroup.CatVulnerability) : Task.CompletedTask);
         TakenAsync.Add((_, target, amount) => GuardianTakenAsync(target, amount));
         DamageAdjusters.Add((s, _, row, _, damage) => GuardianOutgoingDamage(s, row, damage));
+        CastResolved.Add(AutoCounterOnCastAsync);
+        CastResolved.Add(SupportSkillOnCastAsync);
         DamageAdjusters.Add((s, target, _, _, damage) => GuardianControlledDamage(s, GuardianControlTarget(target), damage));
         _buffs.UnitChanged.Add(PublishMonsterAttributesAsync);
         _monsters.Forbidden = _buffs.UnitForbidden;
@@ -43,7 +45,7 @@ public sealed partial class CombatService
     private int GuardianError(GameSession s, GuardianPetRules.Skill skill, CastSkillReq req)
     {
         if (s.Role == null || s.Progress == null || s.Dead || s.SceneLoading || s.SceneRecoveryRequired
-            || !_sessions.All().Contains(s) || s.Attachment?.Cancelled == true) return ErrorCodes.SkillBadState;
+            || !_sessions.Contains(s) || s.Attachment?.Cancelled == true) return ErrorCodes.SkillBadState;
         if (!_pets.GuardianEquipped(s, skill)) return ErrorCodes.SkillNotLearned;
         if (req.OpUnitId != 0 && req.OpUnitId != s.Role.Id) return ErrorCodes.SkillRequirements;
         if (!float.IsFinite(req.Face) || req.TargetPos is { } pos && !Finite(pos)) return ErrorCodes.Parameter;
@@ -288,7 +290,7 @@ public sealed partial class CombatService
         if (!current() || source.Role == null || recipient.Role == null) return;
         foreach (var modifier in ExtraHeal) amount = modifier(source, amount);
         var stats = _character.Stats(recipient);
-        amount = ModifiedHealing(_buffs.GuardianAttributes(source), _buffs.GuardianAttributes(recipient), amount);
+        amount = ModifiedHealing(HealerAttributes(source), stats, amount);
         long actual = Math.Min(Math.Max(0, amount), Math.Max(0, stats[AttributeId.MaxHp] - stats[AttributeId.Hp]));
         long owner = source.Role!.Id, target = recipient.Role!.Id;
         await _character.SetHpSpAsync(recipient, stats[AttributeId.Hp] + actual, null);

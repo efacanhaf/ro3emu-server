@@ -27,8 +27,8 @@ public sealed partial class BuffService
         public bool Busy { get; set; }
     }
 
-    private readonly List<PeriodicEffect> _periodic = new();
-    private readonly Dictionary<long, PeriodicEffect> _periodicByGuid = new();
+    private readonly List<PeriodicEffect> _periodic = [];
+    private readonly Dictionary<long, PeriodicEffect> _periodicByGuid = [];
 
     /// <summary>CombatService: who applied a buff (a player by role id, a monster by uid) in that world scene.</summary>
     internal Func<long, long, PeriodicSource?>? ResolvePeriodicSource { get; set; }
@@ -54,7 +54,8 @@ public sealed partial class BuffService
         var effect = new PeriodicEffect
         {
             Rule = rule, Player = player, Unit = unit, TargetId = player?.Role?.Id ?? unit!.Uid, Guid = buff.Guid, Source = source,
-            NextMs = MonsterService.NowMs + Math.Min(rule.IntervalMs, Math.Max(0, buff.DurationMs)),
+            // From the buff's own start, the time its end was counted from: a later clock read could put the last tick past its end.
+            NextMs = buff.ExpireMs - buff.DurationMs + Math.Min(rule.IntervalMs, Math.Max(0, buff.DurationMs)),
         };
         _periodic.Add(effect);
         _periodicByGuid[buff.Guid] = effect;

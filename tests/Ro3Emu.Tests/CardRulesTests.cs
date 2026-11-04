@@ -11,9 +11,9 @@ using Ro3Emu.Server.Maps;
 namespace Ro3Emu.Tests;
 
 /// <summary>Card collection star/Flash state, socket insert rules, card special effects and craft quality pity.</summary>
-public sealed class CardRulesTests : IAsyncLifetime
+public sealed partial class CardRulesTests : IAsyncLifetime
 {
-    private const int Lunatic = 1420100, Dagger = 2010121;
+    private const int Lunatic = 1420100, Dagger = 2010121, TwoHander = 2030120, OffHand = 2500120, Armor = 2550120, Ring = 2700120;
     private static readonly TimeSpan Wait = TimeSpan.FromSeconds(5);
     private readonly string _dataDir = Path.Combine(Path.GetTempPath(), "ro3emu-card-rules-" + Guid.NewGuid().ToString("N"));
     private WebApplication _app = null!;
@@ -66,7 +66,7 @@ public sealed class CardRulesTests : IAsyncLifetime
     private async Task Gm(string account, string command)
     {
         using var http = new HttpClient();
-        (await http.PostAsync($"{_httpUrl}/ro3emu/gm?account={account}", new StringContent(command))).EnsureSuccessStatusCode();
+        (await http.PostAsync($"{_httpUrl}/ro3emu/gm?account={account}", Operator.Command(command))).EnsureSuccessStatusCode();
     }
 
     private Task<T> OnLoop<T>(Func<T> action) => Service<GameLoop>().InvokeAsync(() => Task.FromResult(action()));
@@ -93,6 +93,95 @@ public sealed class CardRulesTests : IAsyncLifetime
         long dagger = session.Items.Single(i => i.Entry == Dagger).Guid;
         await bot.SendGameAsync(CharacterService.EquipItemOpr, new EquipItemOprReq { Opr = 0, Pos = (EquipGridType)1, ItemGUID = dagger });
         Assert.Equal(0, (await Next(bot, CharacterService.EquipItemOpr, EquipItemOprResp.Parser)).Result);
+    }
+
+    private async Task WearRing(BotClient bot, GameSession session)
+    {
+        await Gm("alice", $"!item {Ring} 1");
+        await bot.SendGameAsync(CharacterService.EquipItemOpr, new EquipItemOprReq { Opr = 0, Pos = (EquipGridType)6, ItemGUID = session.Items.Single(i => i.Entry == Ring).Guid });
+        Assert.Equal(0, (await Next(bot, CharacterService.EquipItemOpr, EquipItemOprResp.Parser)).Result);
+    }
+
+    private Task<KeyValuePair<int, long>[]> Sheet(GameSession session) =>
+        OnLoop(() => Service<CharacterService>().Stats(session).Data.OrderBy(p => p.Key).ToArray());
+
+    // UI_Sys_CardSelect_CellWidgetCtrl._getSlotState: IsSlotValid false is enum_CardStatus.NotEffect, "Cards are inactive
+    // when no gear is equipped". A card stays socketed, durably, so only the gear's return brings its stats back.
+    [ClientDataFact]
+    public async Task CardsStopCountingWhileTheirGearIsOffAndStaySocketedAcrossARelog()
+    {
+        const int passive = 1420101; // [[2, 2000001], [2, 2000101]]
+        KeyValuePair<int, long>[] clean, withCards;
+        await using (var alice = await InWorld("Alice"))
+        {
+            var session = Session("Alice");
+            await Gm("alice", "!lvl 80");
+            await Gm("alice", $"!item {Lunatic} 1");
+            await Gm("alice", $"!item {passive} 1");
+            clean = await Sheet(session);
+            await WearDagger(alice, session);
+            var gearOnly = await Sheet(session);
+            Assert.Equal(0, await Insert(alice, 1, 1, session.Items.Single(i => i.Entry == Lunatic).Guid));
+            Assert.Equal(0, await Insert(alice, 1, 2, session.Items.Single(i => i.Entry == passive).Guid));
+            await Eventually(() => session.Buffs.Any(b => b.IsPassive && !b.IsTotemOwned), "the card's passive");
+            withCards = await Sheet(session);
+            Assert.NotEqual(gearOnly, withCards);
+
+            long dagger = session.Items.Single(i => i.Entry == Dagger).Guid;
+            await alice.SendGameAsync(CharacterService.EquipItemOpr, new EquipItemOprReq { Opr = (EquipItemOprType)1, ItemGUID = dagger });
+            Assert.Equal(0, (await Next(alice, CharacterService.EquipItemOpr, EquipItemOprResp.Parser)).Result);
+            await Eventually(() => !session.Buffs.Any(b => b.IsPassive && !b.IsTotemOwned), "the passive leaves with the gear");
+            Assert.Equal(clean, await Sheet(session));
+            Assert.Equal(2, session.Items.Count(i => i.Grid < 0));
+        }
+        await using var again = await InWorld("Alice", create: false);
+        var back = Session("Alice");
+        Assert.Equal(2, back.Items.Count(i => i.Grid < 0));
+        Assert.Equal(clean, await Sheet(back));
+        await WearDagger(again, back);
+        await Eventually(() => back.Buffs.Any(b => b.IsPassive && !b.IsTotemOwned), "the passive returns with the gear");
+        Assert.Equal(withCards, await Sheet(back));
+    }
+
+    // LC_CardViewHelper.IsActive per enum_WeaponStatusType and enum_GridType.Fashion.
+    [ClientDataFact]
+    public async Task ActiveCardsFollowTheClientsSocketRules()
+    {
+        await using var alice = await InWorld("Alice");
+        var session = Session("Alice");
+        var data = Service<GameData>();
+        var bag = session.Items;
+        int job = session.Progress!.Career;
+        long guid = 880100;
+        InvItem Card(int grid, int socket) => new() { Guid = ++guid, Entry = Lunatic, Stack = 1, Pack = 3, Grid = CharacterService.CardGrid(grid, socket) };
+        InvItem Worn(int entry, int grid) => new() { Guid = ++guid, Entry = entry, Stack = 1, Pack = 2, Grid = grid };
+        (int, int)[] Active(int career, int grid, params InvItem[] worn)
+        {
+            session.Progress!.Career = career;
+            session.Items = [.. worn, .. Enumerable.Range(1, 4).Select(socket => Card(grid, socket))];
+            return [.. EquipmentStunts.ActiveCards(session, data).Select(CharacterService.CardSocket)];
+        }
+        (int, int)[] Sockets(int grid, params int[] sockets) => [.. sockets.Select(socket => (grid, socket))];
+        await OnLoop(() =>
+        {
+            Assert.Empty(Active(1000, 3));
+            Assert.Equal(Sockets(3, 1, 2, 3, 4), Active(1000, 3, Worn(Armor, 3)));
+            Assert.Equal(Sockets(8, 1, 2, 3, 4), Active(1000, 8)); // costume grids need nothing worn
+            Assert.Empty(Active(1000, 1));
+            Assert.Equal(Sockets(1, 1, 2, 3), Active(1000, 1, Worn(Dagger, 1))); // OnlySingleHand
+            Assert.Equal(Sockets(1, 1, 2, 3), Active(1100, 1, Worn(Dagger, 1))); // SingleHandAndTwoHand
+            Assert.Equal(Sockets(1, 1, 2, 3, 4), Active(1100, 1, Worn(TwoHander, 1)));
+            Assert.Equal(Sockets(2, 1), Active(1100, 2, Worn(OffHand, 2)));
+            Assert.Equal(Sockets(1, 1, 2, 3, 4), Active(3100, 1, Worn(TwoHander, 1))); // OnlyTwoHand
+            Assert.Empty(Active(3100, 2, Worn(TwoHander, 1)));
+            Assert.Equal(Sockets(1, 1, 2), Active(5400, 1, Worn(Dagger, 1))); // TwoHandAndDoubleHand
+            Assert.Equal(Sockets(1, 1, 2, 3, 4), Active(5400, 1, Worn(Dagger, 1), Worn(Dagger, 2)));
+            Assert.Equal(Sockets(1, 3, 4), Active(5400, 1, Worn(Dagger, 2)));
+            Assert.Empty(Active(5400, 2, Worn(Dagger, 1), Worn(Dagger, 2)));
+            session.Items = bag;
+            session.Progress.Career = job;
+            return 0;
+        });
     }
 
     [ClientDataFact]
@@ -127,7 +216,7 @@ public sealed class CardRulesTests : IAsyncLifetime
             await Service<GameLoop>().InvokeAsync(() =>
             {
                 var card = session.Items.Single(i => i.Entry == flashable);
-                card.Attrs ??= new();
+                card.Attrs ??= [];
                 card.Attrs[530] = 1;
                 Service<ItemStore>().Update(card);
                 return Task.CompletedTask;
@@ -181,6 +270,31 @@ public sealed class CardRulesTests : IAsyncLifetime
     }
 
     [ClientDataFact]
+    public async Task CostumeSocketsOpenAtTheirConditionAndTakeTheirCardParts()
+    {
+        // EquipGridConfig _iID 8/9/10 (Head/Face/Mouth, category 3) open socket 1 by 4000007/8/9 = base level 20;
+        // card parts 7/8/9 (HeadAccessory/FaceAccessory/MouthAccessory) go there.
+        const int head = 1420700, face = 1430800, mouth = 1430900; // Card: Willow, Sketch Card: Orc Hero / Moonlight Flower
+        await using var alice = await InWorld("Alice");
+        var session = Session("Alice");
+        await Gm("alice", $"!item {head} 1");
+        await Gm("alice", $"!item {face} 1");
+        await Gm("alice", $"!item {mouth} 1");
+        long Guid(int entry) => session.Items.Single(i => i.Entry == entry && i.Grid == 0).Guid;
+
+        Assert.Equal(ErrorCodes.SlotSealed, await Insert(alice, 8, 1, Guid(head)));
+        await Gm("alice", "!lvl 20");
+        Assert.Equal(ErrorCodes.EquipSlot, await Insert(alice, 9, 1, Guid(head))); // a head card does not fit the face grid
+        Assert.Equal(ErrorCodes.SlotSealed, await Insert(alice, 8, 2, Guid(head))); // _kSocketOpen2 0: never
+        Assert.Equal(0, await Insert(alice, 8, 1, Guid(head)));
+        Assert.Equal(0, await Insert(alice, 9, 1, Guid(face)));
+        Assert.Equal(0, await Insert(alice, 10, 1, Guid(mouth)));
+        Assert.Equal(head, session.Items.Single(i => i.Grid == CharacterService.CardGrid(8, 1)).Entry);
+        Assert.Equal(face, session.Items.Single(i => i.Grid == CharacterService.CardGrid(9, 1)).Entry);
+        Assert.Equal(mouth, session.Items.Single(i => i.Grid == CharacterService.CardGrid(10, 1)).Entry);
+    }
+
+    [ClientDataFact]
     public async Task SocketedCardAppliesFlashAttributesAndItsAttributeConversion()
     {
         const int card = 1450101; // _kSkillAttribute 11000062 [8, 109, 1, 1304, 1, 650]; Flash 11001201
@@ -188,6 +302,7 @@ public sealed class CardRulesTests : IAsyncLifetime
         var session = Session("Alice");
         var data = Service<GameData>();
         var character = Service<CharacterService>();
+        await WearDagger(alice, session);
         var copy = new InvItem
         {
             Guid = 880001, Entry = card, Stack = 1, Pack = 3, Grid = CharacterService.CardGrid(1, 1),
@@ -222,6 +337,7 @@ public sealed class CardRulesTests : IAsyncLifetime
         var session = Session("Alice");
         await Gm("alice", "!lvl 80");
         await Gm("alice", $"!item {card} 1");
+        await WearRing(alice, session);
         Assert.Equal(0, await Insert(alice, 6, 1, session.Items.Single(i => i.Entry == card).Guid));
         await Eventually(() => session.Progress!.GrantedSkills.GetValueOrDefault(20040) == 1, "granted");
         await Next(alice, SkillService.SkillDataSync, DBSkillDataIncrement.Parser,
@@ -248,6 +364,7 @@ public sealed class CardRulesTests : IAsyncLifetime
         var session = Session("Alice");
         await Gm("alice", "!lvl 80");
         await Gm("alice", $"!item {card} 1");
+        await WearRing(alice, session);
         Assert.Equal(0, await Insert(alice, 6, 1, session.Items.Single(i => i.Entry == card).Guid));
         long socketed = session.Items.Single(i => i.Entry == card).Guid;
         await Eventually(() => session.Buffs.Any(b => b.IsPassive && !b.IsTotemOwned && b.SourceId == socketed && b.ConfigId == 2052001), "registered");
@@ -271,6 +388,7 @@ public sealed class CardRulesTests : IAsyncLifetime
         var data = Service<GameData>();
         var effects = Service<CardEffects>();
         var buffs = Service<BuffService>();
+        await WearDagger(alice, session);
         int npc = (int)data.Table("NPCConfig").Values.Where(r => GameData.Int(r, "_iNPCType") == 1 && GameData.Int(r, "_iSize") == 2)
             .Select(r => GameData.Int(r, "_iID")).First(id => Service<MonsterService>().Template((int)id) != null);
         var template = Service<MonsterService>().Template(npc)!;
@@ -309,6 +427,225 @@ public sealed class CardRulesTests : IAsyncLifetime
             Assert.DoesNotContain(session.Buffs, b => b.IsPassive && !b.IsTotemOwned);
         }
         finally { effects.Roll = bound => Random.Shared.Next(bound); }
+    }
+
+    // Issue #376. A normal attack never misses here: the players' swings roll against FLEE.
+    private sealed class SureHits : CombatRolls
+    {
+        public override double Hit() => 0;
+    }
+
+    private const int BaphometCard = 1460104, ShadowBaphometCard = 1450104;
+    private const float SplashEdge = 4; // from the primary: past the 3 m Splash, within the 5 m one
+
+    /// <summary>Monsters only of this test's, out of battle: a primary 1 m from Alice, 6 close to it and one at
+    /// <see cref="SplashEdge"/>.</summary>
+    private async Task<(MonsterUnit Primary, MonsterUnit[] Near, MonsterUnit Far)> SplashTargets(GameSession session)
+    {
+        const int npc = 5000002;
+        var monsters = Service<MonsterService>();
+        var units = new MonsterUnit[8];
+        var template = monsters.Template(npc)! with { RoamDistance = 0, SurroundDistance = 0 };
+        for (int i = 0; i < units.Length; i++)
+            units[i] = await Service<GameLoop>().InvokeAsync(async () => (await monsters.SpawnSingleAsync(session.SceneEntry, npc,
+                new MapPoint(session.Position.X, session.Position.Y, session.Position.Z, 0), session.InstanceId, customTemplate: template))!);
+        await Service<GameLoop>().InvokeAsync(() =>
+        {
+            foreach (var other in Service<World>().Map(session.WorldScene).Units.OfType<MonsterUnit>().Where(m => !units.Contains(m)))
+            { other.X += 200; other.Z += 200; }
+            for (int i = 0; i < units.Length; i++)
+            {
+                units[i].StaysOutOfBattle = true;
+                units[i].Hp = 100_000_000;
+                float offset = i == 0 ? 0 : i == 7 ? SplashEdge : 1 + i * 0.25f;
+                units[i].X = session.Position.X + 1 + offset;
+                units[i].Z = session.Position.Z;
+            }
+            Service<CombatService>().Rolls = new SureHits();
+            return Task.CompletedTask;
+        });
+        return (units[0], units[1..7], units[7]);
+    }
+
+    /// <summary>A real swing on the wire (31102), waiting out the swing lock of the one before; its hit on the primary.</summary>
+    private async Task<SkillHitInfo> Swing(BotClient bot, GameSession session, MonsterUnit primary)
+    {
+        int attack = await OnLoop(() => Service<SkillService>().CurrentAttack(session));
+        for (int attempt = 0; ; attempt++)
+        {
+            await bot.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = attack, TargetId = primary.Uid, Face = session.Face });
+            var accepted = await Next(bot, CombatService.UseSkill, CastSkillRsp.Parser);
+            if (accepted.Result == 0)
+                return await Next(bot, CombatService.SkillHit, SkillHitInfo.Parser, h => h.SessionId == accepted.SessionId && h.SkillId == attack);
+            Assert.True(attempt < 30, "the swing was refused " + accepted.Result);
+            await Task.Delay(100);
+        }
+    }
+
+    private async Task<(BotClient Bot, GameSession Session)> Socketed(int card)
+    {
+        var alice = await InWorld("Alice");
+        var session = Session("Alice");
+        await Gm("alice", "!lvl 80");
+        await Gm("alice", $"!item {card} 1");
+        await WearDagger(alice, session);
+        Assert.Equal(0, await Insert(alice, 1, 1, session.Items.Single(i => i.Entry == card).Guid));
+        return (alice, session);
+    }
+
+    private static List<SkillHitInfo> SplashHits(BotClient bot, params int[] rows) =>
+    [
+        .. bot.Inbox.Snapshot().Where(e => e.IsGame(CombatService.SkillHit)).Select(e => SkillHitInfo.Parser.ParseFrom(e.Body))
+            .Where(h => rows.Contains(h.SkillId)),
+    ];
+
+    // BuffConfig 2050901 (Card: Baphomet, star 0), row 2051001: "Melee Basic Attacks trigger a Splash effect within a
+    // 3-meter radius ... up to 5 Extra targets, with damage reduced to 15% of the original."
+    [ClientDataFact]
+    public async Task BaphometCardSplashesAMeleeNormalAttackOnUpToFiveExtraTargets()
+    {
+        var (alice, session) = await Socketed(BaphometCard);
+        await using (alice)
+        {
+            await Eventually(() => session.Buffs.Any(b => b.IsPassive && b.ConfigId == 2050901), "the card's passive");
+            var (primary, near, far) = await SplashTargets(session);
+
+            var hit = await Swing(alice, session, primary);
+            var original = Assert.Single(hit.Dsts);
+            Assert.Equal(primary.Uid, original.DstID);
+            Assert.True(original.Damage > 0);
+
+            var splash = await Next(alice, CombatService.SkillHit, SkillHitInfo.Parser, h => h.SkillId == 2051001);
+            Assert.Equal(5, splash.Dsts.Count);
+            Assert.All(splash.Dsts, d =>
+            {
+                Assert.Contains(near, m => m.Uid == d.DstID);
+                Assert.Equal(Math.Max(1, (long)Math.Floor(original.Damage * 0.15)), d.Damage);
+            });
+            Assert.DoesNotContain(splash.Dsts, d => d.DstID == primary.Uid || d.DstID == far.Uid);
+            var ring = await Next(alice, CombatService.SkillEffect, SkillEffectDisplayNotify.Parser, e => e.EffectId == 2050802);
+            Assert.Equal((primary.Uid, session.Role!.Id, 2), (ring.SourceId, ring.MasterId, ring.EffectType));
+        }
+    }
+
+    // Star 3: 2050904, row 2051901: 5 m, 25%, gfx 2051102 (the same prefab at 1.67).
+    [ClientDataFact]
+    public async Task BaphometCardsStarRaisesTheSplashAreaAndDamage()
+    {
+        var (alice, session) = await Socketed(BaphometCard);
+        await using (alice)
+        {
+            await Service<GameLoop>().InvokeAsync(async () =>
+            {
+                var card = session.Items.Single(i => i.Entry == BaphometCard);
+                (card.Attrs ??= [])[502] = 3;
+                await Service<CardEffects>().RefreshAsync(session);
+            });
+            Assert.Contains(session.Buffs, b => b.IsPassive && b.ConfigId == 2050904);
+            var (primary, near, far) = await SplashTargets(session);
+            await Service<GameLoop>().InvokeAsync(() => // only the far one and one other left in the area
+            {
+                foreach (var m in near.Skip(1)) m.X += 50;
+                return Task.CompletedTask;
+            });
+
+            var original = Assert.Single((await Swing(alice, session, primary)).Dsts);
+            var splash = await Next(alice, CombatService.SkillHit, SkillHitInfo.Parser, h => h.SkillId == 2051901);
+            Assert.Equal(new[] { near[0].Uid, far.Uid }.Order(), splash.Dsts.Select(d => d.DstID).Order());
+            Assert.All(splash.Dsts, d => Assert.Equal(Math.Max(1, (long)Math.Floor(original.Damage * 0.25)), d.Damage));
+            await Next(alice, CombatService.SkillEffect, SkillEffectDisplayNotify.Parser, e => e.EffectId == 2051102);
+        }
+    }
+
+    // 2050801 (Shadow Card: Baphomet, star 0), row 2050801: "25% Chance ... 3-meter ... 50% of the original. Internal
+    // Cooldown: 3 seconds."
+    [ClientDataFact]
+    public async Task ShadowBaphometCardSplashesOnItsChanceAndThenWaitsItsCooldown()
+    {
+        var (alice, session) = await Socketed(ShadowBaphometCard);
+        await using (alice)
+        {
+            await Eventually(() => session.Buffs.Any(b => b.IsPassive && b.ConfigId == 2050801), "the card's passive");
+            var (primary, _, _) = await SplashTargets(session);
+            var effects = Service<CardEffects>();
+            var rolled = new List<int>();
+            effects.Roll = bound => { rolled.Add(bound); return 2500; };
+            await Swing(alice, session, primary); // a roll of 25.00% is the first that fails
+            await Eventually(() => rolled.Contains(10000), "the chance roll");
+            Assert.Empty(SplashHits(alice, 2050801));
+
+            effects.Roll = _ => 2499;
+            var original = Assert.Single((await Swing(alice, session, primary)).Dsts);
+            var splash = await Next(alice, CombatService.SkillHit, SkillHitInfo.Parser, h => h.SkillId == 2050801);
+            Assert.All(splash.Dsts, d => Assert.Equal(Math.Max(1, (long)Math.Floor(original.Damage * 0.5)), d.Damage));
+
+            await Swing(alice, session, primary); // inside the 3 s
+            await Task.Delay(100);
+            Assert.Single(SplashHits(alice, 2050801));
+        }
+    }
+
+    // "Melee Basic Attacks": the Archer series' bow attack 1300001 (_iDistanceType 2) keeps one target.
+    [ClientDataFact]
+    public async Task BaphometCardLeavesARangedNormalAttackAlone()
+    {
+        const int bowItem = 2110120;
+        await using var alice = await InWorld("Alice");
+        var session = Session("Alice");
+        await Gm("alice", "!lvl 80");
+        await Gm("alice", "!job 3100");
+        await Gm("alice", $"!item {bowItem} 1");
+        await Gm("alice", $"!item {BaphometCard} 1");
+        await Eventually(() => session.Items.Any(i => i.Entry == bowItem), "the bow");
+        await alice.SendGameAsync(CharacterService.EquipItemOpr, new EquipItemOprReq { Opr = 0, Pos = (EquipGridType)1, ItemGUID = session.Items.Single(i => i.Entry == bowItem).Guid });
+        Assert.Equal(0, (await Next(alice, CharacterService.EquipItemOpr, EquipItemOprResp.Parser)).Result);
+        Assert.Equal(0, await Insert(alice, 1, 1, session.Items.Single(i => i.Entry == BaphometCard).Guid));
+        await Eventually(() => session.Buffs.Any(b => b.IsPassive && b.ConfigId == 2050901), "the card's passive");
+        var (primary, near, _) = await SplashTargets(session);
+
+        Assert.Equal(1300001, await OnLoop(() => Service<SkillService>().CurrentAttack(session)));
+        Assert.Single((await Swing(alice, session, primary)).Dsts);
+        await Task.Delay(300);
+        Assert.Empty(SplashHits(alice, 2051001));
+        Assert.All(near, m => Assert.Equal(100_000_000, m.Hp));
+    }
+
+    [ClientDataFact]
+    public async Task ANormalAttackWithoutTheCardHitsOneTarget()
+    {
+        await using var alice = await InWorld("Alice");
+        var session = Session("Alice");
+        await Gm("alice", "!lvl 80");
+        await WearDagger(alice, session);
+        var (primary, near, far) = await SplashTargets(session);
+
+        var original = Assert.Single((await Swing(alice, session, primary)).Dsts);
+        Assert.Equal(primary.Uid, original.DstID);
+        await Task.Delay(300);
+        Assert.Empty(SplashHits(alice, 2050801, 2050901, 2051001, 2051101, 2051801, 2051901));
+        Assert.All(near.Append(far), m => Assert.Equal(100_000_000, m.Hp));
+    }
+
+    // The numbers the proc rows give agree with what every tier of both cards says.
+    [ClientDataTheory]
+    [InlineData(2050801, 2500, 3, 5, 5000, 3000, 2050802)]
+    [InlineData(2050802, 4000, 3, 5, 5000, 3000, 2050802)]
+    [InlineData(2050803, 4000, 3, 5, 5000, 2500, 2050802)]
+    [InlineData(2050804, 4000, 3, 5, 5500, 2500, 2050802)]
+    [InlineData(2050901, 10000, 3, 5, 1500, 200, 2050802)]
+    [InlineData(2050902, 10000, 3, 5, 2000, 200, 2050802)]
+    [InlineData(2050903, 10000, 3, 5, 2500, 200, 2050802)]
+    [InlineData(2050904, 10000, 5, 5, 2500, 200, 2051102)]
+    public void EveryBaphometCardTierSplashesAsItsTextSays(int id, long chance, float radius, int extra, long ratio, long cooldownMs, long effect)
+    {
+        var data = Service<GameData>();
+        var buff = Ro3Emu.Server.Data.Config.BuffConfig.Get(data, id)!.Value;
+        var row = Ro3Emu.Server.Data.Config.SkillConfig.Get(data, buff.LogicData[^1])!.Value;
+        Assert.Equal(new CardEffects.Splash(chance, cooldownMs, radius, extra, ratio, effect), CardEffects.SplashOf(buff, row));
+        string[] text = buff.DescData;
+        Assert.Equal(radius, float.Parse(text[^4], System.Globalization.CultureInfo.InvariantCulture));
+        Assert.Equal(extra, int.Parse(text[^3], System.Globalization.CultureInfo.InvariantCulture));
+        Assert.Equal(ratio, long.Parse(text[^2], System.Globalization.CultureInfo.InvariantCulture) * 100);
     }
 
     [ClientDataFact]

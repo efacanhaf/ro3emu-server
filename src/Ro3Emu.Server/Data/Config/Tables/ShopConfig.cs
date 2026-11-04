@@ -9,5 +9,9 @@ public readonly partial record struct ShopConfig(JsonElement Row)
     [ConfigField("_iClassID")] public partial long ClassId { get; }
     [ConfigField("_iFunctionId")] public partial long FunctionId { get; }
     [ConfigField("_iShopType")] public partial long ShopType { get; }
+    /// <summary>[text id]: the shop's name as its tab shows it.</summary>
+    [ConfigField("_iShopName")] public partial long[] ShopName { get; }
     [ConfigField("_kMultiverseArray")] public partial long[] MultiverseArray { get; }
+    [ConfigField("_iNpcId")] public partial long NpcId { get; }
+    [ConfigField("_kGroup")] public partial long[][] Group { get; }
 }

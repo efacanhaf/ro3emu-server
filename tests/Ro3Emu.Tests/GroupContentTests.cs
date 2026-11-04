@@ -76,7 +76,7 @@ public sealed partial class GroupContentTests : IAsyncLifetime
     private async Task Gm(BotClient bot, string command)
     {
         using var client = new HttpClient();
-        (await client.PostAsync($"{_http}/ro3emu/gm?account={bot.Account}", new StringContent(command))).EnsureSuccessStatusCode();
+        (await client.PostAsync($"{_http}/ro3emu/gm?account={bot.Account}", Operator.Command(command))).EnsureSuccessStatusCode();
     }
 
     private GameSession Session(BotClient bot) => Service<SessionRegistry>().All()
@@ -209,6 +209,10 @@ public sealed partial class GroupContentTests : IAsyncLifetime
         });
         Assert.Equal([1L, 40, 2, 0], (await Next(bob, DungeonService.BaseInfo, DungeonBaseInfoNotify.Parser,
             m => m.Vars.Any(v => v.VarId == 304 && v.Vi64[1] == 40))).Vars.Single(v => v.VarId == 304).Vi64);
+        // The report button's own counters (30123) follow each kill.
+        var counters = await Next(alice, DungeonService.PlayerStatistics, DungeonPlayerStatisticsNtf.Parser,
+            n => n.StatisticsInfo.ExtraData[1001004].LongValue == 2);
+        Assert.Equal((long)alice.Self!.Uuid, counters.PlayerId);
 
         // The live report (30117): both camps' roles in sceneStatistics[0].
         await alice.SendGameAsync(DungeonService.StatisticsCurrent, new GetDungeonStatisticsInDungeonReq());
@@ -235,6 +239,264 @@ public sealed partial class GroupContentTests : IAsyncLifetime
         Assert.Equal(997, ((DBCasualBattleInfo)Session(bob).Synced[CasualBattleService.Sync]).Mmr);
         var saved = JsonSerializer.Deserialize<TimedBattleService.State>(Service<Server.Accounts.RoleStore>().LoadTimedBattle((long)alice.Self.Uuid)!)!;
         Assert.Equal(1005, saved.CasualMmr);
+    }
+
+    /// <summary>Each camp's 30441 Virtual team roster keeps a real party in one squad and packs lone players into the
+    /// free slots, five to a squad, with team-wide positions; the squad holding the leaderGuid is the lowest-indexed one.</summary>
+    [ClientDataFact]
+    public async Task MockBattleGivesEachCampAVirtualTeamRosterGroupedByRealParty()
+    {
+        await using var alice = await InWorld("Alice");
+        await using var carol = await InWorld("Carol");
+        await using var bob = await InWorld("Bob");
+        await using var dave = await InWorld("Dave");
+        foreach (var bot in new[] { alice, carol, bob, dave }) await Gm(bot, "!lvl 99");
+        await Party(alice, carol);
+        await Gm(alice, "!casual open");
+        Assert.Equal(0, (await SignUp(alice)).Result);
+        Assert.Equal(0, (await SignUp(bob)).Result);
+        Assert.Equal(0, (await SignUp(dave)).Result);
+        await Gm(alice, "!casual start");
+        foreach (var bot in new[] { alice, carol, bob, dave }) await Load(bot, CasualBattleService.Scene);
+
+        long room = Session(alice).InstanceId;
+        long aliceId = (long)alice.Self!.Uuid, carolId = (long)carol.Self!.Uuid, bobId = (long)bob.Self!.Uuid, daveId = (long)dave.Self!.Uuid;
+        var mine = await Next(alice, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser);
+        Assert.Equal(room, mine.TeamId);
+        Assert.Equal(2, (int)mine.TeamType);
+        var squad = Assert.Single(mine.Squads).Value;
+        Assert.Equal(aliceId, squad.SquadLeaderGuid);
+        Assert.Equal([aliceId, carolId], squad.Members.Keys.Order());
+        Assert.Equal([0, 1], squad.Members.Values.Select(m => m.Position).Order());
+        Assert.Equal(mine.LeaderGuid, squad.SquadLeaderGuid);
+
+        // The two lone players share one squad, in slots 0 and 1 (the client groups slots by five: LC_TeamHelper).
+        var theirs = await Next(bob, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser, n => n.Squads.Values.Sum(s => s.Members.Count) == 2);
+        Assert.Equal(room, theirs.TeamId);
+        var lone = Assert.Single(theirs.Squads).Value;
+        Assert.Equal([bobId, daveId], lone.Members.Keys.Order());
+        Assert.Equal([0, 1], lone.Members.Values.Select(m => m.Position).Order());
+    }
+
+    /// <summary>30451 DUNGEON_TEAM_TRANSFER: only the Virtual team's current leader may hand the role to another
+    /// present member of its own camp; everyone's next 30441 shows the new leaderGuid.</summary>
+    [ClientDataFact]
+    public async Task MockBattleVirtualTeamLeadershipTransfersToAnotherCampMember()
+    {
+        await using var alice = await InWorld("Alice");
+        await using var carol = await InWorld("Carol");
+        await using var bob = await InWorld("Bob");
+        foreach (var bot in new[] { alice, carol, bob }) await Gm(bot, "!lvl 99");
+        await Party(alice, carol);
+        await Gm(alice, "!casual open");
+        Assert.Equal(0, (await SignUp(alice)).Result);
+        Assert.Equal(0, (await SignUp(bob)).Result);
+        await Gm(alice, "!casual start");
+        foreach (var bot in new[] { alice, carol, bob }) await Load(bot, CasualBattleService.Scene);
+        long carolId = (long)carol.Self!.Uuid, bobId = (long)bob.Self!.Uuid;
+        await Next(alice, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser); // the roster from loading, consumed
+        await Next(carol, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser);
+        await Next(bob, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser);
+
+        // Not the leader: refused, nothing changes.
+        await carol.SendGameAsync(CasualBattleService.Transfer, new DungeonTeamTransferReq { TargetGuid = carolId });
+        Assert.Equal(ErrorCodes.NoPermission, (await Next(carol, CasualBattleService.Transfer, DungeonTeamTransferResp.Parser)).Result);
+
+        // A member of the other camp: refused.
+        await alice.SendGameAsync(CasualBattleService.Transfer, new DungeonTeamTransferReq { TargetGuid = bobId });
+        Assert.Equal(ErrorCodes.Parameter, (await Next(alice, CasualBattleService.Transfer, DungeonTeamTransferResp.Parser)).Result);
+
+        // The leader hands off to Carol: both squadmates see the new leaderGuid.
+        await alice.SendGameAsync(CasualBattleService.Transfer, new DungeonTeamTransferReq { TargetGuid = carolId });
+        Assert.Equal(0, (await Next(alice, CasualBattleService.Transfer, DungeonTeamTransferResp.Parser)).Result);
+        await Next(alice, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser, m => m.LeaderGuid == carolId);
+        await Next(carol, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser, m => m.LeaderGuid == carolId);
+
+        // Alice is no longer the leader; Carol is.
+        await alice.SendGameAsync(CasualBattleService.Transfer, new DungeonTeamTransferReq { TargetGuid = carolId });
+        Assert.Equal(ErrorCodes.NoPermission, (await Next(alice, CasualBattleService.Transfer, DungeonTeamTransferResp.Parser)).Result);
+    }
+
+    /// <summary>30448 DUNGEON_TEAM_FOLLOW: a camp member's own follow toggle reaches every present camp member as a
+    /// 30449 notice and is mirrored in the next 30441 roster's own DungeonTeamMemberInfo.followType.</summary>
+    [ClientDataFact]
+    public async Task MockBattleVirtualTeamFollowToggleReachesTheCampAndTheRoster()
+    {
+        await using var alice = await InWorld("Alice");
+        await using var carol = await InWorld("Carol");
+        await using var bob = await InWorld("Bob");
+        foreach (var bot in new[] { alice, carol, bob }) await Gm(bot, "!lvl 99");
+        await Party(alice, carol);
+        await Gm(alice, "!casual open");
+        Assert.Equal(0, (await SignUp(alice)).Result);
+        Assert.Equal(0, (await SignUp(bob)).Result);
+        await Gm(alice, "!casual start");
+        foreach (var bot in new[] { alice, carol, bob }) await Load(bot, CasualBattleService.Scene);
+        long carolId = (long)carol.Self!.Uuid;
+        await Next(alice, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser); // the roster from loading, consumed
+        await Next(carol, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser);
+        await Next(bob, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser);
+
+        // isFollow true with no followType named: refused.
+        await carol.SendGameAsync(CasualBattleService.Follow, new DungeonTeamFollowReq { IsFollow = true });
+        Assert.Equal(ErrorCodes.Parameter, (await Next(carol, CasualBattleService.Follow, DungeonTeamFollowResp.Parser)).Result);
+
+        // Carol follows her squad's leader: her squadmate and she herself both hear the 30449 notice.
+        var followSquad = (DungeonTeamFollowType)2;
+        await carol.SendGameAsync(CasualBattleService.Follow, new DungeonTeamFollowReq { FollowType = followSquad, IsFollow = true });
+        Assert.Equal(0, (await Next(carol, CasualBattleService.Follow, DungeonTeamFollowResp.Parser)).Result);
+        var heardByAlice = await Next(alice, CasualBattleService.FollowNotify, DungeonTeamFollowNotify.Parser);
+        Assert.Equal((carolId, followSquad, true), (heardByAlice.FollowerGuid, heardByAlice.FollowType, heardByAlice.IsFollow));
+        await Next(carol, CasualBattleService.FollowNotify, DungeonTeamFollowNotify.Parser);
+        var rosterFollowing = await Next(alice, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser,
+            m => m.Squads.Values.Single().Members[carolId].FollowType == followSquad);
+        Assert.Equal(followSquad, rosterFollowing.Squads.Values.Single().Members[carolId].FollowType);
+
+        // Carol stops following: the roster's own entry reverts to no follow.
+        await carol.SendGameAsync(CasualBattleService.Follow, new DungeonTeamFollowReq { FollowType = followSquad, IsFollow = false });
+        Assert.Equal(0, (await Next(carol, CasualBattleService.Follow, DungeonTeamFollowResp.Parser)).Result);
+        var rosterStopped = await Next(alice, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser,
+            m => m.Squads.Values.Single().Members[carolId].FollowType != followSquad);
+        Assert.Equal((DungeonTeamFollowType)0, rosterStopped.Squads.Values.Single().Members[carolId].FollowType);
+    }
+
+    /// <summary>30450 DUNGEON_TEAM_SWAP_POSITION: only the sender's own squad leader may swap two of that squad's
+    /// slots, read as the sender's own squad since the request names no squadIdx; everyone's next 30441 shows the
+    /// swap.</summary>
+    [ClientDataFact]
+    public async Task MockBattleVirtualTeamSwapPositionReordersTheSendersOwnSquad()
+    {
+        await using var alice = await InWorld("Alice");
+        await using var carol = await InWorld("Carol");
+        await using var bob = await InWorld("Bob");
+        foreach (var bot in new[] { alice, carol, bob }) await Gm(bot, "!lvl 99");
+        await Party(alice, carol);
+        await Gm(alice, "!casual open");
+        Assert.Equal(0, (await SignUp(alice)).Result);
+        Assert.Equal(0, (await SignUp(bob)).Result);
+        await Gm(alice, "!casual start");
+        foreach (var bot in new[] { alice, carol, bob }) await Load(bot, CasualBattleService.Scene);
+        long aliceId = (long)alice.Self!.Uuid, carolId = (long)carol.Self!.Uuid;
+        await Next(alice, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser); // the roster from loading, consumed
+        await Next(carol, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser);
+        await Next(bob, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser);
+
+        // Not the squad leader: refused.
+        await carol.SendGameAsync(CasualBattleService.SwapPosition, new DungeonTeamSwapPositionReq { PositionFirst = 0, PositionSecond = 1 });
+        Assert.Equal(ErrorCodes.NoPermission, (await Next(carol, CasualBattleService.SwapPosition, DungeonTeamSwapPositionResp.Parser)).Result);
+
+        // No member sits at position 5 in a two-person squad: refused.
+        await alice.SendGameAsync(CasualBattleService.SwapPosition, new DungeonTeamSwapPositionReq { PositionFirst = 0, PositionSecond = 5 });
+        Assert.Equal(ErrorCodes.Parameter, (await Next(alice, CasualBattleService.SwapPosition, DungeonTeamSwapPositionResp.Parser)).Result);
+
+        // The squad leader (position 0, Alice) swaps with Carol (position 1): both see the swapped positions.
+        await alice.SendGameAsync(CasualBattleService.SwapPosition, new DungeonTeamSwapPositionReq { PositionFirst = 0, PositionSecond = 1 });
+        Assert.Equal(0, (await Next(alice, CasualBattleService.SwapPosition, DungeonTeamSwapPositionResp.Parser)).Result);
+        var rosterSwapped = await Next(alice, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser,
+            m => m.Squads.Values.Single().Members[aliceId].Position == 1);
+        var squad = rosterSwapped.Squads.Values.Single();
+        Assert.Equal(1, squad.Members[aliceId].Position);
+        Assert.Equal(0, squad.Members[carolId].Position);
+        Assert.Equal(aliceId, squad.SquadLeaderGuid); // swapping slots does not change who leads the squad
+    }
+
+    /// <summary>30442 DUNGEON_TEAM_SET_FLAG: only the sender's own squad leader may mark or clear that squad's own
+    /// flag; everyone's next 30441 shows it, and a Player flag must name a present member of that squad.</summary>
+    [ClientDataFact]
+    public async Task MockBattleVirtualTeamFlagMarksAndClearsTheSendersOwnSquad()
+    {
+        await using var alice = await InWorld("Alice");
+        await using var carol = await InWorld("Carol");
+        await using var bob = await InWorld("Bob");
+        foreach (var bot in new[] { alice, carol, bob }) await Gm(bot, "!lvl 99");
+        await Party(alice, carol);
+        await Gm(alice, "!casual open");
+        Assert.Equal(0, (await SignUp(alice)).Result);
+        Assert.Equal(0, (await SignUp(bob)).Result);
+        await Gm(alice, "!casual start");
+        foreach (var bot in new[] { alice, carol, bob }) await Load(bot, CasualBattleService.Scene);
+        long aliceId = (long)alice.Self!.Uuid, carolId = (long)carol.Self!.Uuid, bobId = (long)bob.Self!.Uuid;
+        await Next(alice, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser); // the roster from loading, consumed
+        await Next(carol, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser);
+        await Next(bob, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser);
+
+        // Not the squad leader: refused.
+        var flag = new DungeonTeamFlagInfo { Type = DungeonTeamFlagType.Position, Position = new Vec3 { X = 1 } };
+        await carol.SendGameAsync(CasualBattleService.SetFlag, new DungeonTeamSetFlagReq { Slot = 1, FlagInfo = flag });
+        Assert.Equal(ErrorCodes.NoPermission, (await Next(carol, CasualBattleService.SetFlag, DungeonTeamSetFlagResp.Parser)).Result);
+
+        // A Player flag naming someone outside the squad: refused.
+        await alice.SendGameAsync(CasualBattleService.SetFlag, new DungeonTeamSetFlagReq
+        { Slot = 1, FlagInfo = new DungeonTeamFlagInfo { Type = DungeonTeamFlagType.Player, TargetGuid = bobId } });
+        Assert.Equal(ErrorCodes.Parameter, (await Next(alice, CasualBattleService.SetFlag, DungeonTeamSetFlagResp.Parser)).Result);
+
+        // The squad leader marks a position: both squadmates see it on the next roster.
+        await alice.SendGameAsync(CasualBattleService.SetFlag, new DungeonTeamSetFlagReq { Slot = 1, FlagInfo = flag });
+        Assert.Equal(0, (await Next(alice, CasualBattleService.SetFlag, DungeonTeamSetFlagResp.Parser)).Result);
+        await Next(alice, CasualBattleService.FlagNotify, DungeonTeamFlagNotify.Parser);
+        var marked = await Next(carol, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser, n => n.Flags.Count > 0);
+        Assert.Equal(DungeonTeamFlagType.Position, marked.Flags[1].Type);
+        Assert.Equal(1, marked.Flags[1].Position.X);
+
+        // A Player flag naming a present squadmate: accepted, replaces the position flag.
+        await alice.SendGameAsync(CasualBattleService.SetFlag, new DungeonTeamSetFlagReq
+        { Slot = 1, FlagInfo = new DungeonTeamFlagInfo { Type = DungeonTeamFlagType.Player, TargetGuid = carolId } });
+        Assert.Equal(0, (await Next(alice, CasualBattleService.SetFlag, DungeonTeamSetFlagResp.Parser)).Result);
+        var retargeted = await Next(carol, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser,
+            n => n.Flags.Count > 0 && n.Flags[1].Type == DungeonTeamFlagType.Player);
+        Assert.Equal(carolId, retargeted.Flags[1].TargetGuid);
+        Assert.Equal(aliceId, retargeted.Squads.Values.Single(s => s.Members.ContainsKey(aliceId)).SquadLeaderGuid);
+
+        // Clearing the flag removes it from the next roster.
+        await alice.SendGameAsync(CasualBattleService.SetFlag, new DungeonTeamSetFlagReq
+        { Slot = 1, FlagInfo = new DungeonTeamFlagInfo { Type = DungeonTeamFlagType.None } });
+        Assert.Equal(0, (await Next(alice, CasualBattleService.SetFlag, DungeonTeamSetFlagResp.Parser)).Result);
+        await Next(carol, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser, n => n.Flags.Count == 0);
+    }
+
+    /// <summary>30444/30446 DUNGEON_TEAM_RALLY and DUNGEON_TEAM_RALLY_REPLY: only the sender's own squad leader may
+    /// call a rally, the call and every reply reach the present camp, and a reply is refused when the sender's own
+    /// squad has no pending rally. Bob signed up alone, so he lands in the other camp (as Transfer's own camp
+    /// check also assumes) and hears neither notice.</summary>
+    [ClientDataFact]
+    public async Task MockBattleVirtualTeamRallyReachesTheCampAndRefusesAnUnrelatedReply()
+    {
+        await using var alice = await InWorld("Alice");
+        await using var carol = await InWorld("Carol");
+        await using var bob = await InWorld("Bob");
+        foreach (var bot in new[] { alice, carol, bob }) await Gm(bot, "!lvl 99");
+        await Party(alice, carol);
+        await Gm(alice, "!casual open");
+        Assert.Equal(0, (await SignUp(alice)).Result);
+        Assert.Equal(0, (await SignUp(bob)).Result);
+        await Gm(alice, "!casual start");
+        foreach (var bot in new[] { alice, carol, bob }) await Load(bot, CasualBattleService.Scene);
+        long aliceId = (long)alice.Self!.Uuid, carolId = (long)carol.Self!.Uuid;
+        await Next(alice, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser); // the roster from loading, consumed
+        await Next(carol, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser);
+        await Next(bob, DungeonService.TeamInfo, DungeonTeamInfoNotify.Parser);
+
+        // Bob has no pending rally in his own (other camp's) squad: refused.
+        await bob.SendGameAsync(CasualBattleService.RallyReply, new DungeonTeamRallyReplyReq { IsAgree = true });
+        Assert.Equal(ErrorCodes.Parameter, (await Next(bob, CasualBattleService.RallyReply, DungeonTeamRallyReplyResp.Parser)).Result);
+
+        // Not the squad leader: refused.
+        await carol.SendGameAsync(CasualBattleService.Rally, new DungeonTeamRallyReq());
+        Assert.Equal(ErrorCodes.NoPermission, (await Next(carol, CasualBattleService.Rally, DungeonTeamRallyResp.Parser)).Result);
+
+        // The squad leader calls a rally: her squadmate hears the notice.
+        await alice.SendGameAsync(CasualBattleService.Rally, new DungeonTeamRallyReq());
+        var called = await Next(alice, CasualBattleService.Rally, DungeonTeamRallyResp.Parser);
+        Assert.Equal((0, 1), (called.Result, called.SquadIdx));
+        var heardByAlice = await Next(alice, CasualBattleService.RallyNotify, DungeonTeamRallyNotify.Parser);
+        Assert.Equal((aliceId, 1), (heardByAlice.OperGuid, heardByAlice.SquadIdx));
+        await Next(carol, CasualBattleService.RallyNotify, DungeonTeamRallyNotify.Parser);
+
+        // Carol agrees: her squadmate hears the reply too.
+        await carol.SendGameAsync(CasualBattleService.RallyReply, new DungeonTeamRallyReplyReq { IsAgree = true });
+        Assert.Equal(0, (await Next(carol, CasualBattleService.RallyReply, DungeonTeamRallyReplyResp.Parser)).Result);
+        var reply = await Next(alice, CasualBattleService.RallyReplyNotify, DungeonTeamRallyReplyNotify.Parser);
+        Assert.Equal((carolId, true, 1), (reply.ReplyGuid, reply.IsAgree, reply.SquadIdx));
     }
 
     // ---- MVP likes ----

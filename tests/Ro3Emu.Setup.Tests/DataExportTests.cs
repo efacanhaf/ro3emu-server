@@ -25,6 +25,48 @@ public class DataExportTests
     public void NavFileNameReplacesTheFirstSuffix(string navName, string file) => Assert.Equal(file, NavExporter.FileName(navName));
 
     [Fact]
+    public void ADefaultRowReachesPlainRowsAndTheInnerRowsOfAGroup()
+    {
+        var dir = Directory.CreateTempSubdirectory("ro3emu-config-");
+        try
+        {
+            var source = """
+                local defaults = { weight = 320, item = 7 }
+                local mt = { __index = defaults }
+                local t = { m_kValues = {
+                  [601] = { { weight = 5 }, { count = 2 } },
+                  [700] = setmetatable({ count = 3 }, mt),
+                  [800] = { list = { 1, 2 }, name = "plain" },
+                } }
+                for _, row in ipairs(t.m_kValues[601]) do setmetatable(row, mt) end
+                return t
+                """;
+            using (var lua = new KeraLua.Lua())
+            {
+                lua.OpenLibs();
+                lua.PushString(source);
+                lua.SetGlobal("SOURCE");
+                lua.PushString(Path.Combine(dir.FullName, "Sample.luac"));
+                lua.SetGlobal("OUT");
+                Assert.False(lua.DoString("local f = assert(io.open(OUT, 'wb')); f:write(string.dump(assert(load(SOURCE)))); f:close()"));
+            }
+            using (var exporter = new LuaConfigExporter(dir.FullName))
+                Assert.Equal((1, 0), exporter.ExportDirs(Path.Combine(dir.FullName, "out"), ["Sample.luac"]));
+            using var json = System.Text.Json.JsonDocument.Parse(File.ReadAllText(Path.Combine(dir.FullName, "out", "Sample.json")));
+            var group = json.RootElement.GetProperty("601");
+            Assert.Equal(5, group[0].GetProperty("weight").GetInt32()); // a field of the row wins
+            Assert.Equal(7, group[0].GetProperty("item").GetInt32());
+            Assert.Equal(320, group[1].GetProperty("weight").GetInt32());
+            Assert.Equal(2, group[1].GetProperty("count").GetInt32());
+            Assert.Equal(320, json.RootElement.GetProperty("700").GetProperty("weight").GetInt32());
+            var plain = json.RootElement.GetProperty("800");
+            Assert.Equal("plain", plain.GetProperty("name").GetString());
+            Assert.Equal(2, plain.GetProperty("list").GetArrayLength());
+        }
+        finally { dir.Delete(true); }
+    }
+
+    [Fact]
     public void NavNamesAreDistinctInTableOrder()
     {
         var dir = Directory.CreateTempSubdirectory("ro3emu-nav-");
@@ -35,6 +77,46 @@ public class DataExportTests
             Assert.Equal(["b data.bytes", "a data.bytes"], NavExporter.NavNames(json));
         }
         finally { dir.Delete(true); }
+    }
+
+    [Fact]
+    public void ClientScenesListsTheMapsWhoseUnitySceneTheVfsLacks()
+    {
+        var dir = Directory.CreateTempSubdirectory("ro3emu-scenes-");
+        try
+        {
+            // An asset index with one bundle entry (27 bytes: asset hash, load type, dyn id, file hash, VFS hash) and no bytes entries.
+            var meta = new byte[4 + 27 + 4];
+            BitConverter.TryWriteBytes(meta.AsSpan(0), 1u);
+            BitConverter.TryWriteBytes(meta.AsSpan(4), Vfs.LowerHash("SC_Town.unity"));
+            File.WriteAllBytes(Path.Combine(dir.FullName, "assetmeta.data"), meta);
+            var json = Path.Combine(dir.FullName, "MapResource.json");
+            File.WriteAllText(json, """{"1":{"_kResource":"sc_town"},"2":{"_kResource":"sc_field"},"3":{"_kResource":"sc_field"},"4":{"_kResource":""},"5":{}}""");
+            using var vfs = new Vfs(dir.FullName);
+            var file = Path.Combine(dir.FullName, ClientScenes.FileName);
+
+            Assert.Equal(["sc_field"], ClientScenes.Write(json, vfs, file));
+            using var written = System.Text.Json.JsonDocument.Parse(File.ReadAllText(file));
+            Assert.Equal(["sc_field"], written.RootElement.GetProperty("Missing").EnumerateArray().Select(e => e.GetString()));
+        }
+        finally { dir.Delete(true); }
+    }
+
+    /// <summary>The installed client against the exported MapResource table: Glast Heim and the five eastern towns have
+    /// walk maps but no Unity scene (issue: a GM warp to Glast Heim left the character on "Failed to load the area").</summary>
+    [ClientWithDataFact]
+    public void TheInstalledClientHasNoSceneForGlastHeim()
+    {
+        using var vfs = new Vfs(GameDataExport.VfsDir(RealClientExportTests.Client));
+
+        var missing = ClientScenes.Missing(ClientWithDataFactAttribute.MapResource!, vfs);
+
+        Assert.Contains("sc_glast_01_001", missing); // MapConfig 10700 Glast Heim the Ancient City
+        Assert.Contains("sc_gl_prison_001", missing); // 10791, one of its nine floors
+        Assert.Contains("sc_amatsu_001", missing); // 10601
+        Assert.DoesNotContain("sc_prontera_001", missing);
+        Assert.DoesNotContain("sc_gef_dun02_001", missing); // Geffen Tower 3, a floor that loads
+        Assert.True(vfs.Has("sc_glast_01_001_dynamicmapdata.bytes")); // its walk map is there, so the server ran the map
     }
 
     [Fact]
@@ -76,5 +158,26 @@ public class DataExportTests
             Assert.Empty(ClientPatcher.UnresolvedReferences(own, Path.GetDirectoryName(typeof(object).Assembly.Location)!));
         }
         finally { alone.Delete(true); }
+    }
+}
+
+/// <summary>Runs where the RO3 client is installed and this checkout has data/config exported from it.</summary>
+public sealed class ClientWithDataFactAttribute : FactAttribute
+{
+    public static string? MapResource { get; } = FindMapResource();
+
+    public ClientWithDataFactAttribute()
+    {
+        if (GameDataExport.Missing(RealClientExportTests.Client).Count > 0) Skip = "the RO3 client is not installed (set RO3_CLIENT_DIR)";
+        else if (MapResource == null) Skip = "needs data/config/MapResource.json exported from the client";
+    }
+
+    private static string? FindMapResource()
+    {
+        for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir != null; dir = dir.Parent)
+            if (File.Exists(Path.Combine(dir.FullName, "Ro3Emu.slnx")))
+                return File.Exists(Path.Combine(dir.FullName, "data", "config", "MapResource.json"))
+                    ? Path.Combine(dir.FullName, "data", "config", "MapResource.json") : null;
+        return null;
     }
 }

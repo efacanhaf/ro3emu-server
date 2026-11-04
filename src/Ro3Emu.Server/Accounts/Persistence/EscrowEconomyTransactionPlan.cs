@@ -18,7 +18,7 @@ internal sealed class EscrowEconomyTransactionPlan(RoleItemPlan child, EscrowEco
         intent.Changes.Count * 256 + child.Parts.Count * 256);
     internal override IReadOnlyList<RoleRevisionKey> RoleWrites => child.RoleWrites;
     internal override IReadOnlyList<long> RolePins => intent.ActorRoleId > 0
-        ? child.RolePins.Append(intent.ActorRoleId).Distinct().ToArray() : child.RolePins;
+        ? [.. child.RolePins.Append(intent.ActorRoleId).Distinct()] : child.RolePins;
     internal override IReadOnlyList<OwnerRevisionKey> EntityWrites => child.EntityWrites;
     internal override IReadOnlyList<OwnerRevisionKey> EntityDeltaWrites => child.EntityDeltaWrites;
     internal override IReadOnlyList<RoleRevisionKey> MutatedRoleWrites(object? result) => child.MutatedRoleWrites(result);
@@ -178,14 +178,14 @@ internal sealed class EscrowEconomyTransactionPlan(RoleItemPlan child, EscrowEco
                 "GuildMaterialContributionPlan" or "GuildCaravanRewardPlan" or "GuildEventAppendPlan" or
                 "FriendGiftWritePlan" or "FriendGiftGuardPlan" or "FriendGiftSourcePlan" or
                 "ActivityEveGlobalPlan" or "ActivityPreDonationPlan" or "ActivityInventoryGuardPlan" or
-                "CaravanMemberWritePlan"))
+                "CaravanMemberWritePlan" or "GiftCodeRedeemPlan"))
                 throw new InvalidOperationException("Unclassified E03 typed child: " + name);
         }
         foreach (var blob in child.Parts.OfType<RoleBlobWritePlan>())
             if (blob.Column is not ("mailbox" or "new_activities" or "activity_runtime" or
                 "tasks" or "task_runtime" or "task_followup" or "daily" or "library" or "bag_state" or
                 "trade_info" or "stalls_info" or "auction" or "guild_info" or
-                "season_page" or "season_page_meta"))
+                "season_page" or "season_page_meta" or "gifts"))
                 throw new InvalidOperationException("Unclassified E03 role blob: " + blob.Column);
         foreach (var entity in EntityWrites.Concat(EntityDeltaWrites))
             if (!entity.Kind.StartsWith("market_record:", StringComparison.Ordinal) &&
@@ -461,9 +461,9 @@ internal sealed class EscrowEconomyReceiptResolveReadPlan(EscrowEconomyIntent in
         byte[] payload = intent.Payload;
         if (row.GetString(1) != intent.ActorAccount || row.GetInt64(2) != intent.ActorRoleId ||
             row.GetString(3) != intent.CommandKind || row.GetString(4) != intent.Hash ||
-            row.GetString(5) != intent.Hash || !((byte[])row.GetValue(6)).AsSpan().SequenceEqual(payload) ||
+            row.GetString(5) != intent.Hash || !ReceiptBlobs.SamePayload((byte[])row.GetValue(6), payload) ||
             row.GetString(7) != intent.SourceKey ||
-            !((byte[])row.GetValue(8)).AsSpan().SequenceEqual((byte[])row.GetValue(9)))
+            !ReceiptBlobs.SameOutcome((byte[])row.GetValue(8), (byte[])row.GetValue(6), (byte[])row.GetValue(9)))
             throw new EconomyOperationConflictException("E03 operation ID belongs to another intent.");
         string realm = row.GetString(0);
         var result = EscrowEconomyReceiptCodec.Decode((byte[])row.GetValue(9));
@@ -510,7 +510,7 @@ internal static class EscrowEconomyReceiptCodec
         if (payload.Length > 64 * 1024 * 1024) throw new InvalidDataException("E03 child receipt is too large.");
         var values = JsonSerializer.Deserialize<Value[]>(payload) ?? throw new InvalidDataException("Missing E03 children.");
         if (values.Length is < 1 or > 16384) throw new InvalidDataException("Invalid E03 child count.");
-        return values.Select(x => x.Kind switch
+        return [.. values.Select(x => x.Kind switch
         {
             "null" => null,
             "bool" => (object?)x.Data.GetBoolean(),
@@ -521,7 +521,7 @@ internal static class EscrowEconomyReceiptCodec
             "bytes" => x.Data.Deserialize<byte[]>(),
             "auction" => x.Data.Deserialize<AuctionItemWriteReceipt>(),
             _ => throw new InvalidDataException("Unknown E03 child receipt kind.")
-        }).ToArray();
+        })];
     }
     internal static void Validate(RoleItemPlan child, object?[] values)
     {

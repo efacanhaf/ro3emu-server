@@ -8,7 +8,8 @@ namespace Ro3Emu.Tests;
 
 /// <summary>
 /// Who has GM (docs/guide/gm-access.md): an empty ServerOptions.GmAccounts means everyone for tests and local play, nobody
-/// in game on a host started as Production on purpose; the loopback HTTP /ro3emu/gm keeps "empty = everyone".
+/// in game on a server other machines reach or a host started as Production on purpose; the loopback HTTP /ro3emu/gm
+/// keeps "empty = everyone".
 /// </summary>
 public sealed class GmAccessTests
 {
@@ -46,6 +47,42 @@ public sealed class GmAccessTests
         Assert.Equal(expected, GmCommands.Allowed(options, account, loopbackTool));
     }
 
+    /// <summary>
+    /// An empty list opens GM, in game and as the panel's Admin, only on a server that only this machine reaches:
+    /// a public bind, a public panel bind or a proxy in front of the panel (PublicUrl, TrustedProxies) close it, as
+    /// does an explicit Production. An explicit GmOpenWhenEmpty=true still opens the game on a public server, never
+    /// the panel's admin area; a list decides alone.
+    /// </summary>
+    [Theory]
+    // environment, extra settings (";"-separated Ro3Emu:key=value), account, GM in game, panel Admin
+    [InlineData("Development", "", "stranger", true, true)]                                 // local play
+    [InlineData("Production", "", "stranger", false, false)]
+    [InlineData("Development", "PublicHost=192.0.2.10", "stranger", false, false)]          // binds every interface
+    [InlineData("Development", "PublicHost=192.0.2.10;BindAddress=127.0.0.1", "stranger", false, false)] // a tunnel
+    [InlineData("Development", "PublicHost=192.0.2.10;BindAddress=127.0.0.1;Panel:BindAddress=127.0.0.1", "stranger", false, false)]
+    [InlineData("Development", "PublicHost=not-an-ip;BindAddress=127.0.0.1", "stranger", false, false)]
+    [InlineData("Development", "PublicHost=192.0.2.10;BindAddress=127.0.0.1;GmOpenWhenEmpty=true", "stranger", true, false)]
+    [InlineData("Development", "BindAddress=0.0.0.0", "stranger", false, false)]
+    [InlineData("Development", "Panel:BindAddress=0.0.0.0", "stranger", false, false)]
+    [InlineData("Development", "Panel:PublicUrl=https://panel.example.com", "stranger", false, false)]
+    [InlineData("Development", "Panel:TrustedProxies:0=127.0.0.1", "stranger", false, false)]
+    [InlineData("Development", "BindAddress=not-an-ip", "stranger", false, false)]          // a typo never opens
+    [InlineData("Development", "BindAddress=::1", "stranger", true, true)]
+    [InlineData("Development", "PublicHost=192.0.2.10;GmOpenWhenEmpty=true", "stranger", true, false)]
+    [InlineData("Development", "GmOpenWhenEmpty=false", "stranger", false, false)]
+    [InlineData("Production", "PublicHost=192.0.2.10;GmAccounts:0=boss", "boss", true, true)]
+    [InlineData("Production", "PublicHost=192.0.2.10;GmAccounts:0=boss", "stranger", false, false)]
+    [InlineData("Development", "GmAccounts:0=boss", "stranger", false, false)]
+    public void AnEmptyListIsOpenOnlyOnALocalServer(string environment, string settings, string account, bool inGame,
+        bool panelAdmin)
+    {
+        string[] args = ["--environment", environment,
+            .. settings.Split(';', StringSplitOptions.RemoveEmptyEntries).Select(s => "--Ro3Emu:" + s)];
+        var options = ServerHost.ResolveOptions(args);
+        Assert.Equal(inGame, GmCommands.Allowed(options, account, loopbackTool: false));
+        Assert.Equal(panelAdmin, Ro3Emu.Server.Accounts.StaffRoles.GmAdmin(options, account));
+    }
+
     [Fact]
     public async Task InProductionAnEmptyListRefusesChatGmButTheLoopbackToolStillRuns()
     {
@@ -76,9 +113,58 @@ public sealed class GmAccessTests
             Assert.EndsWith(":0", GeneralGMProcRsp.Parser.ParseFrom((await alice.Inbox.WaitAsync(e => e.IsGame(GmCommands.GeneralProcGm), Wait)).Body).ErrInfo);
 
             using var client = new HttpClient();
-            var response = await client.PostAsync($"{http}/ro3emu/gm?account=alice", new StringContent("!where"));
+            var response = await client.PostAsync($"{http}/ro3emu/gm?account=alice", Operator.Command("!where"));
             response.EnsureSuccessStatusCode();
             Assert.Contains("Scene", await Marquee(alice, "Scene"));
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            try { Directory.Delete(dataDir, true); } catch (IOException) { }
+        }
+    }
+
+    [Fact]
+    public async Task AGmLoggingInWithOtherCapitalsGetsItsTypedSpellingBack()
+    {
+        // The client shows its GM button only when the role's account equals the typed login, compared case-sensitively.
+        var dataDir = Path.Combine(Path.GetTempPath(), "ro3emu-gmcase-" + Guid.NewGuid().ToString("N"));
+        var (httpPort, microPort, gamePort) = TestPorts.FreePorts();
+        var app = ServerHost.Create([], o =>
+        {
+            o.DataDir = dataDir;
+            o.GameDataDir = Path.Combine(RepoRoot(), "data");
+            o.HttpPort = httpPort;
+            o.MicroGatePort = microPort;
+            o.GameGatePort = gamePort;
+            o.GmAccounts = ["Beansprout"];
+            o.GmOpenWhenEmpty = false;
+        });
+        await app.StartAsync();
+        try
+        {
+            string http = $"http://127.0.0.1:{httpPort}";
+            string pem = File.ReadAllText(Path.Combine(dataDir, "gate_rsa_public.pem"));
+            await using (var first = new BotClient(http, pem))
+            {
+                await first.LoginAsync("Beansprout", "pw");
+                await first.EnterGateAsync();
+                await first.CreateRoleAsync("Sprout");
+            }
+
+            await using var bean = new BotClient(http, pem);
+            await bean.LoginAsync("beansprout", "pw");
+            Assert.Equal("beansprout", Assert.Single(bean.Roles).Account);
+            await bean.EnterGateAsync();
+            await bean.EnterWorldAsync(bean.Roles[0].Id);
+            var select = bean.Inbox.Snapshot().Last(e => e.IsGame(MsgId.LoginRoleSelect));
+            var basic = AccountLoginSelectRoleResp.Parser.ParseFrom(select.Body).RoleAssets.BasicInfo;
+            Assert.Equal("beansprout", basic.Account);
+
+            await bean.SendGameAsync(GmCommands.GeneralProcGm, new GeneralGMProcReq { ParamString = "ro3-gm-panel-capability-v1:1" });
+            Assert.EndsWith(":1", GeneralGMProcRsp.Parser.ParseFrom((await bean.Inbox.WaitAsync(e => e.IsGame(GmCommands.GeneralProcGm), Wait)).Body).ErrInfo);
         }
         finally
         {

@@ -58,6 +58,7 @@ public static class EconomyLedgerReader
         var eventIntents = new Dictionary<string, EventEconomyMutation>(StringComparer.Ordinal);
         var eventOwnerAmounts = new Dictionary<(string Operation, EconomyOwner Owner, EconomyAsset Asset), BigInteger>();
         var commands = new Dictionary<string, string>(StringComparer.Ordinal);
+        var compactedOps = new HashSet<string>(StringComparer.Ordinal);
         bool obligationSchemaChecked = false;
         var e05Intent = new Dictionary<(string Operation, EconomyAsset Asset, EconomyOwner Owner,
             EconomyCompartment Compartment, EconomyLegKind Kind, EconomyReason Reason), BigInteger>();
@@ -108,6 +109,10 @@ public static class EconomyLedgerReader
                     bool family = EconomyMutation.IsFamilyKind(commandKind) || EconomyMutation.IsProgressionKind(commandKind);
                     bool economic = Economic(commandKind);
                     bool escrow = EscrowEconomyIntent.IsKind(commandKind);
+                    // ReceiptRetention dropped this receipt's payload and outcome: its sequence, legs and source claim
+                    // are still certified below; the intent checks that need those bytes are not possible any more.
+                    bool compacted = ReceiptBlobs.IsCompacted((byte[])row.GetValue(15));
+                    if (compacted) compactedOps.Add(op);
                     if (row.GetString(4) != storedRealm || !allReceipts.TryAdd(seq, (op, count, source, row.GetInt64(6), commandKind)))
                         issues.Add(new(EconomyIssueKind.Corruption, "receipt/" + seq, "Duplicate or foreign realm receipt."));
                     if (string.IsNullOrWhiteSpace(op) || string.IsNullOrWhiteSpace(source) ||
@@ -115,121 +120,124 @@ public static class EconomyLedgerReader
                         (isEvent || escrow ? row.GetInt64(6) < 0 : row.GetInt64(6) <= 0) ||
                         string.IsNullOrWhiteSpace(commandKind) || string.IsNullOrWhiteSpace(row.GetString(8)) ||
                         row.GetString(9).Length != 64 || count < (commandKind == "npc-shop-buy" || isEvent ? 1 : 0) ||
-                        (economic || isEvent || escrow) && ((byte[])row.GetValue(10)).Length == 0)
+                        !compacted && (economic || isEvent || escrow) && ((byte[])row.GetValue(10)).Length == 0)
                         issues.Add(new(EconomyIssueKind.Corruption, "receipt/" + op, "Incomplete committed actor, intent, result or leg count."));
                     commands[op] = commandKind;
                     EconomyRewardEvidence? rewardEvidence = null;
                     long? beforeProgressRevision = null, afterProgressRevision = null;
-                    try
+                    if (!compacted)
                     {
-                        object?[] typedChildren = escrow
-                            ? EscrowEconomyReceiptCodec.Decode((byte[])row.GetValue(11))
-                            : EconomyTransactionPlan.DecodeChildReceipts((byte[])row.GetValue(11));
-                        if (isEvent)
+                        try
                         {
-                            if (typedChildren.Length == 0) throw new InvalidDataException("Event has no typed children.");
-                            EventEconomyEvidence.ValidateRevisions(row.GetString(12), row.GetString(13), row.GetInt64(6));
-                            var intent = EventEconomyEvidence.ReadIntent(catalog, (byte[])row.GetValue(15), row.GetString(9),
-                                op, row.GetString(5), row.GetInt64(6), row.GetString(7), row.GetString(8), source,
-                                row.GetInt64(14), (byte[])row.GetValue(10));
-                            eventIntents.Add(op, intent);
-                            foreach (var quantity in intent.Costs)
-                                intentAmounts[(op, quantity.Asset, true)] = intentAmounts.GetValueOrDefault((op, quantity.Asset, true)) + quantity.Quantity;
-                            foreach (var quantity in intent.Goods)
-                                intentAmounts[(op, quantity.Asset, false)] = intentAmounts.GetValueOrDefault((op, quantity.Asset, false)) + quantity.Quantity;
-                        }
-                        else if (escrow)
-                        {
-                            if (!((byte[])row.GetValue(10)).AsSpan().SequenceEqual((byte[])row.GetValue(11)))
-                                throw new InvalidDataException("E03 outcome differs from typed children.");
-                            var staged = ValidateEscrowIntentPayload((byte[])row.GetValue(15), row.GetString(9),
-                                op, row.GetString(5), row.GetInt64(6), commandKind, row.GetString(8), source, row.GetInt64(14));
-                            ValidateEscrowRevisions(row.GetString(12), row.GetString(13),
-                                staged.ChildRoleWrites, typedChildren);
-                            escrowTransfers.Add(op, staged.TransferReason);
-                            escrowAuthorizations.Add(op, staged.Changes);
-                            escrowRealizations.Add(op, staged.Realizations);
-                            foreach (var change in staged.Changes)
+                            object?[] typedChildren = escrow
+                                ? EscrowEconomyReceiptCodec.Decode((byte[])row.GetValue(11))
+                                : EconomyTransactionPlan.DecodeChildReceipts((byte[])row.GetValue(11));
+                            if (isEvent)
                             {
-                                var key = (op, change.Asset, change.Kind == EconomyLegKind.Sink, change.Reason);
-                                escrowReasons[key] = escrowReasons.GetValueOrDefault(key) + change.Quantity;
+                                if (typedChildren.Length == 0) throw new InvalidDataException("Event has no typed children.");
+                                EventEconomyEvidence.ValidateRevisions(row.GetString(12), row.GetString(13), row.GetInt64(6));
+                                var intent = EventEconomyEvidence.ReadIntent(catalog, (byte[])row.GetValue(15), row.GetString(9),
+                                    op, row.GetString(5), row.GetInt64(6), row.GetString(7), row.GetString(8), source,
+                                    row.GetInt64(14), (byte[])row.GetValue(10));
+                                eventIntents.Add(op, intent);
+                                foreach (var quantity in intent.Costs)
+                                    intentAmounts[(op, quantity.Asset, true)] = intentAmounts.GetValueOrDefault((op, quantity.Asset, true)) + quantity.Quantity;
+                                foreach (var quantity in intent.Goods)
+                                    intentAmounts[(op, quantity.Asset, false)] = intentAmounts.GetValueOrDefault((op, quantity.Asset, false)) + quantity.Quantity;
+                            }
+                            else if (escrow)
+                            {
+                                if (!((byte[])row.GetValue(10)).AsSpan().SequenceEqual((byte[])row.GetValue(11)))
+                                    throw new InvalidDataException("E03 outcome differs from typed children.");
+                                var staged = ValidateEscrowIntentPayload((byte[])row.GetValue(15), row.GetString(9),
+                                    op, row.GetString(5), row.GetInt64(6), commandKind, row.GetString(8), source, row.GetInt64(14));
+                                ValidateEscrowRevisions(row.GetString(12), row.GetString(13),
+                                    staged.ChildRoleWrites, typedChildren);
+                                escrowTransfers.Add(op, staged.TransferReason);
+                                escrowAuthorizations.Add(op, staged.Changes);
+                                escrowRealizations.Add(op, staged.Realizations);
+                                foreach (var change in staged.Changes)
+                                {
+                                    var key = (op, change.Asset, change.Kind == EconomyLegKind.Sink, change.Reason);
+                                    escrowReasons[key] = escrowReasons.GetValueOrDefault(key) + change.Quantity;
+                                }
+                            }
+                            else if (!economic)
+                            {
+                                if (typedChildren.Length == 0) throw new InvalidDataException("E05d receipt has no typed children.");
+                                ValidateEnvelopeRevisions(row.GetString(12), row.GetString(13));
+                                var effects = ValidateEnvelopeIntent((byte[])row.GetValue(15), row.GetString(9),
+                                    op, row.GetString(5), row.GetInt64(6), commandKind, row.GetString(8), source,
+                                    row.GetInt64(14), (byte[])row.GetValue(10), typedChildren);
+                                foreach (var effect in effects)
+                                {
+                                    var key = (op, effect.Asset, effect.Owner, effect.Compartment, effect.Kind, effect.Reason);
+                                    e05Intent[key] = e05Intent.GetValueOrDefault(key) + effect.Delta;
+                                }
+                                foreach (var edge in effects.Where(x => x.Kind == EconomyLegKind.Transfer).GroupBy(x => x.EdgeNumber))
+                                {
+                                    var pair = edge.ToArray();
+                                    if (edge.Key <= 0 || pair.Length != 2 ||
+                                        pair.Count(x => x.Delta < 0) != 1 || pair.Count(x => x.Delta > 0) != 1)
+                                        throw new InvalidDataException("E05d transfer intent lacks one exact counterparty.");
+                                    var debit = pair.Single(x => x.Delta < 0);
+                                    var credit = pair.Single(x => x.Delta > 0);
+                                    var key = (op, debit.Asset, debit.Owner, debit.Compartment, debit.Reason,
+                                        credit.Owner, credit.Compartment, credit.Reason);
+                                    e05IntentEdges[key] = e05IntentEdges.GetValueOrDefault(key) - debit.Delta;
+                                }
+                            }
+                            else if (commandKind == "dungeon-obligation-earn")
+                            {
+                                if (typedChildren.Length != 0) throw new InvalidDataException("Earned obligation has child results.");
+                            }
+                            else if (family)
+                            {
+                                if (typedChildren.Length is < 1 or > 32 || typedChildren[0] is not long[] familyIds ||
+                                    familyIds.Any(id => id <= 0) || familyIds.Distinct().Count() != familyIds.Length ||
+                                    typedChildren.Skip(1).Any(value => value is not int number || number != 1))
+                                    throw new InvalidDataException("Family typed child result shape is invalid.");
+                            }
+                            else if (commandKind == "cd13e/daily-reset")
+                            {
+                                EconomyTransactionPlan.ValidateChildReceipts(typedChildren, -1, commandKind);
+                            }
+                            else
+                            {
+                                if (typedChildren.Length < 2 || typedChildren[0] is not long[] ids)
+                                    throw new InvalidDataException("Economic typed child result shape is invalid.");
+                                EconomyTransactionPlan.ValidateChildReceipts(typedChildren, ids.Length, commandKind);
+                            }
+                            if (economic)
+                            {
+                                (beforeProgressRevision, afterProgressRevision) = ValidateRevisions(row.GetString(12), row.GetString(13),
+                                    row.GetInt64(6), commandKind, typedChildren);
+                                var parsed = ValidateIntentPayload((byte[])row.GetValue(15), row.GetString(9),
+                                    op, row.GetString(5), row.GetInt64(6), commandKind, row.GetString(8), source,
+                                    row.GetInt64(14), (byte[])row.GetValue(10));
+                                bool dungeonReceipt = commandKind is "dungeon-reward" or "dungeon-obligation-earn";
+                                if (dungeonReceipt && !obligationSchemaChecked)
+                                {
+                                    RequireObligationSchema(db, tx);
+                                    obligationSchemaChecked = true;
+                                }
+                                if (commandKind == "dungeon-reward")
+                                    ValidateDungeonObligation(db, tx, source, row.GetInt64(6), parsed);
+                                if (commandKind == "dungeon-obligation-earn")
+                                    ValidateEarnedObligation(db, tx, source, row.GetInt64(6), seq, throughInclusive, parsed,
+                                        (byte[])row.GetValue(15), (byte[])row.GetValue(10));
+                                rewardEvidence = parsed.RewardEvidence;
+                                foreach (var amount in parsed.Amounts)
+                                {
+                                    var amountKey = (op, amount.Asset, amount.Cost);
+                                    intentAmounts[amountKey] = intentAmounts.GetValueOrDefault(amountKey) + amount.Amount;
+                                }
                             }
                         }
-                        else if (!economic)
+                        catch (Exception error) when (error is InvalidDataException or JsonException or EndOfStreamException or KeyNotFoundException or OverflowException or FormatException or ArgumentException or InvalidOperationException)
                         {
-                            if (typedChildren.Length == 0) throw new InvalidDataException("E05d receipt has no typed children.");
-                            ValidateEnvelopeRevisions(row.GetString(12), row.GetString(13));
-                            var effects = ValidateEnvelopeIntent((byte[])row.GetValue(15), row.GetString(9),
-                                op, row.GetString(5), row.GetInt64(6), commandKind, row.GetString(8), source,
-                                row.GetInt64(14), (byte[])row.GetValue(10), typedChildren);
-                            foreach (var effect in effects)
-                            {
-                                var key = (op, effect.Asset, effect.Owner, effect.Compartment, effect.Kind, effect.Reason);
-                                e05Intent[key] = e05Intent.GetValueOrDefault(key) + effect.Delta;
-                            }
-                            foreach (var edge in effects.Where(x => x.Kind == EconomyLegKind.Transfer).GroupBy(x => x.EdgeNumber))
-                            {
-                                var pair = edge.ToArray();
-                                if (edge.Key <= 0 || pair.Length != 2 ||
-                                    pair.Count(x => x.Delta < 0) != 1 || pair.Count(x => x.Delta > 0) != 1)
-                                    throw new InvalidDataException("E05d transfer intent lacks one exact counterparty.");
-                                var debit = pair.Single(x => x.Delta < 0);
-                                var credit = pair.Single(x => x.Delta > 0);
-                                var key = (op, debit.Asset, debit.Owner, debit.Compartment, debit.Reason,
-                                    credit.Owner, credit.Compartment, credit.Reason);
-                                e05IntentEdges[key] = e05IntentEdges.GetValueOrDefault(key) - debit.Delta;
-                            }
+                            issues.Add(new(EconomyIssueKind.Corruption, "receipt/" + op, "Invalid typed child result or revision evidence: " + error.Message));
                         }
-                        else if (commandKind == "dungeon-obligation-earn")
-                        {
-                            if (typedChildren.Length != 0) throw new InvalidDataException("Earned obligation has child results.");
-                        }
-                        else if (family)
-                        {
-                            if (typedChildren.Length is < 1 or > 32 || typedChildren[0] is not long[] familyIds ||
-                                familyIds.Any(id => id <= 0) || familyIds.Distinct().Count() != familyIds.Length ||
-                                typedChildren.Skip(1).Any(value => value is not int number || number != 1))
-                                throw new InvalidDataException("Family typed child result shape is invalid.");
-                        }
-                        else if (commandKind == "cd13e/daily-reset")
-                        {
-                            EconomyTransactionPlan.ValidateChildReceipts(typedChildren, -1, commandKind);
-                        }
-                        else
-                        {
-                            if (typedChildren.Length < 2 || typedChildren[0] is not long[] ids)
-                                throw new InvalidDataException("Economic typed child result shape is invalid.");
-                            EconomyTransactionPlan.ValidateChildReceipts(typedChildren, ids.Length, commandKind);
-                        }
-                        if (economic)
-                        {
-                            (beforeProgressRevision, afterProgressRevision) = ValidateRevisions(row.GetString(12), row.GetString(13),
-                                row.GetInt64(6), commandKind, typedChildren);
-                            var parsed = ValidateIntentPayload((byte[])row.GetValue(15), row.GetString(9),
-                                op, row.GetString(5), row.GetInt64(6), commandKind, row.GetString(8), source,
-                                row.GetInt64(14), (byte[])row.GetValue(10));
-                            bool dungeonReceipt = commandKind is "dungeon-reward" or "dungeon-obligation-earn";
-                            if (dungeonReceipt && !obligationSchemaChecked)
-                            {
-                                RequireObligationSchema(db, tx);
-                                obligationSchemaChecked = true;
-                            }
-                            if (commandKind == "dungeon-reward")
-                                ValidateDungeonObligation(db, tx, source, row.GetInt64(6), parsed);
-                            if (commandKind == "dungeon-obligation-earn")
-                                ValidateEarnedObligation(db, tx, source, row.GetInt64(6), seq, throughInclusive, parsed,
-                                    (byte[])row.GetValue(15), (byte[])row.GetValue(10));
-                            rewardEvidence = parsed.RewardEvidence;
-                            foreach (var amount in parsed.Amounts)
-                            {
-                                var amountKey = (op, amount.Asset, amount.Cost);
-                                intentAmounts[amountKey] = intentAmounts.GetValueOrDefault(amountKey) + amount.Amount;
-                            }
-                        }
-                    }
-                    catch (Exception error) when (error is InvalidDataException or JsonException or EndOfStreamException or KeyNotFoundException or OverflowException or FormatException or ArgumentException or InvalidOperationException)
-                    {
-                        issues.Add(new(EconomyIssueKind.Corruption, "receipt/" + op, "Invalid typed child result or revision evidence: " + error.Message));
                     }
                     if (seq > fromExclusive) receipts.Add(new EconomyReceipt(seq, op, count, [source])
                     {
@@ -333,6 +341,9 @@ public static class EconomyLedgerReader
                     }
                     if (leg.Kind == EconomyLegKind.Transfer) allTransferLegs.Add(leg);
                     if (seq > fromExclusive) legs.Add(leg);
+                    // A compacted receipt's legs still count, pair and link to their receipt (checked above and below);
+                    // their reasons and amounts were certified against the intent before it was compacted.
+                    if (compactedOps.Contains(op)) continue;
                     commands.TryGetValue(op, out string? command);
                     bool economic = Economic(command ?? "");
                     bool escrow = EscrowEconomyIntent.IsKind(command ?? "");
@@ -429,6 +440,7 @@ public static class EconomyLedgerReader
                         {
                             "monster-kill" when leg.Kind == EconomyLegKind.Source => EconomyReason.MonsterDrop,
                             "gather-yield" when leg.Kind == EconomyLegKind.Source => EconomyReason.GatherYield,
+                            "gather-yield" when leg.Kind == EconomyLegKind.Sink => EconomyReason.LifeCost,
                             "tower-reward" when leg.Kind == EconomyLegKind.Source => EconomyReason.ActivityReward,
                             "dungeon-obligation-earn" when leg.Kind == EconomyLegKind.Source => EconomyReason.ActivityReward,
                             "dungeon-reward" when leg.Kind == EconomyLegKind.Transfer => EconomyReason.DungeonRewardDelivery,
@@ -581,7 +593,7 @@ public static class EconomyLedgerReader
             }
             foreach (var receipt in receipts)
             {
-                int[] numbers = legs.Where(x => x.OperationId == receipt.OperationId).Select(x => x.LegNumber).Order().ToArray();
+                int[] numbers = [.. legs.Where(x => x.OperationId == receipt.OperationId).Select(x => x.LegNumber).Order()];
                 if (numbers.Length != receipt.LegCount || !numbers.SequenceEqual(Enumerable.Range(0, numbers.Length)))
                     issues.Add(new(EconomyIssueKind.Corruption, "receipt/" + receipt.OperationId, "Leg count or numbering is incomplete."));
             }
@@ -625,7 +637,8 @@ public static class EconomyLedgerReader
         tx.Commit();
         bool complete = issues.Count == 0;
         return new(storedRealm, catalog.Version, EconomySnapshotReader.CoverageVersion, fromExclusive, throughInclusive, complete,
-            legs, receipts, prior, issues, EconomySnapshotReader.UncoveredFamilies);
+            legs, receipts, prior, issues, EconomySnapshotReader.UncoveredFamilies)
+        { CompactedReceipts = compactedOps.Count };
     }
 
     private static bool MatchEscrowExternal(IReadOnlyList<EscrowExternalChange> authorizations,
@@ -711,7 +724,7 @@ public static class EconomyLedgerReader
             internal int Target = target, Reverse = reverse;
             internal long Capacity = capacity;
         }
-        private readonly List<Edge>[] _graph = Enumerable.Range(0, nodes).Select(_ => new List<Edge>()).ToArray();
+        private readonly List<Edge>[] _graph = [.. Enumerable.Range(0, nodes).Select(_ => new List<Edge>())];
 
         internal void Add(int from, int to, long capacity)
         {
@@ -791,7 +804,7 @@ public static class EconomyLedgerReader
             .ToDictionary(group => group.Key.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 group => group.Select(x => x.Part).ToHashSet(StringComparer.Ordinal), StringComparer.Ordinal);
         var mutated = childRoleWrites.SelectMany((parts, index) =>
-            childReceipts[index] is false or 0 or 0L ? Array.Empty<EscrowRolePart>() : parts).ToHashSet();
+            childReceipts[index] is false or 0 or 0L ? [] : parts).ToHashSet();
         using var before = JsonDocument.Parse(beforeJson);
         using var after = JsonDocument.Parse(afterJson);
         var prior = before.RootElement.EnumerateObject().ToDictionary(x => x.Name, x => x.Value);
@@ -936,8 +949,10 @@ public static class EconomyLedgerReader
             "cd13e/daily-reset" => [.. required, "wild_afk"],
             "gather-yield" => [.. required, "library", "task_followup"],
             "dungeon-reward" => [.. required, "auction_order", "library", "task_followup"],
+            // The Job EXP catch-up commits its marker with its EXP (CharacterService.JobExpCatchUp).
+            "cd13e/grant" => [.. required, "daily", "library", "task_followup", "activity_runtime", "mounts", "job_exp_catchup"],
             "cd13e/tower-milestone" or "cd13e/quest-award" or "cd13e/achievement-award" or "cd13e/advguild-award" or "cd13e/monsterhunt-award" or "cd13e/guild-award" or "cd13e/growthclass-award" or "cd13e/library-award" or "cd13e/firstheart-award" or "cd13e/daily-stage" or
-            "cd13e/grant" or "cd13e/gm-grant" or "cd13e/character-exp" or
+            "cd13e/gm-grant" or "cd13e/character-exp" or
                 "cd13e/journey-victory" => [.. required, "daily", "library", "task_followup", "activity_runtime", "mounts"],
             _ => required
         };
@@ -969,7 +984,7 @@ public static class EconomyLedgerReader
         if (commandKind == "monster-kill")
         {
             long[] credited = creditedKill ? (long[])childReceipts[^1]! : [];
-            long[] others = credited.Where(role => role != actorRole).ToArray();
+            long[] others = [.. credited.Where(role => role != actorRole)];
             var beforeParticipants = b.TryGetProperty("participants", out var bp)
                 ? bp.EnumerateArray().ToArray() : [];
             var afterParticipants = a.TryGetProperty("participants", out var ap)
@@ -1053,6 +1068,12 @@ public static class EconomyLedgerReader
         }
     }
 
+    /// <summary>Intent v1 embeds the outcome in base64 (<c>Outcome</c>); v2 binds it by its SHA-256 (<c>OutcomeHash</c>).</summary>
+    private static bool IntentOutcomeMatches(JsonElement root, byte[] outcome) =>
+        root.TryGetProperty("Outcome", out var embedded)
+            ? Convert.FromBase64String(embedded.GetString() ?? "").AsSpan().SequenceEqual(outcome)
+            : root.TryGetProperty("OutcomeHash", out var hash) && hash.GetString() == Convert.ToHexString(SHA256.HashData(outcome));
+
     private static IReadOnlyList<EconomyEffect> ValidateEnvelopeIntent(byte[] payload, string hash,
         string operation, string account, long role, string command, string fingerprint, string source,
         long effective, byte[] outcome, object?[] typedChildren)
@@ -1068,7 +1089,7 @@ public static class EconomyLedgerReader
             root.GetProperty("RequestFingerprint").GetString() != fingerprint ||
             root.GetProperty("SourceKey").GetString() != source ||
             root.GetProperty("EffectiveUtcMs").GetInt64() != effective ||
-            !Convert.FromBase64String(root.GetProperty("Outcome").GetString() ?? "").AsSpan().SequenceEqual(outcome))
+            !IntentOutcomeMatches(root, outcome))
             throw new InvalidDataException("E05d canonical intent differs from receipt fields.");
         var effects = root.GetProperty("Effects").Deserialize<EconomyEffect[]>() ??
             throw new InvalidDataException("E05d semantic effects are absent.");
@@ -1082,7 +1103,8 @@ public static class EconomyLedgerReader
                 throw new InvalidDataException("E05d typed child intent is malformed.");
         var rebuilt = new EconomyEnvelope(operation, account, role, command, fingerprint, source, effective,
             effects, outcome).BindChildIntent(childIntent);
-        if (!rebuilt.IntentPayload.AsSpan().SequenceEqual(payload))
+        byte[] canonical = root.TryGetProperty("Outcome", out _) ? rebuilt.LegacyIntent().Payload : rebuilt.IntentPayload;
+        if (!canonical.AsSpan().SequenceEqual(payload))
             throw new InvalidDataException("E05d canonical semantic effects were altered.");
         const string alias = "auction-source:";
         if (!effects.Any(x => x.Owner.Kind == EconomyOwnerKind.Escrow &&
@@ -1115,7 +1137,7 @@ public static class EconomyLedgerReader
                     throw new InvalidDataException("E05d auction lot receipt identity is invalid.");
             }
         }
-        return effects.Select(effect =>
+        return [.. effects.Select(effect =>
         {
             if (effect.Owner.Kind != EconomyOwnerKind.Escrow ||
                 !effect.Owner.Id.StartsWith(alias, StringComparison.Ordinal)) return effect;
@@ -1130,7 +1152,7 @@ public static class EconomyLedgerReader
                 Owner = new EconomyOwner(EconomyOwnerKind.Escrow,
                 "auction:" + lot.Id.ToString(System.Globalization.CultureInfo.InvariantCulture))
             };
-        }).ToArray();
+        })];
 
         static bool IsLotSource(string lotSource, string batchSource)
         {
@@ -1161,7 +1183,7 @@ public static class EconomyLedgerReader
             root.GetProperty("RequestFingerprint").GetString() != fingerprint ||
             root.GetProperty("SourceKey").GetString() != source ||
             root.GetProperty("EffectiveUtcMs").GetInt64() != effective ||
-            !Convert.FromBase64String(root.GetProperty("Outcome").GetString() ?? "").AsSpan().SequenceEqual(outcome))
+            !IntentOutcomeMatches(root, outcome))
             throw new InvalidDataException("Canonical intent differs from committed receipt fields or outcome.");
         if (EconomyMutation.IsProgressionKind(command) &&
             (!root.TryGetProperty("PlanFingerprint", out var planHash) || planHash.GetString() is not { Length: 64 } hashValue ||
@@ -1194,8 +1216,12 @@ public static class EconomyLedgerReader
                 command != "world-revive" && !EconomyMutation.IsOwnedExchangeCommand(command) && costs.Length != 0)
                 throw new InvalidDataException("Reward command has unsupported cost or goods amounts.");
         }
-        return new(costs.Select(q => (q.Asset, Cost: true, Amount: (BigInteger)q.Quantity))
-            .Concat(goods.Select(q => (q.Asset, Cost: false, Amount: (BigInteger)q.Quantity))).ToArray(), evidence);
+        return new(
+        [
+            .. costs.Select(q => (q.Asset, Cost: true, Amount: (BigInteger)q.Quantity))
+,
+            .. goods.Select(q => (q.Asset, Cost: false, Amount: (BigInteger)q.Quantity)),
+        ], evidence);
     }
 
     /// <summary>Receipts of an EconomyMutation (E01 NPC, cd13a/cd13b families, E04 rewards and obligations, 13e

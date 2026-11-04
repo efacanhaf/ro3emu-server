@@ -23,6 +23,15 @@ public sealed class ClientInstaller(PublisherConfig config, HttpClient http, str
 
     public int MaxAttempts { get; set; } = 8;
 
+    /// <summary>
+    /// How many parts of a package are fetched at once. One connection to a distant mirror is often limited by latency
+    /// rather than bandwidth, and several of them add up. The parts are written to the file in order, so the file is
+    /// always a whole prefix of the package and a resume works as with one connection. 1 = a single connection.
+    /// </summary>
+    public int Connections { get; set; } = 1;
+
+    public int ChunkBytes { get; set; } = 8 << 20;
+
     public Func<int, TimeSpan> Backoff { get; set; } = attempt => TimeSpan.FromSeconds(Math.Min(30, 1 << Math.Min(attempt, 5)));
 
     public sealed record Manifests(ReleaseManifest Full, ReleaseManifest? Delta, string Origin);
@@ -72,8 +81,10 @@ public sealed class ClientInstaller(PublisherConfig config, HttpClient http, str
             }
         }
         if (last is InstallException install) throw install;
-        throw new InstallException("The publisher's download servers could not be reached.",
-            "Check the internet connection and try again. If the servers moved, a newer RO3Emu (or RO3Emu.download.json) has the new addresses.");
+        throw new InstallException("Genesis' download servers could not be reached.",
+            "Check the internet connection and try again. Some internet providers block Genesis' mirror: connecting through "
+            + "Cloudflare WARP (or another VPN) helps, or install the game with the Genesis launcher and pick its folder instead. "
+            + "If the servers moved, a newer RO3Emu (or RO3Emu.download.json) has the new addresses.");
     }
 
     private async Task<byte[]> GetBytesAsync(string url, CancellationToken ct)
@@ -121,14 +132,14 @@ public sealed class ClientInstaller(PublisherConfig config, HttpClient http, str
         foreach (var t in missing.OrderBy(t => sources.TryGetValue((t.Path, t.Sha256), out var s) ? s.Count : 0).ThenBy(t => t.Path, StringComparer.Ordinal))
         {
             if (!sources.TryGetValue((t.Path, t.Sha256), out var candidates) || candidates.Count == 0)
-                throw new InstallException($"The publisher's release has no package for {t.Path}.", "Try again later.");
+                throw new InstallException($"Genesis' release has no package for {t.Path}.", "Try again later.");
             var package = candidates.FirstOrDefault(c => chosen.ContainsKey(c.Id)) ?? candidates[0];
             chosen.TryAdd(package.Id, package);
             needs.Add(new Need(t, package));
         }
         var order = manifests.Full.Packages.Concat(manifests.Delta?.Packages ?? []).Select(p => p.Id).Distinct().ToList();
         return new Plan(needs, targets.Count - missing.Count, keptPatched, missing.Sum(t => t.Length),
-            chosen.Values.OrderBy(p => order.IndexOf(p.Id)).ToList());
+            [.. chosen.Values.OrderBy(p => order.IndexOf(p.Id))]);
     }
 
     private enum Present { No, Yes, Patched }
@@ -185,7 +196,7 @@ public sealed class ClientInstaller(PublisherConfig config, HttpClient http, str
         var part = final + ".part";
         if (File.Exists(final))
         {
-            if (new FileInfo(final).Length == package.Length && Sha256(final) == package.Sha256.ToLowerInvariant()) return final;
+            if (new FileInfo(final).Length == package.Length && string.Equals(Sha256(final), package.Sha256, StringComparison.OrdinalIgnoreCase)) return final;
             File.Delete(final);
         }
         var urls = config.PackageUrls(package.Url);
@@ -197,10 +208,20 @@ public sealed class ClientInstaller(PublisherConfig config, HttpClient http, str
             {
                 long have = File.Exists(part) ? new FileInfo(part).Length : 0;
                 if (have > package.Length) { File.Delete(part); have = 0; }
-                if (have < package.Length) await FetchRangeAsync(url, part, have, package.Length, progress, ct);
+                if (have < package.Length && Connections > 1 && package.Length - have > 2L * ChunkBytes)
+                {
+                    try { await FetchPartsAsync(url, part, have, package.Length, progress, ct); }
+                    catch (RangesNotServedException)
+                    {
+                        Log?.Invoke($"package {package.Id[..12]} from {url}: no ranges, using one connection");
+                        await FetchRangeAsync(url, part, new FileInfo(part).Length, package.Length, progress, ct);
+                    }
+                }
+                else if (have < package.Length)
+                    await FetchRangeAsync(url, part, have, package.Length, progress, ct);
                 progress?.Invoke(package.Length, package.Length);
                 Progress?.Invoke("Checking the download", 0, 0);
-                if (Sha256(part) == package.Sha256.ToLowerInvariant())
+                if (string.Equals(Sha256(part), package.Sha256, StringComparison.OrdinalIgnoreCase))
                 {
                     File.Move(part, final, overwrite: true);
                     return final;
@@ -219,6 +240,52 @@ public sealed class ClientInstaller(PublisherConfig config, HttpClient http, str
         }
         throw new InstallException($"A game package could not be downloaded ({last?.Message}).",
             "Check the internet connection and run the same command again: the download resumes where it stopped.");
+    }
+
+    /// <summary>The server answered a range with the whole file: it can still serve the package over one connection.</summary>
+    private sealed class RangesNotServedException() : Exception("the server does not serve ranges");
+
+    /// <summary>Fetches the rest of a package in <see cref="ChunkBytes"/> parts, <see cref="Connections"/> at a time, appended in order.</summary>
+    private async Task FetchPartsAsync(string url, string part, long have, long length, Action<long, long>? progress, CancellationToken ct)
+    {
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var running = new Queue<Task<byte[]>>();
+        long next = have, done = have;
+        try
+        {
+            await using var file = new FileStream(part, have > 0 ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20);
+            while (done < length)
+            {
+                while (running.Count < Connections && next < length)
+                {
+                    long end = Math.Min(next + ChunkBytes, length) - 1;
+                    running.Enqueue(FetchChunkAsync(url, next, end, stop.Token));
+                    next = end + 1;
+                }
+                var data = await running.Dequeue();
+                await file.WriteAsync(data, stop.Token);
+                done += data.Length;
+                progress?.Invoke(done, length);
+            }
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            foreach (var task in running) await Task.WhenAny(task); // observe the parts still running
+        }
+    }
+
+    private async Task<byte[]> FetchChunkAsync(string url, long from, long to, CancellationToken ct)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.Range = new RangeHeaderValue(from, to);
+        using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+        response.EnsureSuccessStatusCode();
+        if (response.StatusCode != HttpStatusCode.PartialContent) throw new RangesNotServedException();
+        var data = new byte[to - from + 1];
+        await using var body = await response.Content.ReadAsStreamAsync(ct);
+        await body.ReadExactlyAsync(data, ct);
+        return data;
     }
 
     private async Task FetchRangeAsync(string url, string part, long have, long length, Action<long, long>? progress, CancellationToken ct)
@@ -271,7 +338,7 @@ public sealed class ClientInstaller(PublisherConfig config, HttpClient http, str
                     output.Write(buffer, 0, read);
                     length += read;
                 }
-                if (length != f.Length || Convert.ToHexStringLower(hash.GetHashAndReset()) != f.Sha256.ToLowerInvariant())
+                if (length != f.Length || !string.Equals(Convert.ToHexStringLower(hash.GetHashAndReset()), f.Sha256, StringComparison.OrdinalIgnoreCase))
                 {
                     output.Dispose();
                     File.Delete(temp);

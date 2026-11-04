@@ -65,6 +65,48 @@ public sealed partial class NewActivityTests
         return sw.SceneID;
     }
 
+    private const long DummyChallengeQuest = 10200120;
+
+    // A dummy never dies, and every hit on it still reports 31129. The client's Statistics panel ignores them only by its
+    // own pause (LC_DunGeon_Pile.InitBattleInfo, until the challenge starts), which a server pause must not outlive.
+    [ClientDataFact]
+    public async Task EveryHitOnADummyReportsAndAPauseEndsWithItsScene()
+    {
+        var bot = await InWorld("DummyStats");
+        await Next(bot, TrainingService.Sync, DBTrainingGroundInfoIncrement.Parser);
+        await Gm(bot, "!lvl 99"); await Gm(bot, "!job 1100");
+        long role = (long)bot.Self!.Uuid;
+        async Task HitAndExpectReport(long instance)
+        {
+            var dummy = await Service<GameLoop>().InvokeAsync(() => Task.FromResult(Service<World>().AllUnits()
+                .OfType<MonsterUnit>().Single(m => m.InstanceId == instance)));
+            await OnLoop(() => { Session(bot).SkillCds.Clear(); return Task.CompletedTask; });
+            await bot.SendGameAsync(MsgId.Walk, new WalkReq { Pos = dummy.Pos, BStop = true, SpeedRate = 1 });
+            await bot.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1001001, TargetId = dummy.Uid });
+            Assert.Equal(0, (await Next(bot, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
+            var hit = await Next(bot, CombatService.SkillHit, SkillHitInfo.Parser, h => h.Dsts.Any(d => d.DstID == dummy.Uid && d.Damage > 0));
+            var report = await Next(bot, CombatService.DamageStatistics, DamageStatisticsNotify.Parser, n => n.Damages.Any(d => d.DamageTargetId == dummy.Uid && d.DamageValue > 0)); // a missed swing reports its 0 first
+            var entry = Assert.Single(report.Damages);
+            Assert.Equal(role, entry.DamageSourceId);
+            Assert.Equal(hit.Dsts.Single(d => d.DstID == dummy.Uid).Damage, entry.DamageValue);
+            Assert.False(dummy.Dead);
+            // A lethal hit is restored just after its report goes out.
+            for (var until = DateTime.UtcNow.AddSeconds(5); dummy.Hp != dummy.Template.MaxHp && DateTime.UtcNow < until;) await Task.Delay(10);
+            Assert.Equal(dummy.Template.MaxHp, dummy.Hp);
+            await bot.SendGameAsync(CombatService.SkillInterrupt, new NullArg());
+            await Task.Delay(600); // a swing cancelled by a move holds the next one (CombatService.CancelCastAsync)
+        }
+        await bot.SendGameAsync(DungeonService.Enter, new EnterDungeonReq { SceneEntry = 2100009 });
+        Assert.Equal(0, (await Next(bot, DungeonService.Enter, EnterDungeonRsp.Parser)).Result);
+        await HitAndExpectReport(await LoadPrivate(bot, 2100009));
+
+        await bot.SendGameAsync(CombatService.TrainingOperation, new BattleTrainingGroundOpReq { OpType = (BattleTrainingGroundOpType)1 });
+        Assert.Equal(0, (await Next(bot, CombatService.TrainingOperation, BattleTrainingGroundOpResp.Parser)).Result);
+        await bot.SendGameAsync(84061, new NullArg());
+        Assert.Equal(0, (await Next(bot, 84061, TrainingChallengeModeResp.Parser)).Result);
+        await HitAndExpectReport(await LoadPrivate(bot, 2100011));
+    }
+
     [ClientDataFact]
     public async Task TrainingMeasuresRealHitsAndRewardClaimsAreAtomicAndDurable()
     {
@@ -89,6 +131,9 @@ public sealed partial class NewActivityTests
         });
         await bot.SendGameAsync(84064, new TrainingUpdateWoodNpcAttrReq { Race = -1, Element = 4, BodyType = 1 });
         Assert.Equal(ErrorCodes.Parameter, (await Next(bot, 84064, TrainingUpdateWoodNpcAttrResp.Parser)).Result);
+        // Side quest 10200120 "Complete a Training Ground Dummy Challenge" [210006, 1]: practice does not count.
+        await QuestProbe.AcceptAsync(_app, _http, "training", DummyChallengeQuest);
+        Assert.Equal(0, (await QuestProbe.ReadAsync(_app, "training", DummyChallengeQuest))!.CompleteNum[0]);
         await bot.SendGameAsync(84061, new NullArg());
         Assert.Equal(0, (await Next(bot, 84061, TrainingChallengeModeResp.Parser)).Result);
         long challenge = await LoadPrivate(bot, 2100011);
@@ -102,7 +147,7 @@ public sealed partial class NewActivityTests
         await bot.SendGameAsync(84064, new TrainingUpdateWoodNpcAttrReq { Race = 3, Element = 4, BodyType = 1 });
         Assert.NotEqual(0, (await Next(bot, 84064, TrainingUpdateWoodNpcAttrResp.Parser)).Result);
         await bot.SendGameAsync(MsgId.Walk, new WalkReq { Pos = actor.Pos, BStop = true, SpeedRate = 1 });
-        await bot.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1100001, TargetId = actor.Uid });
+        await bot.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1001001, TargetId = actor.Uid });
         Assert.Equal(0, (await Next(bot, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
         await Next(bot, CombatService.SkillHit, SkillHitInfo.Parser, h => h.Dsts.Any(d => d.DstID == actor.Uid && d.Damage > 0));
         await bot.SendGameAsync(CombatService.SkillInterrupt, new NullArg());
@@ -114,6 +159,7 @@ public sealed partial class NewActivityTests
         Assert.True(result.Data.TrainingGroundData.SumDamage > 0);
         Assert.Equal(result.Data.TrainingGroundData.SumDamage / 60, result.Data.TrainingGroundData.MaxDps);
         Assert.False(actor.Dead);
+        Assert.Equal(1, (await QuestProbe.DoneAsync(_app, "training", DummyChallengeQuest)).CompleteNum[0]);
         // Seed the qualification threshold independently of hit strength; the RPC still validates and settles the claim.
         await OnLoop(() => { Session(bot).Training!.MaxDps = Math.Max(100, Session(bot).Training!.MaxDps); return Task.CompletedTask; });
         long moneyBefore = Session(bot).Progress!.Currency.GetValueOrDefault(1);
@@ -210,6 +256,23 @@ public sealed partial class NewActivityTests
     }
 
     [ClientDataFact]
+    public void FestivalBetPayoutFollowsTheKoiBetTierOfTheWinnerCount()
+    {
+        var festival = Service<FestivalService>();
+        var tiers = Ro3Emu.Server.Data.Config.KoiBetRewardConfig.All(Service<GameData>()).OrderBy(t => t.WinnerMin).ToList();
+        Assert.Equal(0, festival.BetAward(0));
+        foreach (var tier in tiers)
+        {
+            Assert.Equal(tier.AwardId, festival.BetAward((int)tier.WinnerMin));
+            if (tier.WinnerMax > 0) Assert.Equal(tier.AwardId, festival.BetAward((int)tier.WinnerMax));
+        }
+        Assert.Equal(tiers[^1].AwardId, festival.BetAward(1_000_000)); // the last tier has no upper bound
+        // The fewer the winners, the more each right bet pays.
+        long Zeny(long award) => Service<AwardService>().ResolveForProgress(new RoleProgress(), award, 101).Grants.Sum(g => (long)g.Count);
+        Assert.True(Zeny(festival.BetAward(1)) > Zeny(festival.BetAward(1_000_000)));
+    }
+
+    [ClientDataFact]
     public async Task FestivalUsesAuthoredAnswerZonesAndPaysEachEntitlementOnce()
     {
         var bot = await InWorld("Festival");
@@ -269,7 +332,10 @@ public sealed partial class NewActivityTests
             }
             Assert.True(arrived, "The authoritative player position did not reach the authored answer zone.");
             var plan = Service<AwardService>().Resolve(Session(bot), 85001, 101);
-            var item = plan.Grants.First();
+            var item = plan.Grants[0];
+            // The right bet pays the KoiBetRewardConfig tier of one winner, in the same currency.
+            var betItem = Service<AwardService>().Resolve(Session(bot), Service<FestivalService>().BetAward(1), 101).Grants[0];
+            Assert.Equal(item.Entry, betItem.Entry);
             long before = Service<CharacterService>().CountOf(Session(bot), item.Entry);
             _clock.SetLocal(2026, 10, 9, 18, 35, 1);
             await ReconcileFestival();
@@ -321,11 +387,11 @@ public sealed partial class NewActivityTests
             }
             finally { release.TrySetResult(); store.BeforeOwnedCommitForTest = null; }
             await Task.WhenAll(completion, retry).WaitAsync(TimeSpan.FromSeconds(10));
-            Assert.Equal(before + item.Count * 2, Service<CharacterService>().CountOf(Session(bot), item.Entry));
+            Assert.Equal(before + item.Count + betItem.Count, Service<CharacterService>().CountOf(Session(bot), item.Entry));
             Assert.Equal(2, CountRows(rewardCount));
             Assert.Equal(1, CountRows(completionCount, completionSource));
             await ReconcileFestival();
-            Assert.Equal(before + item.Count * 2, Service<CharacterService>().CountOf(Session(bot), item.Entry));
+            Assert.Equal(before + item.Count + betItem.Count, Service<CharacterService>().CountOf(Session(bot), item.Entry));
             Assert.Equal(1, CountRows(completionCount, completionSource));
             using (var db = Service<AccountStore>().Open())
             using (var cmd = db.CreateCommand())
@@ -338,14 +404,14 @@ public sealed partial class NewActivityTests
                 {
                     var grants = System.Text.Json.JsonSerializer.Deserialize<AwardGrant[]>((byte[])frozen.GetValue(0));
                     Assert.NotNull(grants);
-                    Assert.Contains(grants, grant => grant.Entry == item.Entry && grant.Count == item.Count);
+                    Assert.Contains(grants, grant => grant.Entry == item.Entry && (grant.Count == item.Count || grant.Count == betItem.Count));
                     rows++;
                 }
                 Assert.Equal(2, rows);
             }
             await bot.DisposeAsync(); await WaitOffline("festival");
             await using var again = await InWorld("Festival", false);
-            Assert.Equal(before + item.Count * 2, Service<CharacterService>().CountOf(Session(again), item.Entry));
+            Assert.Equal(before + item.Count + betItem.Count, Service<CharacterService>().CountOf(Session(again), item.Entry));
         }
         catch (Exception error)
         {
@@ -356,14 +422,15 @@ public sealed partial class NewActivityTests
     }
 
     [Fact]
-    public async Task CashOrdersAndClientPaymentReportsAreRefused()
+    public async Task UnknownCashOrdersAndForgedPaymentReportsAreRefused()
     {
+        // The shop is free (Ro3Emu:Shop:FreeProducts, PaidProductsTests), but only for the client's own products and orders.
         await using var bot = await InWorld("CashRefused");
         await bot.SendGameAsync(2001, new CreateOrderReq { ChargeType = 2, ChargeId = 199, Amount = 1 });
-        Assert.Equal(ErrorCodes.FeatureUnavailable, (await Next(bot, 2001, CreateOrderResp.Parser)).Result);
+        Assert.Equal(ErrorCodes.TopUpOption, (await Next(bot, 2001, CreateOrderResp.Parser)).Result);
         await bot.SendGameAsync(2002, new PayResultReq { OrderId = "client-forged" });
         var reply = await Next(bot, 2002, PayResultResp.Parser);
-        Assert.Equal(ErrorCodes.FeatureUnavailable, reply.Result); Assert.Equal("client-forged", reply.OrderId);
+        Assert.Equal(ErrorCodes.ShopGiftOrderMissing, reply.Result); Assert.Equal("client-forged", reply.OrderId);
     }
 
     private async Task WaitOffline(string account)

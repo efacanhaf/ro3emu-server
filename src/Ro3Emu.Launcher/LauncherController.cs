@@ -9,16 +9,16 @@ namespace Ro3Emu.Launcher;
 /// <summary>
 /// The launcher's logic behind the page: checks the channel, installs/updates/repairs the client with
 /// <see cref="Updater"/>, updates the launcher itself, pings the game server and starts ro3.exe.
-/// Messages to the page: state, progress, server, settings, news (see ui/app.js).
+/// Messages to the page: state, progress, server, settings, news, hero, notes, shortcuts, uninstall (see ui/app.js).
 /// </summary>
-public sealed class LauncherController : IDisposable
+public sealed partial class LauncherController : ILauncherController
 {
     readonly LauncherConfig _config;
     readonly string _exePath;
     readonly Action<object> _post;
     readonly Func<string, string?> _pickFolder;
-    readonly Action _minimize;
-    readonly UserSettings _settings = UserSettings.Load();
+    readonly Action<bool> _gameRunningChanged;
+    readonly UserSettings _settings;
     readonly RepositoryClient _repo;
     readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(5) };
     readonly string _version = typeof(LauncherController).Assembly.GetName().Version?.ToString(3) ?? "1.0.0";
@@ -28,41 +28,39 @@ public sealed class LauncherController : IDisposable
     LocalState? _installed;
     string _phase = "checking";
     CancellationTokenSource? _work;
+    Process? _game;
     bool _started;
 
-    public LauncherController(LauncherConfig config, string exePath, Action<object> post, Func<string, string?> pickFolder, Action minimize)
+    public LauncherController(LauncherConfig config, string exePath, Action<object> post, Func<string, string?> pickFolder, Action<bool> gameRunningChanged)
     {
         _config = config;
         _exePath = exePath;
         _post = post;
         _pickFolder = pickFolder;
-        _minimize = minimize;
-        _repo = new RepositoryClient(new Uri(config.Repository));
+        _gameRunningChanged = gameRunningChanged;
+        _settings = UserSettings.ForRepository(config.RepositoryUrl);
+        _repo = new RepositoryClient(new Uri(config.RepositoryUrl));
         _layout = new InstallLayout(_settings.ClientDirectory ?? Path.Combine(Path.GetDirectoryName(exePath)!, "Client"));
     }
 
-    public async Task HandleAsync(string cmd)
+    /// <summary>The hero picture once it is loaded (served to the page as "hero-image"); null = the built-in one.</summary>
+    public HeroImage? Hero { get; private set; }
+
+    public async Task HandleAsync(string cmd, JsonElement message)
     {
         switch (cmd)
         {
             case "ready":
-                PostSettings();
-                if (!_started)
-                {
-                    _started = true;
-                    _ = PingLoopAsync();
-                    _ = LoadNewsAsync();
-                }
-                await CheckAsync();
+                await OnPageReadyAsync();
                 break;
             case "primary":
                 if (_work != null) return;
-                if (_phase is "ready" or "running") await PlayAsync();
+                if (_phase == "ready") await PlayAsync();
                 else if (_phase is "install" or "update" or "repair") await UpdateAsync(verifyAll: _phase == "repair");
-                else await CheckAsync();
+                else if (_phase is "offline" or "error") await CheckAsync();
                 break;
             case "repair":
-                if (_work == null) await UpdateAsync(verifyAll: true);
+                if (_work == null && _phase != "running") await UpdateAsync(verifyAll: true);
                 break;
             case "pause":
                 _work?.Cancel();
@@ -74,15 +72,58 @@ public sealed class LauncherController : IDisposable
                 if (Directory.Exists(_layout.GameDirectory))
                     Process.Start(new ProcessStartInfo("explorer.exe", $"\"{_layout.GameDirectory}\"") { UseShellExecute = true });
                 break;
+            case "shortcuts":
+                CreateShortcuts(Flag(message, "desktop"), Flag(message, "startMenu"));
+                break;
+            case "notesSeen":
+                break; // remembered when the notes were shown
+            case "uninstall":
+                await UninstallAsync();
+                break;
+            case "panel":
+                if (PanelUrl() is { } panel) MainWindow.OpenExternal(panel);
+                break;
         }
     }
 
-    void PostSettings() => _post(new { type = "settings", dir = _layout.GameDirectory, launcher = _version });
+    static bool Flag(JsonElement message, string name) => message.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.True;
 
-    void PostState(string phase, string? message = null)
+    async Task OnPageReadyAsync()
+    {
+        PostSettings();
+        if (!_started)
+        {
+            _started = true;
+            _ = PingLoopAsync();
+            _ = LoadNewsAsync();
+            _ = LoadHeroAsync();
+            // first run: offer Desktop / Start menu shortcuts (asked once; the launcher never moves itself)
+            if (!_settings.ShortcutsAsked) _post(new { type = "shortcuts", status = "ask" });
+        }
+        else if (Hero is not null) PostHero();
+        if (IsGameRunning()) PostState("running");
+        else await CheckAsync();
+    }
+
+    void PostSettings() => _post(new
+    {
+        type = "settings",
+        dir = _layout.GameDirectory,
+        launcher = _version,
+        serverName = _config.ServerName,
+        links = _config.Links.Where(l => l.Url.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+            || l.Url.StartsWith("http://", StringComparison.OrdinalIgnoreCase)).Select(l => new { label = l.Label, url = l.Url, icon = l.Icon }),
+        canUninstall = CanUninstall(),
+        panel = PanelUrl() is { } url ? new { state = Ro3Emu.Setup.PanelLink.Open, url } : null,
+    });
+
+    /// <summary>The title bar's Web panel entry: only the operator's "panelUrl" (an operator's launcher looks for no panel itself).</summary>
+    string? PanelUrl() => Ro3Emu.Setup.PanelLink.Configured(_config.PanelUrl);
+
+    void PostState(string phase, string? message = null, long? downloadBytes = null)
     {
         _phase = phase;
-        _post(new { type = "state", phase, installed = _installed?.Version, remote = _channel?.Version, message });
+        _post(new { type = "state", phase, installed = _installed?.Version, remote = _channel?.Version, message, downloadBytes });
     }
 
     async Task CheckAsync()
@@ -94,31 +135,57 @@ public sealed class LauncherController : IDisposable
             var check = await updater.CheckAsync(_config.Channel, _life.Token);
             _channel = check.Channel;
             _installed = check.Installed;
-            if (_channel.Launcher is { } release && SelfUpdate.IsNewer(release.Version, _version))
-            {
-                PostState("checking", $"Updating the launcher to {release.Version}…");
-                if (await SelfUpdate.ApplyAsync(_repo, release, _version, _exePath, _life.Token))
-                {
-                    SelfUpdate.Restart(_exePath);
-                    System.Windows.Application.Current.Dispatcher.Invoke(() => System.Windows.Application.Current.Shutdown());
-                    return;
-                }
-            }
-            if (check.Installed is null)
-            {
-                bool existing = File.Exists(Path.Combine(_layout.GameDirectory, "ro3.exe"));
-                PostState("install", existing ? "Found an RO3 client in this folder: only the changed files will be downloaded." : null);
-            }
+            if (await SelfUpdateAsync()) return;
+            RememberInstalledVersion();
+            if (check.Installed is null) await PostInstallAsync();
             else if (check.UpdateRequired) PostState("update", $"Version {_channel.Version} is available.");
             else if (updater.QuickVerify(check.Installed) is { Count: > 0 } changed) PostState("repair", $"{changed.Count} game files differ from the release.");
-            else PostState("ready");
+            else
+            {
+                PostState("ready");
+                await ShowNotesIfNewAsync();
+            }
         }
         catch (Exception e) when (e is PatcherException or HttpRequestException or TaskCanceledException or IOException or JsonException)
         {
             _installed = new Updater(_layout, _repo).LoadState();
+            // The patcher's own words say why (a repository that is not https, a missing channel); a network error has none.
+            string? reason = e is PatcherException ? e.Message : null;
             // Offline but installed: the game can still start (the update server and the game server are separate).
-            PostState(_installed is not null ? "ready" : "offline", _installed is not null ? "Can't reach the update server; playing the installed version." : null);
+            if (_installed is not null) PostState("ready", (reason ?? "Can't reach the update server.") + " Playing the installed version.");
+            else PostState("offline", reason);
         }
+        PostSettings();
+    }
+
+    /// <summary>A newer launcher in the channel: download it, restart into it and return true.</summary>
+    async Task<bool> SelfUpdateAsync()
+    {
+        if (_channel?.Launcher is not { } release || !SelfUpdate.IsNewer(release.Version, _version)) return false;
+        PostState("checking", $"Updating the launcher to {release.Version}…");
+        if (!await SelfUpdate.ApplyAsync(_repo, release, _version, _exePath, _life.Token)) return false;
+        SelfUpdate.Restart(_exePath);
+        System.Windows.Application.Current.Dispatcher.Invoke(() => System.Windows.Application.Current.Shutdown());
+        return true;
+    }
+
+    /// <summary>Not installed: into a folder that already has the client only the changed files come; else everything.</summary>
+    async Task PostInstallAsync()
+    {
+        if (File.Exists(Path.Combine(_layout.GameDirectory, "ro3.exe")))
+        {
+            PostState("install", "Found an RO3 client in this folder: only the changed files will be downloaded.");
+            return;
+        }
+        long? bytes = null;
+        try
+        {
+            // A fresh install downloads every distinct chunk once.
+            var (manifest, _) = await _repo.GetManifestAsync(_channel!, _life.Token);
+            bytes = manifest.Files.SelectMany(f => f.Chunks).DistinctBy(c => c.Hash).Sum(c => (long)c.StoredSize);
+        }
+        catch (Exception e) when (e is PatcherException or HttpRequestException or TaskCanceledException or IOException or JsonException) { }
+        PostState("install", downloadBytes: bytes);
     }
 
     async Task UpdateAsync(bool verifyAll)
@@ -128,37 +195,51 @@ public sealed class LauncherController : IDisposable
             await CheckAsync();
             if (_channel is null) return;
         }
+        if (IsGameRunning())
+        {
+            PostState("error", "Close the game before updating.");
+            return;
+        }
+        ClaimFreshDirectory();
         Directory.CreateDirectory(_layout.GameDirectory);
         _work = CancellationTokenSource.CreateLinkedTokenSource(_life.Token);
         PostState("updating");
-        var meter = new SpeedMeter();
-        var progress = new ThrottledProgress(p =>
-        {
-            var (rate, eta) = p.Stage == UpdateStage.Downloading ? meter.Sample(p.BytesDone, p.BytesTotal) : (0, 0);
-            _post(new { type = "progress", stage = p.Stage.ToString().ToLowerInvariant(), done = p.BytesDone, total = p.BytesTotal, rate, eta });
-        });
         try
         {
             var updater = new Updater(_layout, _repo);
             var channel = _channel;
             var token = _work.Token;
+            var progress = ProgressReporter();
             await Task.Run(() => updater.UpdateAsync(channel, verifyAll, progress, token));
-            _work.Dispose();
-            _work = null;
+            EndWork();
             await CheckAsync();
         }
         catch (OperationCanceledException)
         {
-            _work?.Dispose();
-            _work = null;
+            EndWork();
             PostState(_installed is null ? "install" : "update", "Paused. Downloaded parts are kept; continue any time.");
         }
         catch (Exception e)
         {
-            _work?.Dispose();
-            _work = null;
+            EndWork();
             PostState("error", e.Message);
         }
+    }
+
+    void EndWork()
+    {
+        _work?.Dispose();
+        _work = null;
+    }
+
+    ThrottledProgress ProgressReporter()
+    {
+        var meter = new SpeedMeter();
+        return new ThrottledProgress(p =>
+        {
+            var (rate, eta) = p.Stage == UpdateStage.Downloading ? meter.Sample(p.BytesDone, p.BytesTotal) : (0, 0);
+            _post(new { type = "progress", stage = p.Stage.ToString().ToLowerInvariant(), done = p.BytesDone, total = p.BytesTotal, rate, eta, file = p.File });
+        });
     }
 
     async Task PlayAsync()
@@ -166,13 +247,17 @@ public sealed class LauncherController : IDisposable
         PostState("launching");
         try
         {
-            string? failure = await GameStarter.StartAsync(_layout.GameDirectory);
-            if (failure is null)
+            var start = await GameStarter.StartAsync(_layout.GameDirectory);
+            if (start.Game is not { } game)
             {
-                PostState("running");
-                _minimize();
+                PostState("repair", $"The game did not start: {start.Failure}.");
+                return;
             }
-            else PostState("repair", $"The game did not start: {failure}.");
+            _game = game;
+            game.EnableRaisingEvents = true;
+            game.Exited += (_, _) => System.Windows.Application.Current.Dispatcher.InvokeAsync(() => OnGameExitedAsync(game));
+            PostState("running");
+            _gameRunningChanged(true);
         }
         catch (Exception e)
         {
@@ -180,9 +265,38 @@ public sealed class LauncherController : IDisposable
         }
     }
 
+    /// <summary>The game closed: the launcher comes back from the tray and looks for updates again.</summary>
+    async Task OnGameExitedAsync(Process game)
+    {
+        if (_game == game) _game = null;
+        game.Dispose();
+        _gameRunningChanged(false);
+        await CheckAsync();
+    }
+
+    /// <summary>The game this launcher started, or any ro3.exe of the game folder (started before this launcher).</summary>
+    bool IsGameRunning()
+    {
+        if (_game is { HasExited: false }) return true;
+        string exe = Path.GetFullPath(Path.Combine(_layout.GameDirectory, "ro3.exe"));
+        foreach (var process in Process.GetProcessesByName("ro3"))
+        {
+            try
+            {
+                if (string.Equals(process.MainModule?.FileName, exe, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            catch (Exception e) when (e is System.ComponentModel.Win32Exception or InvalidOperationException) { }
+            finally
+            {
+                process.Dispose();
+            }
+        }
+        return false;
+    }
+
     async Task ChangeDirectoryAsync()
     {
-        if (_work != null) return;
+        if (_work != null || _phase == "running") return;
         string? folder = _pickFolder("Game folder (an existing ROO_PC folder or an empty one)");
         if (folder is null) return;
         // An existing client (ro3.exe) or an empty folder is used as is; anything else gets its own subfolder.
@@ -196,74 +310,18 @@ public sealed class LauncherController : IDisposable
         await CheckAsync();
     }
 
-    async Task PingLoopAsync()
+    void CreateShortcuts(bool desktop, bool startMenu)
     {
-        if (string.IsNullOrEmpty(_config.Server)) return;
-        string server = _config.Server.TrimEnd('/');
-        while (!_life.IsCancellationRequested)
-        {
-            bool online = false;
-            int? players = null;
-            try
-            {
-                using var status = await _http.GetAsync(server + "/ro3emu/status", _life.Token);
-                if (status.IsSuccessStatusCode)
-                {
-                    online = true;
-                    using var json = JsonDocument.Parse(await status.Content.ReadAsStringAsync(_life.Token));
-                    if (json.RootElement.TryGetProperty("players", out var p)) players = p.GetInt32();
-                }
-                else
-                {
-                    // Servers without /ro3emu/status: any answer from the gate-key endpoint means up.
-                    using var key = await _http.GetAsync(server + "/ro3emu/gate-key.pem", _life.Token);
-                    online = key.IsSuccessStatusCode;
-                }
-            }
-            catch (Exception e) when (e is HttpRequestException or TaskCanceledException or JsonException) { }
-            if (_life.IsCancellationRequested) return;
-            _post(new { type = "server", online, players });
-            try { await Task.Delay(TimeSpan.FromSeconds(30), _life.Token); }
-            catch (TaskCanceledException) { return; }
-        }
-    }
-
-    /// <summary>news.json in the repository root: { "items": [ { tag, color, title, text } ] }.</summary>
-    async Task LoadNewsAsync()
-    {
-        try
-        {
-            byte[]? bytes = await _repo.TryGetBytesAsync("news.json", _life.Token);
-            if (bytes is null) return;
-            using var json = JsonDocument.Parse(bytes);
-            if (json.RootElement.TryGetProperty("items", out var items))
-                _post(new { type = "news", items = items.Clone() });
-        }
-        catch (Exception e) when (e is HttpRequestException or TaskCanceledException or JsonException or PatcherException) { }
+        var failed = desktop || startMenu ? Shortcuts.Create(_exePath, _config.ServerName, desktop, startMenu) : [];
+        _settings.ShortcutsAsked = true;
+        _settings.Save();
+        _post(new { type = "shortcuts", status = failed.Count == 0 ? "done" : "error", created = desktop || startMenu, failed });
     }
 
     public void Dispose()
     {
         _life.Cancel();
         _work?.Cancel();
-    }
-
-    /// <summary>Download speed over the last ~5 seconds and the remaining seconds at that speed.</summary>
-    sealed class SpeedMeter
-    {
-        readonly Stopwatch _clock = Stopwatch.StartNew();
-        readonly Queue<(double At, long Bytes)> _samples = new();
-
-        public (double Rate, double Eta) Sample(long done, long total)
-        {
-            double now = _clock.Elapsed.TotalSeconds;
-            _samples.Enqueue((now, done));
-            while (_samples.Count > 2 && now - _samples.Peek().At > 5) _samples.Dequeue();
-            var first = _samples.Peek();
-            double seconds = now - first.At;
-            if (seconds < 1) return (0, 0);
-            double rate = (done - first.Bytes) / seconds;
-            return rate <= 0 ? (0, 0) : (rate, (total - done) / rate);
-        }
+        _game?.Dispose();
     }
 }

@@ -52,7 +52,7 @@ public sealed partial class GuildTests
             Assert.Equal(0, session.Guild!.GuildId);
             Assert.Equal(0, DBRoleGuildInfo.Parser.ParseFrom(roles.LoadGuildInfo(recruitId)!).GuildId);
             timer = loop.InvokeAsync(service.ReconcileAsync);
-            gm = httpClient.PostAsync(_http + "/ro3emu/gm?account=holdrecruit", new StringContent("!item 1 17"));
+            gm = httpClient.PostAsync(_http + "/ro3emu/gm?account=holdrecruit", Operator.Command("!item 1 17"));
             await unrelated.SendGameBytesAsync(MsgId.SaveSetting, [0x0a, 1, 5, 0x12, 4, 0x2a, 2, 16, 1]);
             Assert.Equal(0, (await Next(unrelated, MsgId.SaveSetting, SaveSettingResp.Parser)).Result);
             Assert.False(timer.IsCompleted);
@@ -138,8 +138,9 @@ public sealed partial class GuildTests
         Assert.Null(store.ForRole((long)founder.Self!.Uuid));
         var ledger = S3EconomyReader.ReadLedger(_dataDir, catalog, opening, closing)!;
         Assert.True(ledger.CompleteHistory, string.Join(";", ledger.Issues.Select(x => x.Detail)));
-        Assert.Single(ledger.Receipts);
-        Assert.Equal(escrow == 0 ? 10 : 12, ledger.Legs.Count);
+        // A quest award can land between the two snapshots, so only the disband's own receipt and legs count.
+        var disband = Assert.Single(ledger.Receipts, x => x.CommandKind == "guild-disband");
+        Assert.Equal(escrow == 0 ? 10 : 12, ledger.Legs.Count(x => x.OperationId == disband.OperationId));
         Assert.Empty(store.LoadMarket().Stalls);
         foreach (long asset in Enumerable.Range(1, 5).Select(x => (long)x))
         {

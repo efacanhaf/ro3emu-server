@@ -16,7 +16,7 @@ namespace Ro3Emu.Server.Game;
 /// A role owns its order and five daily rounds; membership only authorizes help and receives configured guild funds.
 /// (inferred) Stable weighted order draw, 05:00 dayVersion, reward mail at rollover, and cross-guild help cleanup.
 /// </summary>
-public sealed class GuildCaravanService(GameData data, GuildStore guilds, AccountStore accounts, RoleStore roles,
+public sealed partial class GuildCaravanService(GameData data, GuildStore guilds, AccountStore accounts, RoleStore roles,
     CharacterService character, AwardService awards, MailService mail, GuildService guildService,
     TaskService tasks, SeasonService seasons, FunctionService functions, SessionRegistry sessions, TimeProvider clock, GameLoop loop,
     ILogger<GuildCaravanService> log) : IGameTicker
@@ -55,8 +55,8 @@ public sealed class GuildCaravanService(GameData data, GuildStore guilds, Accoun
         public long ReqHelpOtherCount { get; set; }
         public bool IsAwardGot { get; set; }
         public long LastRefreshTime { get; set; }
-        public List<Sku> Skus { get; set; } = new();
-        public List<PendingAward> PendingAwards { get; set; } = new();
+        public List<Sku> Skus { get; set; } = [];
+        public List<PendingAward> PendingAwards { get; set; } = [];
     }
 
     private sealed class PendingAward
@@ -65,7 +65,7 @@ public sealed class GuildCaravanService(GameData data, GuildStore guilds, Accoun
         public string SourceKey { get; set; } = "";
         public long GuildId { get; set; }
         public bool GuildBooked { get; set; }
-        public List<PendingGrant> Grants { get; set; } = new();
+        public List<PendingGrant> Grants { get; set; } = [];
     }
 
     private sealed class PendingGrant
@@ -274,7 +274,7 @@ public sealed class GuildCaravanService(GameData data, GuildStore guilds, Accoun
         if (_data.Table("GuildSettingConfig").TryGetValue("GuildTransportRoundSAB", out var row)
             && row.TryGetProperty("_kValue", out var array) && array.ValueKind == JsonValueKind.Array
             && round >= 0 && round < array.GetArrayLength() && array[round].ValueKind == JsonValueKind.Array)
-            return array[round].EnumerateArray().Select(x => (long)(GameData.Number(x) ?? 0)).ToArray();
+            return [.. array[round].EnumerateArray().Select(x => (long)(GameData.Number(x) ?? 0))];
         return [];
     }
 
@@ -333,7 +333,7 @@ public sealed class GuildCaravanService(GameData data, GuildStore guilds, Accoun
         if (Guild(s)?.Id != guild.Id || !Eligible(s)) throw new CaravanMembershipChangedException();
         long roleId = s.Role!.Id;
         var state = Read(roleId) ?? new State { Day = Day, GuildId = guild.Id };
-        state.PendingAwards ??= new(); state.Skus ??= new();
+        state.PendingAwards ??= []; state.Skus ??= [];
         if (state.Day != Day)
             state = await RolloverAsync(roleId, state, s.Progress!);
         if (Guild(s)?.Id != guild.Id || !Eligible(s) || state.Day != Day)
@@ -362,7 +362,7 @@ public sealed class GuildCaravanService(GameData data, GuildStore guilds, Accoun
         var next = new State
         {
             Day = Day, GuildId = state.GuildId, Revision = state.Revision,
-            PendingAwards = state.PendingAwards.ToList()
+            PendingAwards = [.. state.PendingAwards]
         };
         long owed = !state.IsAwardGot && state.Skus.Count(x => x.Status == 1) >= Setting("GuildTransportRequestItemTypeNum", 5)
             ? DepartureAward(state) : 0;
@@ -393,7 +393,7 @@ public sealed class GuildCaravanService(GameData data, GuildStore guilds, Accoun
                         _guilds.EnlistCaravanReward(state.GuildId, roleId, funds, contribution, tx);
                 }, _loop.Owners?.Current, parentEconomy: expired => new EconomyEnvelope(operation,
                     actor.Account, roleId, "guild-caravan-rollover", source, source, NowMs,
-                    effects.Concat(expired).ToArray(), []));
+                    [.. effects, .. expired], []));
             if (funds > 0 || contribution > 0)
                 await _guildService.RefreshCaravanResourcesAsync(state.GuildId);
         }
@@ -420,13 +420,20 @@ public sealed class GuildCaravanService(GameData data, GuildStore guilds, Accoun
         catch { _sweeping = false; throw; }
     }
     private bool _sweeping;
+    private const int SweepReadsPerYield = 50, SweepRolloversPerRest = 10;
+    private static readonly TimeSpan SweepRest = TimeSpan.FromMilliseconds(100);
 
     /// <summary>Settle yesterday's connected and offline orders at 05:00, once per persisted role.</summary>
     public async Task ReconcileAllAsync()
     {
         var roleIds = _accounts.ReadSync<List<long>>(new CaravanRoleIdsReadPlan());
+        int read = 0, sinceRest = 0;
         foreach (long roleId in roleIds)
         {
+            // (inferred pacing; server tuning) At 05:00 every persisted role rolls over in one sweep: this lets queued work
+            // through between roles and rests between batches of rollovers, outside any guild gate.
+            if (++read % SweepReadsPerYield == 0) await Task.Yield();
+            if (sinceRest == SweepRolloversPerRest) { sinceRest = 0; await Task.Delay(SweepRest); }
             var snapshot = Read(roleId);
             if (snapshot == null || snapshot.Day == Day) continue;
             try
@@ -436,6 +443,7 @@ public sealed class GuildCaravanService(GameData data, GuildStore guilds, Accoun
                 var current = Read(roleId);
                 if (current == null || current.Day == Day || current.GuildId != snapshot.GuildId) continue;
                 await RolloverAsync(roleId, current, _roles.LoadProgress(roleId));
+                sinceRest++;
                 if (_sessions.All().FirstOrDefault(x => x.Role?.Id == roleId) is { } online && Guild(online) is { } guild)
                 {
                     var today = await EnsureAsync(online, guild);
@@ -693,7 +701,8 @@ public sealed class GuildCaravanService(GameData data, GuildStore guilds, Accoun
         {
             committed = await _character.ExchangeLockedAsync(s, cost, goods, boundGoods: bound,
             baseExp: plan.Grants.Where(g => g.Entry == 100).Sum(g => (long)g.Count),
-            jobExp: plan.Grants.Where(g => g.Entry == 101).Sum(g => (long)g.Count),
+            jobExp: plan.Grants.Where(g => g.Entry == 101).Sum(g => (long)g.Count)
+                + _character.JobExpFromBase(plan.Grants.Where(g => g.Entry == 100).Sum(g => (long)g.Count)),
             popup: false, persist: tx =>
             {
                 EnlistMemberSave(tx, s.Role!.Id, guildId, next, fixedPlan == null);
@@ -847,7 +856,7 @@ public sealed class GuildCaravanService(GameData data, GuildStore guilds, Accoun
                 var own = await EnsureAsync(s, guild);
                 resp.DayVersion = Version(guild.Id, own.Day); resp.HelpOtherCount = own.HelpOtherCount;
                 foreach (var member in _guilds.Get(guild.Id)?.Members.Values.AsEnumerable()
-                    ?? Enumerable.Empty<GuildStore.Member>())
+                    ?? [])
                     if (Read(member.RoleId) is { } other && other.GuildId == guild.Id && other.Day == own.Day)
                         foreach (var sku in other.Skus.Where(x => x.Status == 2))
                             resp.Skus.Add(new GuildCatShopItemHelpSku
@@ -919,8 +928,8 @@ public sealed class GuildCaravanService(GameData data, GuildStore guilds, Accoun
                                 {
                                     SourceKey = $"guild-caravan:help:{guild.Id}:{req.PlayerID}:{target.Day}:{target.CurRound}:{req.SkuIndex}",
                                     GuildId = guild.Id, GuildBooked = true,
-                                    Grants = targetPlan.Grants.Select(g => new PendingGrant
-                                    { Entry = g.Entry, Count = g.Count, BindType = g.BindType, ExpireTimeStamp = g.ExpireTimeStamp }).ToList()
+                                    Grants = [.. targetPlan.Grants.Select(g => new PendingGrant
+                                    { Entry = g.Entry, Count = g.Count, BindType = g.BindType, ExpireTimeStamp = g.ExpireTimeStamp })]
                                 });
                                 long targetFunds = targetPlan.Grants.Where(g => g.Entry == 104).Sum(g => (long)g.Count);
                                 long targetContribution = targetPlan.Grants.Where(g => g.Entry == 102).Sum(g => (long)g.Count);

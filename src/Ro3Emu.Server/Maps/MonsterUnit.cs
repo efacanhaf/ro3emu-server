@@ -17,12 +17,25 @@ public sealed record MonsterTemplate(
     public BossSkillBook? Skills { get; init; }
     /// <summary>AttriMonsterConfig cast speed (116), retained for live chant modifiers.</summary>
     public long CastSpeed { get; init; }
+    /// <summary>AIConfig _iIsSurround 1: metres between the attackers' slots around a player (_iSurroundDistance cm);
+    /// 0: a straight approach (MonsterService.Surround).</summary>
+    public float SurroundDistance { get; init; }
+    /// <summary>AIConfig _iBattleCallType 1: how far (m) it calls its kind into the fight it enters; 0 calls no one.</summary>
+    public float BattleCallRange { get; init; }
+    /// <summary>AIConfig _iBattleCallResponse 1: it answers such a call.</summary>
+    public bool AnswersBattleCall { get; init; }
+    /// <summary>Metres a skill reaches past its centre (<see cref="Data.Config.UnitConfig.DamageRadius"/>).</summary>
+    public float DamageRadius { get; init; }
+    /// <summary>NPCConfig _iNPCSubType 3 MT_MINI, 4 MT_MVP, 6 MT_BOSS, as the boss skills and Paragon count them.</summary>
+    public bool IsBoss { get; init; }
 }
 
-/// <summary>A live monster on a map (entityType 1): HP, home point, current walk segment and AI state.</summary>
-public sealed class MonsterUnit : WorldUnit
+/// <summary>A live monster on a map (entityType 1): HP, home point, current walk segment and AI state. The siege war
+/// machines derive from it (TerritoryWarsService.CannonUnit, VehicleUnit): they take damage and die as monsters do.</summary>
+public class MonsterUnit : WorldUnit
 {
-    public required MonsterTemplate Template { get; init; }
+    /// <summary>Its kind's stats; GmSetEntityAttr swaps in a changed copy for this one unit.</summary>
+    public required MonsterTemplate Template { get; set; }
     /// <summary>Instance-specific final outgoing damage rate; 10000 leaves field and dungeon monsters unchanged.</summary>
     public int DamageRatio { get; init; } = 10000;
     public required SpawnGroup Group { get; init; }
@@ -61,7 +74,15 @@ public sealed class MonsterUnit : WorldUnit
     public TowerPetUnit? PetTarget { get; set; }
     public long NextSwingMs { get; set; }
     public long NextChaseMs { get; set; }
+    /// <summary>When this monster may search a way around an obstacle again: a straight walk failed, and the search is not free.</summary>
+    public long NextPathMs { get; set; }
+    /// <summary>The players who have engaged it since it last left combat: losing its target, it turns to the nearest of them.</summary>
+    public List<Game.GameSession> Hated { get; } = [];
     public bool Returning { get; set; }
+    /// <summary>Back home it keeps its damage instead of healing to full (the siege castle, TerritoryWarsService.SiegeObjects).</summary>
+    public bool KeepsDamage { get; set; }
+    /// <summary>It never takes a target, so it neither locks nor chases anybody (the siege castle's AIConfig _iCanInBattle 0).</summary>
+    public bool StaysOutOfBattle { get; set; }
     public long LastCombatMs { get; set; }
     /// <summary>Boss special-skill scheduler state, created when the boss first engages (MonsterService.BossSkills).</summary>
     public BossSkillRuntime? BossSkills { get; set; }
@@ -72,15 +93,18 @@ public sealed class MonsterUnit : WorldUnit
     /// <summary>MvpService paces this boss's specials from its own tick (its plans first, then the generic ones).</summary>
     public bool SpecialsOwnedByMvp { get; set; }
     /// <summary>Live boss skill cooldowns for 31125/31127, keyed by actual cast row.</summary>
-    public Dictionary<int, long> BossSkillCds { get; } = new();
+    public Dictionary<int, long> BossSkillCds { get; } = [];
+
+    /// <summary>A destination it walks to between fights instead of roaming at home (MonsterService.March); null: none.</summary>
+    public MonsterMarch? March { get; set; }
 
     /// <summary>Status bits (property 2701); bit 15 = fighting.</summary>
     public long StatusBits { get; set; }
 
-    public MonsterBrain? Brain { get; init; }
+    public IMonsterBrain? Brain { get; init; }
 
     /// <summary>Unit custom data a gameplay attaches (31018 on change; carried in the AOI entity), e.g. Guild League IsFlag.</summary>
-    public List<CustomData> CustomData { get; } = new();
+    public List<CustomData> CustomData { get; } = [];
 
     /// <summary>Extra snapshot state an owner adds to the 31037 base (MVP bosses and minions: their live buffs).</summary>
     public Action<EntityBase>? EntityExtras { get; set; }
@@ -151,8 +175,29 @@ public sealed class MonsterUnit : WorldUnit
     };
 }
 
+/// <summary>
+/// A scripted walk of one monster to a goal (the Battle for Prontera invaders): the route legs still ahead, whether it
+/// arrived, and where it left the route for its current fight (the centre of its leash while it fights).
+/// </summary>
+public sealed class MonsterMarch(float goalX, float goalZ, float arriveRadius)
+{
+    public float GoalX { get; } = goalX;
+    public float GoalZ { get; } = goalZ;
+    public float ArriveRadius { get; } = arriveRadius;
+    public bool Arrived { get; set; }
+    /// <summary>Route points still to walk, nearest first; empty: planned again from where the monster stands.</summary>
+    public List<(float X, float Y, float Z)> Route { get; } = [];
+    public float LeashX { get; set; }
+    public float LeashZ { get; set; }
+    /// <summary>Plans in a row that found no way on; past a few the monster stays where it is.</summary>
+    public int Failures { get; set; }
+    /// <summary>Held where it stands until released (the siege's battering ram without an escort,
+    /// TerritoryWarsService.SiegeUnits).</summary>
+    public bool Halted { get; set; }
+}
+
 /// <summary>Runs a monster's AI each map tick (MonsterService).</summary>
-public interface MonsterBrain
+public interface IMonsterBrain
 {
     void Tick(MonsterUnit monster, MapInstance map);
 }

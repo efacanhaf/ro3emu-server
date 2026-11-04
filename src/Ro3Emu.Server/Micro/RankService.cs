@@ -27,16 +27,16 @@ namespace Ro3Emu.Server.Micro;
 /// PublicParamConfig.LeaderBoardRefreshIntervalTs seconds, the client's own refresh interval (inferred reuse).
 /// Only entries with a positive score are listed (inferred: the original fed boards on progress events).
 /// _iSortingRules [[1,1],[2,2]] is read as Values[1] descending, then the board's tie-break ascending (inferred).
-/// Reward settlement (_iRefresh, _kPrizesTimeNew, _iRankRewards, LeaderBoardsGiftConfig) is not implemented.
+/// Reward settlement (_kPrizesTimeNew, _iRankRewards, LeaderBoardsGiftConfig) is RankRewardService's.
 /// </para>
 /// </summary>
 public sealed class RankService(GameData data, AccountStore accounts, GuildService guilds, CharacterService character,
-    EmblemService emblems, TimeProvider clock, ILogger<RankService> log) : IMicroService
+    EmblemService emblems, TerritoryWarsClock territory, TimeProvider clock, ILogger<RankService> log) : IMicroService
 {
     // Board ids: LeaderBoardsConfig _iID / enum_LeaderBoardType (Lua_GameDefine.lua:10440-10552).
     public const int SpiritTower = 1011, GuildPrestige = 1030, GuildActivity = 1031, SurvivorOverall = 1052, SurvivorWeeklyKills = 1053,
         SurvivorWeeklyWins = 1054, HeroAll = 1101, DummyOverall = 1201, Fashion = 1301, Equipment = 1401,
-        DragonOverall = 1601, DragonWeeklyMvp = 1602;
+        DragonOverall = 1601, DragonWeeklyMvp = 1602, BattleGlory = 2102;
 
     /// <summary>
     /// UI_Sys_RankCopyMainPanelModel.lua:24-45: job -1 (all) -> 1101, root jobs -> 1103-1108. 1101 has no
@@ -83,7 +83,7 @@ public sealed class RankService(GameData data, AccountStore accounts, GuildServi
                             if (!board.RankOf.ContainsKey(id) && board.Guild && boards.GuildOf.TryGetValue(id, out long guild)) id = guild;
                             if (board.RankOf.TryGetValue(id, out int rank)) rows.Add(Row(board.Rows[rank - 1], rank));
                         }
-                    return Reply(rows.ToArray(), board);
+                    return Reply([.. rows], board);
                 }
             case "getUserRankSurrounding":
                 {
@@ -98,7 +98,7 @@ public sealed class RankService(GameData data, AccountStore accounts, GuildServi
                     if (board != null && board.RankOf.TryGetValue(id, out int rank))
                     {
                         int first = Math.Max(1, rank - before), last = Math.Min(board.Rows.Count, rank + after);
-                        rows = Enumerable.Range(first, last - first + 1).Select(r => Row(board.Rows[r - 1], r)).ToArray();
+                        rows = [.. Enumerable.Range(first, last - first + 1).Select(r => Row(board.Rows[r - 1], r))];
                     }
                     return Reply(rows, board);
                 }
@@ -111,6 +111,19 @@ public sealed class RankService(GameData data, AccountStore accounts, GuildServi
     public async Task<int> EquipRankAsync(int boardId, long itemGuid) =>
         boardId == Equipment && (await BoardsAsync()).Boards.TryGetValue(Equipment, out var board)
             && board.RankOf.TryGetValue(itemGuid, out int rank) ? rank : 0;
+
+    /// <summary>A role's (or guild's) place on a board, 1-based; 0 when it is not listed.</summary>
+    public async Task<int> RankOfAsync(int boardId, long id) =>
+        (await BoardsAsync()).Boards.TryGetValue(boardId, out var board) && board.RankOf.TryGetValue(id, out int rank) ? rank : 0;
+
+    /// <summary>The first <paramref name="count"/> rows of a board (role or guild ids with their score), best first.</summary>
+    public async Task<IReadOnlyList<(long Id, long Score)>> TopAsync(int boardId, int count) =>
+        (await BoardsAsync()).Boards.TryGetValue(boardId, out var board) ? [.. board.Rows.Take(count).Select(r => (r.Id, r.Score))] : [];
+
+    /// <summary>The first <paramref name="count"/> rows of a role board, best first; a guild board has none.</summary>
+    public async Task<IReadOnlyList<(long Id, long Score)>> RoleTopAsync(int boardId, int count) =>
+        (await BoardsAsync()).Boards.TryGetValue(boardId, out var board) && !board.Guild
+            ? [.. board.Rows.Take(count).Select(r => (r.Id, r.Score))] : [];
 
     /// <summary>Drops the cached boards so the next request recomputes them (tests, GM tools).</summary>
     internal void Invalidate()
@@ -192,7 +205,7 @@ public sealed class RankService(GameData data, AccountStore accounts, GuildServi
         var boards = new Dictionary<int, List<Candidate>>();
         void Add(int board, Candidate candidate)
         {
-            if (!boards.TryGetValue(board, out var list)) boards[board] = list = new();
+            if (!boards.TryGetValue(board, out var list)) boards[board] = list = [];
             list.Add(candidate);
         }
         var dummyBoards = DummyBoards();
@@ -246,6 +259,10 @@ public sealed class RankService(GameData data, AccountStore accounts, GuildServi
             // Hero Registry (UI_Sys_RankCopyMainPanel): ranked by the role's displayed power, normalPower +
             // seasonPower: the total PowerService last published and saved with the Soul Echo
             // state. A role that never logged in since has only its Soul Echo plan to rank by.
+            // 2102 Battle Merit (enum_LeaderBoardType.BattleGlory; UI_Sys_TerritoryWars_BattleFeatsSettlementPanelModel asks
+            // its own place with GetMyRankByBoardId): the Battle Merit points earned this Territory War season.
+            if (role.TerritoryWars is { Length: > 0 } && TerritoryWarsService.GloryPointsOf(role.TerritoryWars, territory.Epoch) is > 0 and var merit)
+                Add(BattleGlory, new Candidate(role.Id, merit, 0, 0, 0, () => []));
             long power = PowerService.StoredTotal(role.Emblems) ?? emblems.StoredPower(role.Emblems, items);
             if (power > 0)
             {
@@ -338,7 +355,7 @@ public sealed class RankService(GameData data, AccountStore accounts, GuildServi
         return map;
     }
 
-    /// <summary>LeaderBoardsConfig._iFullRankMax; 1101 has no row and takes its siblings' 3000 (inferred).</summary>
+    /// <summary>LeaderBoardsConfig._iFullRankMax; 1101 and 2102 have no row and take the other role boards' 3000 (inferred).</summary>
     private int FullRankMax(int board) => data.Row("LeaderBoardsConfig", board) is { } row
-        ? (int)GameData.Int(row, "_iFullRankMax") : board == HeroAll ? 3000 : 0;
+        ? (int)GameData.Int(row, "_iFullRankMax") : board is HeroAll or BattleGlory ? 3000 : 0;
 }

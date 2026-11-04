@@ -22,8 +22,8 @@ public sealed partial class EquipmentService
     private const int ItemTypeEquip = 5;
 
     /// <summary>Committed crafts and paid refinement attempts, for task targets 103024/103006/103005.</summary>
-    public List<Func<GameSession, int, int, int, Task>> Crafted { get; } = new();
-    public List<Func<GameSession, Task>> Refined { get; } = new();
+    public List<Func<GameSession, int, int, int, Task>> Crafted { get; } = [];
+    public List<Func<GameSession, Task>> Refined { get; } = [];
 
     private readonly GameData _data;
     private readonly CharacterService _character;
@@ -164,11 +164,16 @@ public sealed partial class EquipmentService
             }
             levels = session.EquipLevels;
             _log.LogInformation("{Name} refines grid {Grid} +{Level}: {Result}", session.Role!.Name, grid, level, error?.Why ?? (success ? "success" : $"failed, now +{levels.Refine.GetValueOrDefault(grid)}"));
+            // LC_DAL_Equipment._processRefineEquipments plays the success settlement (its animation and sound) for a
+            // refineLv above the stored level and the failure one only when refineLv is absent; a failed roll therefore
+            // leaves refineLv unset, which the client stores as +0 (issue #362), so SendFullLevelsAsync sends the real level.
             await session.SendGameAsync(Refine, new RefineEquipmentRsp
             {
-                Result = error?.Code ?? 0, EquipPos = req.EquipPos, RefineLv = levels.Refine.GetValueOrDefault(grid),
+                Result = error?.Code ?? 0, EquipPos = req.EquipPos,
+                RefineLv = error == null && !success ? 0 : levels.Refine.GetValueOrDefault(grid),
                 RefineEffectLv = _character.Resonance(session, "RefiningEffectTable"), RefineLuckyAdd = levels.Luck.GetValueOrDefault(grid),
             });
+            if (error == null && !success) await SendFullLevelsAsync(session);
             await AfterUpgradeAsync(session, error == null);
             paid = error == null;
         }
@@ -183,11 +188,44 @@ public sealed partial class EquipmentService
     /// raised it), and the refine panel redraws on the currency change (UI_Sys_StrengthenRefineInfoWidgetCtrl binds
     /// m_kCurrency to _refreshView), which must therefore come after the reply stored the new level.
     /// </summary>
+    /// <summary>
+    /// The client takes a grid's levels from a 31404/31405 reply or a full 5007 (LC_DAL_Equipment._processEquipBaseNtf rebuilds
+    /// EquipStrengthenData); an incremental 5007 leaves them (seen in the client 3.11: itemsRefine 4 sent, the panel stayed at +0).
+    /// Before the bag: the paid currency makes the panel redraw its materials from this level.
+    /// </summary>
+    private async Task SendFullLevelsAsync(GameSession session)
+    {
+        session.Synced.Remove(CharacterService.EquipSync);
+        await _character.EquipLevelsChangedAsync(session, persist: false);
+    }
+
     private async Task AfterUpgradeAsync(GameSession session, bool paid)
     {
         if (!paid) return;
         await _character.ItemsChangedAsync(session, stats: false);
         await _character.EquipLevelsChangedAsync(session, persist: false);
+    }
+
+    /// <summary>
+    /// GM panel 4 GmOpStrengthen / 5 GmOpRefine: the grids' strengthen or refine level set outright, with no materials,
+    /// chance or luck, then 5007 and properties as after a paid upgrade. (inferred) No 31404/31405 reply: the panel
+    /// asked nothing of the upgrade widget; a set refine level clears the grid's luck as a success does.
+    /// </summary>
+    internal async Task<string?> GmSetLevelAsync(GameSession session, IReadOnlyList<int> grids, int level, bool refine)
+    {
+        using var gate = await CharacterService.Lock(session);
+        foreach (int grid in grids)
+            if (level < 0 || level > 0 && (refine ? _character.RefineRow(grid, level) : _character.StrengthenRow(grid, level)) == null)
+                return null;
+        var next = CopyLevels(session.EquipLevels);
+        foreach (int grid in grids)
+        {
+            (refine ? next.Refine : next.Strength)[grid] = level;
+            if (refine) next.Luck.Remove(grid);
+        }
+        session.EquipLevels = next;
+        await SendFullLevelsAsync(session);
+        return $"{(refine ? "Refine" : "Strengthen")} +{level} on grids {string.Join(',', grids)}.";
     }
 
     private static EquipLevels CopyLevels(EquipLevels source) => new()
@@ -237,7 +275,7 @@ public sealed partial class EquipmentService
                 int floor = redDue ? QualityRed : orangeDue ? QualityOrange : 0;
                 var pool = outputs.Where(o => o.Quality >= floor).ToList();
                 var weighted = pool.Where(o => o.Weight > 0).Select(o => (o.Entry, o.Weight)).ToList();
-                if (weighted.Count == 0 && floor > 0) weighted = pool.Select(o => (o.Entry, Weight: 1L)).ToList();
+                if (weighted.Count == 0 && floor > 0) weighted = [.. pool.Select(o => (o.Entry, Weight: 1L))];
                 int entry = Draw(weighted);
                 long quality = outputs.FirstOrDefault(o => o.Entry == entry).Quality;
                 counter.CraftCount++;
@@ -383,10 +421,10 @@ public sealed partial class EquipmentService
     // ---- config helpers ----
 
     private static List<(int Entry, long Count)> Pairs(JsonElement row, string field) =>
-        GameData.Pairs(row, field).Select(p => ((int)p.Item1, (long)p.Item2)).ToList();
+        [.. GameData.Pairs(row, field).Select(p => ((int)p.Item1, (long)p.Item2))];
 
     /// <summary>A flat number array field ([item, count, bonus]); empty for {} / absent.</summary>
     private static long[] Flat(JsonElement row, string field) =>
         row.TryGetProperty(field, out var v) && v.ValueKind == JsonValueKind.Array
-            ? v.EnumerateArray().Select(e => (long)(GameData.Number(e) ?? 0)).ToArray() : [];
+            ? [.. v.EnumerateArray().Select(e => (long)(GameData.Number(e) ?? 0))] : [];
 }

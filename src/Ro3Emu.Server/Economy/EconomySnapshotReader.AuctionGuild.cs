@@ -145,7 +145,7 @@ public static partial class EconomySnapshotReader
                         Guard(key, () =>
                         {
                             using var doc = Json(bytes); var state = doc.RootElement;
-                            Fields(state, "Id Name Announce Notice CreateTime Status HelperDeadlineMs Level Background Icon AutoAccept AutoCreateHelper JoinLevelLimit Money Contribute Materials Reputation AuctionMaterials LastChangeNameTime LastChangeNoticeTime LastRecruitMs HistoryNames Members Applications HelperApplies Rights Buildings BuildingEndTimes CurActivity LastWeekActivity ActivityWeek LeagueElites LeagueEliteVersion UnlockedHeadIcons ShopCommodityBuys ShopCommodityWeek NextBroadEmailMs BroadEmailCount BroadEmailDay");
+                            Fields(state, "Id Name Announce Notice CreateTime Status HelperDeadlineMs FoundingItem FoundingCount Level Background Icon AutoAccept AutoCreateHelper JoinLevelLimit Money Contribute Materials Reputation AuctionMaterials LastChangeNameTime LastChangeNoticeTime LastRecruitMs HistoryNames Members Applications HelperApplies Rights Buildings BuildingEndTimes CurActivity LastWeekActivity ActivityWeek LeagueElites LeagueEliteVersion UnlockedHeadIcons ShopCommodityBuys ShopCommodityWeek NextBroadEmailMs BroadEmailCount BroadEmailDay ImpeachOwner ImpeachEndMs ImpeachNeed ImpeachResponders NextImpeachMs MergeInvites PendingMergeGuildId MergeAbsorbs MergeAtSec MergeMemberIds MergeCooldownSec WartimeItems WartimeStocked WartimeSlots WartimePrepay");
                             if (Long(state, "Id") != id) throw new FormatException("Guild identity mismatch.");
                             var owner = new EconomyOwner(EconomyOwnerKind.Guild, Id(id));
                             foreach (var field in new[] { ("Money", 1L), ("Contribute", 2L), ("Materials", 3L),
@@ -179,7 +179,7 @@ public static partial class EconomySnapshotReader
                                 throw new FormatException("Invalid or live guild recovery identity.");
                             using var doc = Json(bytes);
                             var state = doc.RootElement;
-                            Fields(state, "Id Name Announce Notice CreateTime Status HelperDeadlineMs Level Background Icon AutoAccept AutoCreateHelper JoinLevelLimit Money Contribute Materials Reputation AuctionMaterials LastChangeNameTime LastChangeNoticeTime LastRecruitMs HistoryNames Members Applications HelperApplies Rights Buildings BuildingEndTimes CurActivity LastWeekActivity ActivityWeek LeagueElites LeagueEliteVersion UnlockedHeadIcons ShopCommodityBuys ShopCommodityWeek NextBroadEmailMs BroadEmailCount BroadEmailDay");
+                            Fields(state, "Id Name Announce Notice CreateTime Status HelperDeadlineMs FoundingItem FoundingCount Level Background Icon AutoAccept AutoCreateHelper JoinLevelLimit Money Contribute Materials Reputation AuctionMaterials LastChangeNameTime LastChangeNoticeTime LastRecruitMs HistoryNames Members Applications HelperApplies Rights Buildings BuildingEndTimes CurActivity LastWeekActivity ActivityWeek LeagueElites LeagueEliteVersion UnlockedHeadIcons ShopCommodityBuys ShopCommodityWeek NextBroadEmailMs BroadEmailCount BroadEmailDay ImpeachOwner ImpeachEndMs ImpeachNeed ImpeachResponders NextImpeachMs MergeInvites PendingMergeGuildId MergeAbsorbs MergeAtSec MergeMemberIds MergeCooldownSec WartimeItems WartimeStocked WartimeSlots WartimePrepay");
                             if (Long(state, "Id") != id) throw new FormatException("Guild recovery snapshot identity mismatch.");
                             var owner = new EconomyOwner(EconomyOwnerKind.Guild, Id(id));
                             foreach (var field in new[] { ("Money", 1L), ("Contribute", 2L), ("Materials", 3L),
@@ -277,7 +277,7 @@ public static partial class EconomySnapshotReader
             }
             if (Has("guild_caravan_version")) ScanIntegerKeys("guild_caravan_version", "guild_id");
             ScanJsonEvidence("guild_campfire", "guild_id", "state", (key, root) =>
-                Fields(root, "Day Exp Seeds FuelCount DrawnStages BossDead FruitKills"));
+                Fields(root, "Day Exp Seeds FuelCount DrawnStages BossDead FruitKills PrizeStages"));
             ScanJsonEvidence("guild_challenge", "guild_id", "state", (key, root) =>
                 Fields(root, "Season Cycle Activated Unlocked LastUnlocked PassedDifficulty Difficulty Stage Selected Complete Progress BestTimeMs AuctionEntries"));
         }

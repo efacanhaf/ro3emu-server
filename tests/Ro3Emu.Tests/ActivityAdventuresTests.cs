@@ -8,7 +8,9 @@ using Ro3Emu.Bot;
 using Ro3Emu.Server;
 using Ro3Emu.Server.Accounts;
 using Ro3Emu.Server.Game;
+using Ro3Emu.Server.Data;
 using Ro3Emu.Server.Game.Ownership;
+using Ro3Emu.Server.Maps;
 
 namespace Ro3Emu.Tests;
 
@@ -19,7 +21,7 @@ public sealed class ActivityAdventuresTests : IAsyncLifetime
     private static readonly TimeSpan Wait = TimeSpan.FromSeconds(5);
     private WebApplication _app = null!;
     private string _http = "";
-    private readonly Dictionary<string, BotClient> _clients = new();
+    private readonly Dictionary<string, BotClient> _clients = [];
     private readonly FixedClock _clock = new();
 
     private sealed class FixedClock : TimeProvider
@@ -75,7 +77,7 @@ public sealed class ActivityAdventuresTests : IAsyncLifetime
     private async Task Gm(string account, string line)
     {
         using var client = new HttpClient();
-        var response = await client.PostAsync($"{_http}/ro3emu/gm?account={account}", new StringContent(line));
+        var response = await client.PostAsync($"{_http}/ro3emu/gm?account={account}", Operator.Command(line));
         response.EnsureSuccessStatusCode();
         if (line.StartsWith("!warp ", StringComparison.Ordinal))
         {
@@ -644,7 +646,7 @@ public sealed class ActivityAdventuresTests : IAsyncLifetime
         await Gm("alice", $"!jump {x} {z}");
         await alice.SendGameAsync(SceneService.NpcInteraction, new NpcInteractionReq
         {
-            NpcUid = SceneService.TreasureUidPrefix | session.Role!.Id, InteractionId = 4,
+            NpcUid = SceneService.TreasureUidPrefix | session.Role!.Id, InteractionId = 21070002,
         });
         var interaction = await Next(alice, SceneService.NpcInteraction, NpcInteractionRsp.Parser);
         Assert.Equal(0, interaction.Result);
@@ -653,10 +655,94 @@ public sealed class ActivityAdventuresTests : IAsyncLifetime
 
         await alice.SendGameAsync(SceneService.NpcInteraction, new NpcInteractionReq
         {
-            NpcUid = SceneService.TreasureUidPrefix | session.Role.Id, InteractionId = 4,
+            NpcUid = SceneService.TreasureUidPrefix | session.Role.Id, InteractionId = 21070002,
         });
         Assert.NotEqual(0, (await Next(alice, SceneService.NpcInteraction, NpcInteractionRsp.Parser,
             i => i.Result != 0)).Result);
+    }
+
+    [ClientDataFact]
+    public async Task TreasureMapStartsOnlyWhereTheClientCanPathToItsPoint()
+    {
+        var window = _app.Services.GetRequiredService<ActivityClock>()
+            .Segments(1017, _clock.GetUtcNow().ToUnixTimeSeconds()).Single();
+        _clock.Set(window.Start + 60);
+        await using var alice = await InWorld("Alice");
+        await Gm("alice", "!lvl 99");
+        await Gm("alice", "!item 1112001 2");
+        var session = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Role?.Name == "Alice");
+        long guid = session.Items.Single(i => i.Entry == 1112001).Guid;
+        async Task<int> Use()
+        {
+            await alice.SendGameAsync(CharacterService.ItemUse, new ItemUseReq { ItemGuid = guid, ItemCount = 1 });
+            return (await Next(alice, CharacterService.ItemUse, ItemUseResp.Parser)).Result;
+        }
+
+        // Prontera has no TreasureHuntMapPointConfig row. LC_System_SeasonTreasure.StartHunt paths only on the current map.
+        await Gm("alice", "!warp 10100");
+        Assert.Equal(ErrorCodes.TreasurePointNotOnMap, await Use());
+        Assert.Equal(0, session.ActivityRuntime.AdventureTreasure.PointId);
+        Assert.Equal(2, session.Items.Single(i => i.Guid == guid).Stack);
+
+        await Gm("alice", "!warp 10110");
+        Assert.Equal(0, await Use());
+        long point = session.ActivityRuntime.AdventureTreasure.PointId;
+        var target = _app.Services.GetRequiredService<SceneService>().TreasurePoint(point);
+        Assert.Equal(10110, target!.Value.Scene);
+
+        // ItemUseResp has no parameter, so a parameterized text would show its raw placeholder.
+        Assert.Equal(ErrorCodes.ItemCannotBeUsed, await Use());
+        await Gm("alice", "!warp 10100");
+        Assert.Equal(ErrorCodes.TreasurePointNotOnMap, await Use());
+        Assert.Equal(point, session.ActivityRuntime.AdventureTreasure.PointId);
+        Assert.Equal(1, session.Items.Single(i => i.Guid == guid).Stack);
+    }
+
+    [ClientDataFact]
+    public void EveryTreasurePointStandsWithinDigReachOfTheGround()
+    {
+        var scene = _app.Services.GetRequiredService<SceneService>();
+        var world = _app.Services.GetRequiredService<WorldData>();
+        foreach (long id in _app.Services.GetRequiredService<GameData>().Table("TreasureHuntMapPointConfig").Values
+            .Select(r => GameData.Int(r, "_iId")).Where(id => id > 0))
+        {
+            var (mapId, at) = scene.TreasurePoint(id)!.Value;
+            Assert.Equal(world.Map(mapId)!.Nav!.WalkHeight(at.X, at.Z, at.Y), at.Y);
+        }
+        Assert.Equal(-3f, scene.TreasurePoint(1033)!.Value.Position.Y, 0.01f);
+    }
+
+    [ClientDataFact]
+    public async Task SeasonalItemBelongsToTheCurrentSeasonAndOthersHaveNone()
+    {
+        await using var alice = await InWorld("Alice");
+        await Gm("alice", "!item 1112002 1");
+        var rare = await Next(alice, CharacterService.ItemsSync, DBItemsInfoIncrement.Parser,
+            m => m.PackInfo.TryGetValue(1, out var pack) && pack.Inc?.Items.Values.Any(i => i.All?.ItemEntry == 1112002) == true);
+        Assert.Equal(_app.Services.GetRequiredService<SeasonService>().SeasonId,
+            rare.PackInfo[1].Inc.Items.Values.Single(i => i.All?.ItemEntry == 1112002).All.Season);
+        await Gm("alice", "!item 1112001 1");
+        var plain = await Next(alice, CharacterService.ItemsSync, DBItemsInfoIncrement.Parser,
+            m => m.PackInfo.TryGetValue(1, out var pack) && pack.Inc?.Items.Values.Any(i => i.All?.ItemEntry == 1112001) == true);
+        Assert.Equal(0, plain.PackInfo[1].Inc.Items.Values.Single(i => i.All?.ItemEntry == 1112001).All.Season);
+    }
+
+    [ClientDataFact]
+    public async Task RareTreasureMapHuntsOnTheCurrentMapToo()
+    {
+        var window = _app.Services.GetRequiredService<ActivityClock>()
+            .Segments(1017, _clock.GetUtcNow().ToUnixTimeSeconds()).Single();
+        _clock.Set(window.Start + 60);
+        await using var alice = await InWorld("Alice");
+        await Gm("alice", "!lvl 99");
+        await Gm("alice", "!item 1112002 1");
+        await Gm("alice", "!warp 10110");
+        var session = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Role?.Name == "Alice");
+        await alice.SendGameAsync(CharacterService.ItemUse, new ItemUseReq
+        { ItemGuid = session.Items.Single(i => i.Entry == 1112002).Guid, ItemCount = 1 });
+        Assert.Equal(0, (await Next(alice, CharacterService.ItemUse, ItemUseResp.Parser)).Result);
+        var target = _app.Services.GetRequiredService<SceneService>().TreasurePoint(session.ActivityRuntime.AdventureTreasure.PointId);
+        Assert.Equal(10110, target!.Value.Scene);
     }
 
     [ClientDataFact]
@@ -684,7 +770,7 @@ public sealed class ActivityAdventuresTests : IAsyncLifetime
         {
             session.Dead = false;
             var item = session.Items.Single(i => i.Guid == guid);
-            item.BindExpire = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 1;
+            item.BindExpire = _clock.GetUtcNow().ToUnixTimeSeconds() - 1;
             itemStore.Update(item);
             return Task.CompletedTask;
         });
@@ -1109,6 +1195,85 @@ public sealed class ActivityAdventuresTests : IAsyncLifetime
         return path?.FullName ?? throw new DirectoryNotFoundException("Repository data/config");
     }
 
+    /// <summary>A dig that disturbs the Drake boss (TreasureHuntResultRateConfig 5) announces ChatConfig 401 to everyone
+    /// online. The finder is mailed the boss's _iAwardId (Dig - Precious Chest) and another player who hit it is mailed
+    /// _iAssistAwardId (Dig - Co-op Chest).</summary>
+    [ClientDataFact]
+    public async Task TreasureBossIsAnnouncedAndHelpersGetTheCoopChest()
+    {
+        var window = _app.Services.GetRequiredService<ActivityClock>()
+            .Segments(1017, _clock.GetUtcNow().ToUnixTimeSeconds()).Single();
+        _clock.Set(window.Start + 60);
+        await using var alice = await InWorld("Alice");
+        await using var bob = await InWorld("Bob");
+        await Gm("alice", "!lvl 99");
+        await Gm("bob", "!lvl 99");
+        await Gm("alice", "!item 1112001 1");
+        var registry = _app.Services.GetRequiredService<SessionRegistry>();
+        var finder = registry.All().Single(s => s.Role?.Name == "Alice");
+        var helper = registry.All().Single(s => s.Role?.Name == "Bob");
+        Assert.Equal(finder.WorldScene, helper.WorldScene);
+        _app.Services.GetRequiredService<NewActivityService>().TreasureOutcomeForTest = 5;
+
+        long guid = finder.Items.Single(i => i.Entry == 1112001).Guid;
+        await alice.SendGameAsync(CharacterService.ItemUse, new ItemUseReq { ItemGuid = guid, ItemCount = 1 });
+        Assert.Equal(0, (await Next(alice, CharacterService.ItemUse, ItemUseResp.Parser)).Result);
+        var cursor = await Next(alice, 5064, DBTreasureInfoIncrement.Parser, i => i.PointId > 0);
+        var target = _app.Services.GetRequiredService<SceneService>().TreasurePoint(cursor.PointId)!.Value;
+        Assert.Equal(finder.SceneEntry, target.Scene);
+        string x = target.Position.X.ToString(CultureInfo.InvariantCulture);
+        string z = target.Position.Z.ToString(CultureInfo.InvariantCulture);
+        await Gm("alice", $"!jump {x} {z}");
+        await Gm("bob", $"!jump {x} {z}");
+        await alice.SendGameAsync(SceneService.NpcInteraction, new NpcInteractionReq
+        {
+            NpcUid = SceneService.TreasureUidPrefix | finder.Role!.Id, InteractionId = 21070002,
+        });
+        Assert.Equal(0, (await Next(alice, SceneService.NpcInteraction, NpcInteractionRsp.Parser)).Result);
+        Assert.Equal(5, (int)(await Next(alice, 83251, TreasureEventNotify.Parser)).Type);
+
+        string map = _app.Services.GetRequiredService<Ro3Emu.Server.Data.GameData>().MapName(finder.SceneEntry);
+        foreach (var bot in new[] { alice, bob })
+        {
+            var marquee = await Next(bot, 1022, SystemBoardCastMsgNtf.Parser, n => n.ChatId == 401);
+            Assert.Equal("Alice", marquee.ParamList[1].Params.Single());
+            Assert.Equal(map, marquee.ParamList[2].Params.Single());
+        }
+
+        var loop = _app.Services.GetRequiredService<GameLoop>();
+        long bossUid = finder.ActivityRuntime.AdventureTreasure.PendingMonsterUid;
+        var boss = await loop.InvokeAsync(() => Task.FromResult(_app.Services.GetRequiredService<Ro3Emu.Server.Maps.World>()
+            .Map(finder.WorldScene).Units.OfType<Ro3Emu.Server.Maps.MonsterUnit>().Single(u => u.Uid == bossUid)));
+        Assert.Equal(80000002, boss.Template.NpcId);
+
+        // Bob hits it first without killing it, then Alice lands the final blow.
+        await loop.InvokeAsync(() => { boss.Hp = Math.Max(boss.Template.MaxHp, 10_000_000); return Task.CompletedTask; });
+        await bob.SendGameAsync(MsgId.Walk, new WalkReq { Pos = boss.Pos, BStop = true, SpeedRate = 1 });
+        await bob.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1000001, TargetId = boss.Uid });
+        Assert.Equal(0, (await Next(bob, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
+        await Next(bob, CombatService.SkillHit, SkillHitInfo.Parser, h => h.Dsts.Any(d => d.DstID == boss.Uid));
+        await loop.InvokeAsync(() => { boss.Hp = 1; return Task.CompletedTask; });
+        await alice.SendGameAsync(MsgId.Walk, new WalkReq { Pos = boss.Pos, BStop = true, SpeedRate = 1 });
+        await alice.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1000001, TargetId = boss.Uid });
+        Assert.Equal(0, (await Next(alice, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
+        await Next(alice, CombatService.SkillHit, SkillHitInfo.Parser, h => h.Dsts.Any(d => d.DstID == boss.Uid && d.IsDead));
+
+        // MailConfig 11603 "Dig Rewards" (finder's boss kill) and 11604 (assist), each carrying its configured chest.
+        var roles = _app.Services.GetRequiredService<RoleStore>();
+        MailService.Letter[] Letters(GameSession s) => roles.LoadMailbox(s.Role!.Id) is { } blob
+            ? [.. JsonSerializer.Deserialize<MailService.Mailbox>(blob)!.Letters] : [];
+        bool Mailed(GameSession s, int template, int entry) =>
+            Letters(s).Any(l => l.TemplateId == template && l.Attachments.Any(a => a.Entry == entry && a.Count == 1));
+        var deadline = DateTime.UtcNow + Wait;
+        while (DateTime.UtcNow < deadline && !(Mailed(finder, 11603, 1300088) && Mailed(helper, 11604, 1300089)))
+            await Task.Delay(50);
+        Assert.True(Mailed(finder, 11603, 1300088), "finder's Dig - Precious Chest mail");
+        Assert.True(Mailed(helper, 11604, 1300089), "helper's Dig - Co-op Chest mail");
+        Assert.DoesNotContain(Letters(finder), l => l.TemplateId == 11604);
+        Assert.DoesNotContain(finder.Items, i => i.Entry == 1300088);
+        Assert.Equal(0, finder.ActivityRuntime.AdventureTreasure.PendingMonsterAward);
+    }
+
     /// <summary>106802 counts a committed dig at the Treasure Map's point (growth title 4's 704090 [106802,20], the
     /// activity quest 110008 [106802,1]); using the map alone is not a dig. The count survives a relogin.</summary>
     [ClientDataFact]
@@ -1135,7 +1300,7 @@ public sealed class ActivityAdventuresTests : IAsyncLifetime
         await Gm("alice", $"!jump {x} {z}");
         await alice.SendGameAsync(SceneService.NpcInteraction, new NpcInteractionReq
         {
-            NpcUid = SceneService.TreasureUidPrefix | session.Role!.Id, InteractionId = 4,
+            NpcUid = SceneService.TreasureUidPrefix | session.Role!.Id, InteractionId = 21070002,
         });
         Assert.Equal(0, (await Next(alice, SceneService.NpcInteraction, NpcInteractionRsp.Parser)).Result);
         await Next(alice, 83251, TreasureEventNotify.Parser);

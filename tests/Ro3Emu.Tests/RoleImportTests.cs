@@ -74,7 +74,7 @@ public sealed class RoleImportTests
         // The active plan carries exactly the worn items, one per grid, all of them equipment pack (2).
         var active = equip.EquipPlans[equip.CurrentEquipPlan];
         Assert.Equal([1, 2, 3, 4, 5, 6, 7], active.ItemsEquipGrid.Keys.Order());
-        Assert.Equal(worn, active.ItemsEquipGrid.Values.ToHashSet());
+        Assert.Equal(worn, [.. active.ItemsEquipGrid.Values]);
         Assert.All(plan.Items.Where(item => item.Grid > 0), item => Assert.Equal(2, item.Pack));
         Assert.Equal(1, plan.Items.Count(item => item.Grid == 1));
     }
@@ -187,7 +187,7 @@ public sealed class RoleImportTests
         Assert.NotEmpty(guides.FinishedGuideIds);
         // The runtime carries the guides the TGuide objectives read, and the old story's award debt is gone.
         var runtime = JsonSerializer.Deserialize<TaskRuntimeState>(plan.Blobs["task_runtime"])!;
-        Assert.Equal(guides.FinishedGuideIds.ToHashSet(), runtime.CompletedGuides);
+        Assert.Equal([.. guides.FinishedGuideIds], runtime.CompletedGuides);
         Assert.Equal("[]", System.Text.Encoding.UTF8.GetString(plan.Blobs["task_followup"]));
     }
 

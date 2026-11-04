@@ -2,6 +2,7 @@ using System.Text.Json;
 using Romsg;
 using Ro3Emu.Server.Accounts;
 using Ro3Emu.Server.Data;
+using Ro3Emu.Server.Data.Config;
 
 namespace Ro3Emu.Server.Game;
 
@@ -23,7 +24,7 @@ public sealed partial class EmblemService
 
     public sealed class EmblemState
     {
-        public Dictionary<int, Plan> Plans { get; set; } = new();
+        public Dictionary<int, Plan> Plans { get; set; } = [];
         public int CurrentPlan { get; set; }
         public long HistorySeasonPower { get; set; }
         /// <summary>The role's published and best power total (PowerService); null before its first publish.</summary>
@@ -32,7 +33,7 @@ public sealed partial class EmblemService
 
     public sealed class Plan
     {
-        public Dictionary<int, long> Slots { get; set; } = new();
+        public Dictionary<int, long> Slots { get; set; } = [];
         public string Name { get; set; } = "";
     }
 
@@ -44,7 +45,7 @@ public sealed partial class EmblemService
     private readonly ILogger<EmblemService> _log;
 
     /// <summary>After a committed 82424 upgrade: the levels it gained (quest target 317002). Listeners post their work.</summary>
-    public List<Action<GameSession, int>> Upgraded { get; } = new();
+    public List<Action<GameSession, int>> Upgraded { get; } = [];
 
     public EmblemService(GameData data, CharacterService character, FunctionService functions, SeasonService seasons,
         RoleStore roles, ILogger<EmblemService> log)
@@ -89,11 +90,13 @@ public sealed partial class EmblemService
                 item.Sort = nextSort;
                 changed = true;
             }
-            if (item.Attrs == null || !item.Attrs.ContainsKey(Level))
+            if (item.Attrs == null || !item.Attrs.TryGetValue(Level, out long reached))
             {
                 item.Attrs = GenerateAttrs(item.Entry);
                 changed = true;
             }
+            // Echoes levelled before random marks were rolled hold 0 in their lit slots.
+            else if (AddMarks(item.Attrs, item.Entry, (int)reached)) changed = true;
         }
         var active = next.Plans[next.CurrentPlan];
         var seen = new HashSet<long>();
@@ -109,7 +112,7 @@ public sealed partial class EmblemService
         foreach (var item in afterItems.Where(i => IsEmblem(_data, i.Entry)))
         {
             int slot = active.Slots.FirstOrDefault(p => p.Value == item.Guid).Key;
-            item.Attrs ??= new();
+            item.Attrs ??= [];
             if (item.Attrs.GetValueOrDefault(Source) == (slot == 0 ? 0 : 2)
                 && item.Attrs.GetValueOrDefault(Position) == slot) continue;
             item.Attrs[Source] = slot == 0 ? 0 : 2;
@@ -265,6 +268,10 @@ public sealed partial class EmblemService
         return stages;
     }
 
+    /// <summary>Lit marks of one id on the active plan's echoes (LC_SpecialEffectHelper._getEmblemMarkCount).</summary>
+    internal static int MarkCount(GameSession session, long mark, GameData data) =>
+        MarkCounts(Worn(session), data).GetValueOrDefault(mark);
+
     /// <summary>Lit marks per mark id over the given echoes (LC_EmblemHelper.GetAllMarkEquipedNum).</summary>
     private static Dictionary<long, int> MarkCounts(IEnumerable<InvItem> worn, GameData data)
     {
@@ -280,7 +287,7 @@ public sealed partial class EmblemService
     }
 
     public static bool IsReserved(GameSession session, InvItem item) =>
-        item.Attrs?.GetValueOrDefault(Source) == 2 || session.Emblems.Plans.Values.Any(p => p.Slots.Values.Contains(item.Guid));
+        item.Attrs?.GetValueOrDefault(Source) == 2 || session.Emblems.Plans.Values.Any(p => p.Slots.ContainsValue(item.Guid));
 
     public static bool IsEmblem(GameData data, int entry) =>
         data.Row("ItemConfig", entry) is { } row && GameData.Int(row, "_iType") == 8 && GameData.Int(row, "_iSubType") == 800;
@@ -359,7 +366,7 @@ public sealed partial class EmblemService
         if (code == 0) code = req.EmblemPos is < FirstSlot or > LastSlot ? ErrorCodes.EmblemSlot
             : item == null || !IsEmblem(_data, item.Entry) ? ErrorCodes.EmblemInvalid
             : !SeasonValid(item.Entry) ? ErrorCodes.EmblemOtherSeason
-            : plan.Slots.Values.Contains(req.EmblemGuid) ? ErrorCodes.EmblemAlreadyDeployed : 0;
+            : plan.Slots.ContainsValue(req.EmblemGuid) ? ErrorCodes.EmblemAlreadyDeployed : 0;
         long oldGuid = code == 0 ? plan.Slots.GetValueOrDefault(req.EmblemPos) : 0;
         if (code == 0)
         {
@@ -369,10 +376,10 @@ public sealed partial class EmblemService
             var next = CopyState(session.Emblems);
             if (oldGuid != 0 && afterItems.FirstOrDefault(i => i.Guid == oldGuid) is { } old)
             {
-                old.Attrs ??= new(); old.Attrs[Source] = 0; old.Attrs[Position] = 0;
+                old.Attrs ??= []; old.Attrs[Source] = 0; old.Attrs[Position] = 0;
             }
             var deployed = afterItems.Single(i => i.Guid == req.EmblemGuid);
-            deployed.Attrs ??= GenerateAttrs(deployed.Entry) ?? new();
+            deployed.Attrs ??= GenerateAttrs(deployed.Entry) ?? [];
             deployed.Attrs[Source] = 2; deployed.Attrs[Position] = req.EmblemPos;
             next.Plans[next.CurrentPlan].Slots[req.EmblemPos] = deployed.Guid;
             await CommitEmblemsAsync(session, "emblem-setup", next, beforeItems, afterItems, [],
@@ -401,7 +408,7 @@ public sealed partial class EmblemService
             next.Plans[next.CurrentPlan].Slots.Remove(req.EmblemPos);
             if (afterItems.FirstOrDefault(i => i.Guid == guid) is { } item)
             {
-                item.Attrs ??= new(); item.Attrs[Source] = 0; item.Attrs[Position] = 0;
+                item.Attrs ??= []; item.Attrs[Source] = 0; item.Attrs[Position] = 0;
             }
             await CommitEmblemsAsync(session, "emblem-setdown", next, beforeItems, afterItems, [],
                 new { req.EmblemPos, EmblemGuid = guid });
@@ -469,7 +476,7 @@ public sealed partial class EmblemService
             try
             {
                 // Compute the whole new item state before payment; no roll/overflow can fail after item removal.
-                upgradedAttrs = target!.Attrs == null ? GenerateAttrs(target.Entry) ?? new() : new(target.Attrs);
+                upgradedAttrs = target!.Attrs == null ? GenerateAttrs(target.Entry) ?? [] : new(target.Attrs);
                 long remaining = checked(upgradedAttrs.GetValueOrDefault(Exp) + xp);
                 int next = level;
                 while (next < cap && LevelRow(quality, next + 1) is { } row && remaining >= GameData.Int(row, "_iExp"))
@@ -594,17 +601,38 @@ public sealed partial class EmblemService
         }
     }
 
-    private void AddMarks(Dictionary<int, long> attrs, int entry, int level)
+    /// <summary>
+    /// Lights the _kInitialMark slots the level reached; true when that changed the item. A slot's mark 0 is a random
+    /// element, rolled once: UI_Sys_SoulUpgradePanelCtrl (:1147-1149, PlayChaosMarkUpgradeSound :1202-1277) animates
+    /// such a slot as random and then reads its real mark off the upgraded item, and the help text says each lit element is random.
+    /// </summary>
+    private bool AddMarks(Dictionary<int, long> attrs, int entry, int level)
     {
-        if (_data.Row("EmblemConfig", entry) is not { } row || !row.TryGetProperty("_kInitialMark", out var list) || list.ValueKind != JsonValueKind.Array) return;
+        if (_data.Row("EmblemConfig", entry) is not { } row || !row.TryGetProperty("_kInitialMark", out var list) || list.ValueKind != JsonValueKind.Array) return false;
+        bool changed = false;
         int slot = 0;
         foreach (var pair in list.EnumerateArray())
         {
             if (slot >= 10 || pair.ValueKind != JsonValueKind.Array || pair.GetArrayLength() < 2) break;
             if ((long)(GameData.Number(pair[0]) ?? 0) > level) break;
-            attrs[1021 + slot] = (long)(GameData.Number(pair[1]) ?? 0);
+            long mark = (long)(GameData.Number(pair[1]) ?? 0);
+            if (mark == 0) mark = attrs.GetValueOrDefault(1021 + slot) is var kept and > 0 ? kept : RollMark();
+            if (!attrs.TryGetValue(1021 + slot, out long held) || held != mark)
+            {
+                attrs[1021 + slot] = mark;
+                changed = true;
+            }
             slot++;
         }
+        return changed;
+    }
+
+    /// <summary>Uniform over the elements EmblemMarkConfig has stages for (inferred: the client holds no weights).</summary>
+    private long RollMark()
+    {
+        var pool = EmblemMarkConfig.All(_data).Where(r => r.MarkStage > 0 && SeasonRowsValid(r.Row))
+            .Select(r => r.EmblemMarkId).Distinct().ToArray();
+        return pool.Length == 0 ? 0 : pool[Random.Shared.Next(pool.Length)];
     }
 
     /// <summary>Positive-weight rows selected without replacement by actual attribute ID (inferred selection).</summary>

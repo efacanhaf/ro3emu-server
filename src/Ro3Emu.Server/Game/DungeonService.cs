@@ -25,10 +25,13 @@ public sealed partial class DungeonService
     public const uint PlotSceneEvent = 84012;
 
     /// <summary>Committed clears only; consumers receive the scene entry and whether an actual personal award was paid.</summary>
-    public List<Func<GameSession, int, bool, Task>> Completed { get; } = new();
+    public List<Func<GameSession, int, bool, Task>> Completed { get; } = [];
     /// <summary>After <see cref="Completed"/> for a TenGameplay run: the boss (TenGameplayBossConfig._iBoss) and the
     /// run's settled participants (quest target 106602).</summary>
-    public List<Func<GameSession, long, IReadOnlyCollection<GameSession>, Task>> MultiBossCleared { get; } = new();
+    public List<Func<GameSession, long, IReadOnlyCollection<GameSession>, Task>> MultiBossCleared { get; } = [];
+    /// <summary>A loaded member's dungeon task tracker (TaskService.OnDungeonRun): scene, instance and the scripted steps
+    /// the run has passed. Listeners post their work.</summary>
+    public List<Action<GameSession, long, long, int>> RunTracked { get; } = [];
     /// <summary>Guild Challenge owns admission and rewards; this engine retains scenes, combat and cleanup.</summary>
     internal Func<GameSession, EnterDungeonReq, Task<bool>>? GuildChallengeEnter { get; set; }
     /// <summary>Another private-room owner whose 30402 exit revives a dead member on return (the guild home).</summary>
@@ -46,6 +49,7 @@ public sealed partial class DungeonService
     private readonly SeasonService _seasons;
     private readonly InstanceService _instances;
     private readonly TeamService _teams;
+    private readonly WorldInteractionService _vehicles;
     private readonly SessionRegistry _sessions;
     private readonly RewardService _rewards;
     private readonly AuctionService _auctions;
@@ -62,7 +66,8 @@ public sealed partial class DungeonService
     private readonly AwardService _awards;
     private readonly ServerOptions _options;
     private readonly PraiseService _praise;
-    private readonly Dictionary<GameSession, Preparation> _pending = new();
+    private readonly TestingSwitches _testing;
+    private readonly Dictionary<GameSession, Preparation> _pending = [];
 
     public DungeonService(GameData data, DungeonCatalog catalog, RoleStore roles, Ownership.OwnerRegistry owners,
         DungeonObligationStore obligations, CharacterService character,
@@ -70,9 +75,10 @@ public sealed partial class DungeonService
         SessionRegistry sessions, RewardService rewards, AuctionService auctions, GuildStore guilds, MonsterService monsters, CombatService combat,
         SceneService scene, BuffService buffs, GameLoop loop, TimeProvider clock, ILogger<DungeonService> log, World world,
         GmCommands gm, AccountStore accounts, AwardService awards, Microsoft.Extensions.Options.IOptions<ServerOptions> options,
-        PraiseService praise)
+        PraiseService praise, WorldInteractionService vehicles, TestingSwitches testing)
     {
         this._accounts = accounts; this._awards = awards; this._options = options.Value; this._praise = praise;
+        this._testing = testing;
         gm.Register("firstclear", "<bossId> [daysAgo] | <bossId> clear (Realm of the Gods test aid: the server's first clear "
             + "of a boss, which unlocks its hall of fame entry and Sacred Blessing)", FirstClearGmAsync);
         this._data = data; this._catalog = catalog; this._roles = roles; this._owners = owners;
@@ -85,7 +91,12 @@ public sealed partial class DungeonService
         this._buffs = buffs;
         this._scenes = scene;
         this._world = world;
+        this._vehicles = vehicles;
+        scene.WalkOnRide = vehicles.IsSeatedOnSceneActor;
+        combat.GrantedSkill.Add(FiresCannon);
+        combat.AimsFromSeat = FiresCannon;
         gm.Register("actors", "[npcId | walk <x> <z> | use] (scripted scene test aid: the step's scene actors, jump beside one, arrive at x z as a walk would, or complete the step server-side)", ActorsGmAsync);
+        WireRaidTrials(combat, gm);
         teams.MultiDungeonInfo = TeamDungeonInfo;
         combat.DamageAdjusters.Add((s, m, _, _, damage) => BondDamage(s, m, damage, incoming: false));
         combat.IncomingDamageAdjusters.Add((m, s, _, damage) => Task.FromResult(BondDamage(s, m, damage, incoming: true)));
@@ -103,6 +114,9 @@ public sealed partial class DungeonService
 
     public sealed class Attempt
     {
+        /// <summary>Who sits on a scene actor now (a ride, DungeonService.Ride), with the seat's token.</summary>
+        internal Dictionary<GameSession, long> Riders { get; } = [];
+
         public required InstanceService.Room Room { get; init; }
         public required DungeonCatalog.Plan Plan { get; init; }
         public required long Leader { get; init; }
@@ -110,22 +124,24 @@ public sealed partial class DungeonService
         public required int PlayBook { get; init; }
         public required int SeasonId { get; init; }
         public bool Matched { get; init; }
-        public HashSet<GameSession> Loaded { get; } = new();
+        public HashSet<GameSession> Loaded { get; } = [];
         /// <summary>30441 roster slots by role (index = 0-based position), fixed on the first roster.</summary>
-        public List<long> Slots { get; } = new();
-        public HashSet<long> Killed { get; } = new();
+        public List<long> Slots { get; } = [];
+        public HashSet<long> Killed { get; } = [];
         /// <summary>The completing events a step with "all" has seen so far.</summary>
         public HashSet<(ReconstructedDungeons.TriggerKind Kind, long Id)> StepSeen { get; } = [];
         /// <summary>A scripted step's strikes taken so far, by monster uid.</summary>
-        public Dictionary<long, int> Struck { get; } = [];
         /// <summary>A step's own timers' generation: each step (and each new hide-and-seek game) starts a new one, so a
         /// stale timer does nothing.</summary>
         public int StepGeneration { get; set; }
+        /// <summary>The running step's <see cref="ReconstructedDungeons.ScriptedStep.HoldAfterMs"/> was started / is over.</summary>
+        public bool StepHeld { get; set; }
+        public bool StepHoldOver { get; set; }
         /// <summary>A hide-and-seek step: the round being played (1-based) and the hiding places already searched in
         /// this game.</summary>
         public int SeekRound { get; set; }
         public HashSet<long> Searched { get; } = [];
-        public HashSet<long> Precounted { get; } = new();
+        public HashSet<long> Precounted { get; } = [];
         public bool ObligationsFrozen { get; set; }
         public bool ObligationsActivated { get; set; }
         public bool FrozenWin { get; set; }
@@ -135,12 +151,12 @@ public sealed partial class DungeonService
         public string? TerminalKillSource { get; set; }
         public RewardSettlement? ActivationSettlement { get; set; }
         internal SemaphoreSlim FreezeGate { get; } = new(1, 1);
-        public Dictionary<long, RoleStatisticsInfo> Stats { get; } = new();
-        public Dictionary<GameSession, Dictionary<int, long>> StartingItems { get; } = new();
-        public HashSet<GameSession> Paid { get; } = new();
-        public Dictionary<long, int> RevivesUsed { get; } = new();
-        public Dictionary<long, long> AutoReviveAt { get; } = new();
-        public HashSet<GameSession> Reviving { get; } = new();
+        public Dictionary<long, RoleStatisticsInfo> Stats { get; } = [];
+        public Dictionary<GameSession, Dictionary<int, long>> StartingItems { get; } = [];
+        public HashSet<GameSession> Paid { get; } = [];
+        public Dictionary<long, int> RevivesUsed { get; } = [];
+        public Dictionary<long, long> AutoReviveAt { get; } = [];
+        public HashSet<GameSession> Reviving { get; } = [];
         public bool Started { get; set; }
         public bool Settled { get; set; }
         public int Wave { get; set; }
@@ -154,13 +170,23 @@ public sealed partial class DungeonService
         public bool Spawning { get; set; }
         /// <summary>The current scripted step got one of its completing client events (DungeonService.Scripted).</summary>
         public bool StepDone { get; set; }
+        /// <summary>The wave whose scripted step was completed, so its counter reads full and the next one's does not.</summary>
+        public int GoalFullWave { get; set; } = -1;
         /// <summary>A Realm of the Gods raid waits in its preparation phase (DungeonService.RealmOfGods).</summary>
         public bool Preparing { get; set; }
         /// <summary>The boss's Sacred Blessing level (TenGameplayBuffConfig row) active for this run, fixed at its start.</summary>
         public JsonElement? Blessing { get; set; }
         /// <summary>The scripted scene actors shown now (also tracked by the room for cleanup).</summary>
-        internal List<SceneActorUnit> SceneActors { get; } = new();
+        internal List<SceneActorUnit> SceneActors { get; } = [];
+        /// <summary>Scene actors an earlier step took away: a late auto interaction on one is answered without an error.</summary>
+        internal HashSet<long> RetiredActors { get; } = [];
+        /// <summary>The scripted step's allied companions standing now (DungeonService.Companions; room props too).</summary>
+        internal List<CompanionUnit> Companions { get; } = [];
+        /// <summary>The companions (NPC, point) that fell in this run: they do not come back.</summary>
+        internal HashSet<(int NpcId, long Point)> FallenCompanions { get; } = [];
         internal GuildChallengeService.Run? GuildChallenge { get; set; }
+        /// <summary>A raid boss's scripted trials in this run (DungeonService.RaidTrials); null: none.</summary>
+        internal RaidRun? Raid { get; set; }
         /// <summary>Dracula's Lair: DraculaWeddingService owns admission, the bride, the key and the settlement.</summary>
         internal DraculaWeddingService.Run? Dracula { get; set; }
     }
@@ -171,14 +197,13 @@ public sealed partial class DungeonService
         public required GameSession Leader;
         public required GameSession[] Members;
         public required long TeamId;
-        public readonly HashSet<GameSession> Ready = new();
+        public readonly HashSet<GameSession> Ready = [];
         public bool Closed;
     }
 
     private static Attempt? Active(GameSession s) => s.DungeonAttempt is { Started: true, Settled: false } a
         && !a.Room.Closed && s.InstanceId == a.Room.Id && !s.SceneLoading ? a : null;
-    private static GameSession[] Present(Attempt a) => a.Room.ActiveMembers.Select(m => m.Session)
-        .Where(s => ReferenceEquals(s.DungeonAttempt, a) && s.InstanceId == a.Room.Id && s.Role != null).ToArray();
+    private static GameSession[] Present(Attempt a) => [.. a.Room.ActiveMembers.Select(m => m.Session).Where(s => ReferenceEquals(s.DungeonAttempt, a) && s.InstanceId == a.Room.Id && s.Role != null)];
     private static Dictionary<int, long> Inventory(GameSession s)
     {
         var counts = s.Items.GroupBy(i => i.Entry).ToDictionary(g => g.Key, g => g.Sum(i => (long)i.Stack));
@@ -208,7 +233,9 @@ public sealed partial class DungeonService
         return 0;
     }
 
-    public async Task EnterAsync(GameSession s, EnterDungeonReq req)
+    /// <param name="alone">Enter only this role even in a party (a story region stepped into by a member who is not the
+    /// leader, <see cref="EnterFromRegionAsync"/>).</param>
+    public async Task EnterAsync(GameSession s, EnterDungeonReq req, bool alone = false)
     {
         await DeliverPendingAsync(s);
         if (GuildChallengeEnter != null && await GuildChallengeEnter(s, req)) return;
@@ -216,7 +243,7 @@ public sealed partial class DungeonService
         int error = plan == null ? ErrorCodes.DungeonDataMissing : Admission(s, plan, continuation: true);
         if (error == 0 && Preparing(s)) error = ErrorCodes.DungeonPreparing;
         var membership = s.Role != null ? _teams.TeamOf(s.Role.Id) : default;
-        long[] ids = s.Role == null ? [] : plan?.MaxPlayers == 1 ? [s.Role.Id] : _teams.MembersOf(s.Role.Id).ToArray();
+        long[] ids = s.Role == null ? [] : alone || plan?.MaxPlayers == 1 ? [s.Role.Id] : [.. _teams.MembersOf(s.Role.Id)];
         var online = _sessions.All().Where(p => p.Role != null).ToDictionary(p => p.Role!.Id);
         var members = ids.Where(online.ContainsKey).Select(id => online[id]).ToArray();
         if (error == 0 && ids.Length > 1 && membership.Leader != s.Role!.Id) error = ErrorCodes.NoPermission;
@@ -239,7 +266,7 @@ public sealed partial class DungeonService
             || selected.DungeonId != 0 && selected.DungeonId != s.InstanceId)) error = ErrorCodes.Parameter;
         await s.SendGameAsync(Enter, new EnterDungeonRsp { Result = error });
         if (error != 0) return;
-        if (members.Length == 1) { await BeginAsync(plan!, members, s.Role!.Id, membership.TeamId); return; }
+        if (members.Length == 1) { await BeginAsync(plan!, members, s.Role!.Id, alone ? 0 : membership.TeamId); return; }
         var p = new Preparation { Plan = plan!, Members = members, Leader = s, TeamId = membership.TeamId };
         p.Ready.Add(s); // Initiating the request is the leader's affirmative answer (inferred).
         foreach (var member in members) _pending[member] = p;
@@ -306,7 +333,7 @@ public sealed partial class DungeonService
         // Revalidate everyone after the last confirmation; no member can enter dead/offline/in another scene.
         foreach (var member in p.Members)
         {
-            error = _sessions.All().Contains(member) ? Admission(member, p.Plan, continuation: true) : ErrorCodes.PlayerOffline;
+            error = _sessions.Contains(member) ? Admission(member, p.Plan, continuation: true) : ErrorCodes.PlayerOffline;
             if (error != 0) { await CancelAsync(p, error, member.Role?.Id ?? 0); return; }
         }
         p.Closed = true;
@@ -389,10 +416,23 @@ public sealed partial class DungeonService
     {
         if (s.DungeonAttempt is not { } a || s.InstanceId != a.Room.Id || a.Room.Closed || !a.Loaded.Add(s)) return;
         await s.SendGameAsync(BaseInfo, Snapshot(a));
+        TrackRun(a, [s], TrackerStep(a));
         await SendReviveInfoAsync(s, a);
         await SendRosterAsync(a);
         await RefreshBondsAsync(a);
         if (ReadyToStart(a)) await StartAsync(a);
+    }
+
+    /// <summary>
+    /// The tracker step a run is at: the lair's wave (each wave is one of its dungeon tasks, DraculaWeddingService); a Guild
+    /// Challenge stage is rebuilt as its boss fight, so its chain is at the last step, the boss (inferred).
+    /// </summary>
+    private static int TrackerStep(Attempt a) => a.Settled ? TaskService.RunOver : a.GuildChallenge != null ? TaskService.FinalStep : a.Wave;
+
+    internal void TrackRun(Attempt a, IEnumerable<GameSession> members, int step)
+    {
+        foreach (var s in members)
+            foreach (var handler in RunTracked) handler(s, a.Plan.SceneEntry, a.Room.Id, step);
     }
 
     // Waiting for all remaining members before starting the encounter clock is (inferred).
@@ -432,6 +472,7 @@ public sealed partial class DungeonService
         }
         if (a.Dracula is { } dracula) snapshot.Vars.Add(dracula.Vars());
         if (FunctionButtons(a) is { } buttons) snapshot.Vars.Add(buttons);
+        if (GuideWays(a) is { } ways) snapshot.Vars.Add(ways);
         if (a.Preparing)
         {
             // (inferred) The preparation phase is the map's initializing state, ending when the boss fight begins.
@@ -477,8 +518,10 @@ public sealed partial class DungeonService
         var v = new DungeonVar { VarId = 10003 };
         if (Step(a) is { } step && size == 0)
         {
-            // A scripted step: its configured counter, or the events an "all" step has seen (inferred).
-            v.Vi64.Add(step.All ? [a.StepSeen.Count, step.Complete.Count] : [step.Goal.Done, step.Goal.Total]);
+            // A scripted step: its configured counter, or the events an "all" step has seen (inferred). A step that was
+            // completed reads full, or the tracker keeps "Open the treasured chest (0/1)" until the scene ends.
+            bool completed = a.GoalFullWave == a.Wave;
+            v.Vi64.Add(step.All ? [a.StepSeen.Count, step.Complete.Count] : [completed ? step.Goal.Total : step.Goal.Done, step.Goal.Total]);
             return v;
         }
         v.Vi64.Add([Math.Clamp(a.Killed.Count - a.WaveBase, 0, size), size]);
@@ -549,6 +592,7 @@ public sealed partial class DungeonService
         a.StartedAt = _loop.Now; a.StartMs = MonsterService.NowMs;
         await BroadcastAsync(a, BaseInfo, Snapshot(a));
         await SpawnWaveAsync(a);
+        StartRaidTrials(a);
         _loop.ScheduleLegacy(TimeSpan.FromMilliseconds(a.Plan.DurationMs), () => a.Settled || a.Room.Closed ? Task.CompletedTask : SettleAsync(a, false));
     }
 
@@ -584,7 +628,7 @@ public sealed partial class DungeonService
         foreach (var spawn in a.Plan.Waves[a.Wave].Spawns)
         {
             if (a.Settled || a.Room.Closed) { a.Spawning = false; return; }
-            var monster = await _instances.SpawnAsync(a.Room, spawn.NpcId, spawn.Point);
+            var monster = await _instances.SpawnAsync(a.Room, spawn.NpcId, spawn.Point, grounded: spawn.Route == null);
             if (a.Settled || a.Room.Closed)
             {
                 a.Spawning = false;
@@ -593,6 +637,11 @@ public sealed partial class DungeonService
             }
             if (monster == null) { a.Spawning = false; await SettleAsync(a, false); return; }
             a.Spawned++;
+            if (spawn.Route is { } route)
+            {
+                await FlyAsync(a, monster, route);
+                continue;
+            }
             // Multi-bosses retain their AI instead of being ordered to attack on scene load. In Culvert the
             // born point 15 is 15m from monster point 19; NPC 4300000/1 uses non-roaming AI 25000001 and
             // RaidFive_Boss00[easy], whose server script is absent. Waiting for a player hit/taunt is an
@@ -630,6 +679,19 @@ public sealed partial class DungeonService
     {
         if (a.Settled || a.Preparing || a.Spawning || a.Precounted.Count != 0 || a.Killed.Count != a.Spawned || a.Advancing) return;
         if (Step(a) != null && !a.StepDone) return;
+        // A scripted step's hold: what it showed (a bubble being read, an enemy falling) is not cut by the next step or the
+        // result. Only once per step, and not past the run's time limit.
+        if (Step(a) is { HoldAfterMs: > 0 } step && !a.StepHoldOver && _loop.Now - a.StartedAt < TimeSpan.FromMilliseconds(a.Plan.DurationMs))
+        {
+            if (a.StepHeld) return; // the hold is running; its end advances
+            a.StepHeld = true;
+            _loop.ScheduleLegacy(Paced(step.HoldAfterMs), () =>
+            {
+                a.StepHoldOver = true;
+                return a.Settled || a.Room.Closed ? Task.CompletedTask : AdvanceAsync(a);
+            }, "dungeon scripted step hold");
+            return;
+        }
         a.Advancing = true;
         if (_loop.Now - a.StartedAt >= TimeSpan.FromMilliseconds(a.Plan.DurationMs)) await SettleAsync(a, false);
         else if (a.Wave + 1 == a.Plan.Waves.Count) await SettleAsync(a, true);
@@ -673,14 +735,17 @@ public sealed partial class DungeonService
         && !a.AutoReviveAt.ContainsKey(p.Role!.Id)
         && a.RevivesUsed.GetValueOrDefault(p.Role.Id) >= ReviveLimit(a));
 
-    /// <summary>All resurrection sources obey the active dungeon's click-revive allowance.</summary>
+    /// <summary>The run revives this role without using a count: OnClickRevive [0], or its timed [2,n] request pending.</summary>
+    private static bool ReviveIsFree(Attempt a, long roleId) => ImmediateRevive(a) || a.AutoReviveAt.ContainsKey(roleId);
+
+    /// <summary>All resurrection sources obey the active dungeon's click-revive allowance, as ReviveAsync reads it.</summary>
     public int ExternalReviveError(GameSession s)
     {
         if (!s.Dead) return ErrorCodes.TargetAlive;
         if (s.DungeonAttempt == null) return 0;
         var a = Active(s);
         return a == null || s.Role == null || a.Reviving.Contains(s)
-            || a.RevivesUsed.GetValueOrDefault(s.Role.Id) >= ReviveLimit(a)
+            || !ReviveIsFree(a, s.Role.Id) && a.RevivesUsed.GetValueOrDefault(s.Role.Id) >= ReviveLimit(a)
             ? ErrorCodes.FeatureUnavailable : 0;
     }
 
@@ -690,10 +755,11 @@ public sealed partial class DungeonService
         if (s.DungeonAttempt == null) return;
         var a = Active(s);
         if (a == null || s.Role == null) return;
-        a.RevivesUsed[s.Role.Id] = a.RevivesUsed.GetValueOrDefault(s.Role.Id) + 1;
+        if (!ReviveIsFree(a, s.Role.Id)) a.RevivesUsed[s.Role.Id] = a.RevivesUsed.GetValueOrDefault(s.Role.Id) + 1;
+        a.AutoReviveAt.Remove(s.Role.Id); // or the next death keeps this one's time (PlayerDiedAsync TryAdd)
     }
 
-    public Task PublishExternalReviveAsync(GameSession s) => Active(s) is { } a
+    public Task PublishExternalReviveAsync(GameSession s) => s.Role != null && Active(s) is { } a
         ? SendReviveInfoAsync(s, a) : Task.CompletedTask;
 
     private async Task PlayerDiedAsync(GameSession s)
@@ -810,16 +876,31 @@ public sealed partial class DungeonService
         if (_pending.TryGetValue(s, out var p)) await CancelAsync(p, ErrorCodes.MemberLeft, s.Role?.Id ?? 0);
         if (s.DungeonAttempt is not { } a) return;
         s.DungeonAttempt = null; s.Attack = null;
-        if (a.Dracula is { } dracula) await dracula.Owner.LeftAsync(a, s);
-        await ClearBondsAsync(s, a);
-        await _instances.AbandonAsync(s);
+        try
+        {
+            if (a.Dracula is { } dracula) await dracula.Owner.LeftAsync(a, s);
+            await ClearBondsAsync(s, a);
+            await _instances.AbandonAsync(s);
+        }
+        // A full queue wrote nothing: the attempt stays for the handover's retry, which would otherwise find nothing to do.
+        catch (Exception e) when (Accounts.Persistence.QueueFullPatience.Refused(e))
+        {
+            s.DungeonAttempt = a;
+            throw;
+        }
         var remaining = Present(a);
         if (remaining.Length == 0) { a.Settled = true; return; }
         await RefreshBondsAsync(a);
         await SendRosterAsync(a);
         if (ReadyToStart(a)) await StartAsync(a);
-        else if (!a.Settled && Defeated(a)) await SettleAsync(a, false);
+        // A retry of this leave would not come back here, so a refused settlement for the others waits for room now; it
+        // reserves nothing before its freeze commits, so it can run again.
+        else if (!a.Settled && Defeated(a)) await Accounts.Persistence.QueueFullPatience.RunAsync(() => SettleAsync(a, false));
     }
+
+    // A scripted scene logs each walk/interaction step as it completes; its last fight step ends here, at the clear.
+    [LoggerMessage(Level = LogLevel.Information, Message = "Dungeon {Scene} instance {Instance} settled (cleared: {Cleared}) at step {Step}/{Steps}")]
+    private static partial void LogSettled(ILogger logger, long scene, long instance, bool cleared, int step, int steps);
 
     /// <summary>
     /// All configured actors dead before timeout wins (inferred predicate). Reserve once before any await.
@@ -833,6 +914,7 @@ public sealed partial class DungeonService
             a.Settled = true;
             await _instances.ClearMonstersAsync(a.Room);
             await BroadcastAsync(a, BaseInfo, Snapshot(a));
+            TrackRun(a, LoadedMembers(a), TaskService.RunOver);
             await challenge.Owner.SettleAsync(a, won);
             return;
         }
@@ -841,7 +923,9 @@ public sealed partial class DungeonService
             a.Settled = true;
             await _instances.ClearMonstersAsync(a.Room);
             a.SceneActors.Clear(); // removed with the room's monsters
+            a.Companions.Clear();
             await BroadcastAsync(a, BaseInfo, Snapshot(a));
+            TrackRun(a, LoadedMembers(a), TaskService.RunOver);
             await dracula.Owner.SettleAsync(a, won);
             return;
         }
@@ -850,11 +934,17 @@ public sealed partial class DungeonService
         await FreezeAsync(a, won);
         won = a.FrozenWin;
         a.Settled = true;
+        long scene = a.Plan.SceneEntry, instance = a.Room.Id;
+        int steps = a.Plan.Waves.Count, step = Math.Min(a.Wave + 1, steps);
+        LogSettled(_log, scene, instance, won, step, steps);
         var participants = Present(a).Where(a.Loaded.Contains).Select(s => (Session: s, Role: s.Role!.Id)).ToArray();
         var notifications = new List<Func<Task>>();
         var auctionAwards = new List<ItemBaseInfo>();
-        await _instances.ClearMonstersAsync(a.Room);
+        // A scripted scene's defeated enemies keep their bodies for their own remain time instead of vanishing with the result
+        // (the Eddga's body stays where it fell); the living ones and the scene actors are cleared as before.
+        await _instances.ClearMonstersAsync(a.Room, keepBodies: a.Plan.Waves.Any(w => w.Step != null));
         a.SceneActors.Clear(); // removed with the room's monsters
+        a.Companions.Clear();
         foreach (var (s, roleId) in participants)
         {
             if (s.Role?.Id != roleId) continue;
@@ -919,6 +1009,9 @@ public sealed partial class DungeonService
                 {
                     if (committed && goods.Count > 0) await _character.ItemsChangedAsync(s, stats: false);
                     await s.SendGameAsync(Result, result);
+                    if (success) await HideGuideWaysAsync(s, a);
+                    if (success && (LeavesAfterClear(a) || _catalog.ScriptedLeavesAfterClear(a.Plan.SceneEntry))) ScheduleLeaveAfterClear(s, a);
+                    else if (success && ContinuationOf(a.Plan.SceneEntry) is long nextScene and not 0) ScheduleContinuation(s, a, nextScene);
                     if (success && a.Plan.Multi != null)
                     {
                         var award = new SyncMultiDungeonAwardNotify
@@ -936,7 +1029,7 @@ public sealed partial class DungeonService
             });
         }
         if (won && a.Plan.Multi != null && a.Plan.Boss is { } cleared)
-            RecordFirstClear(a, cleared, participants.Select(p => p.Session).Where(s => s.Role != null).ToArray());
+            RecordFirstClear(a, cleared, [.. participants.Select(p => p.Session).Where(s => s.Role != null)]);
         // Finalize only from committed personal entitlements; pending journals recover on restart.
         if (won && a.Plan.Multi != null && _obligations.PendingRoom(a.Room.Id).Count == 0)
         {

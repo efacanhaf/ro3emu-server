@@ -1,5 +1,7 @@
 using System.Globalization;
 using Romsg;
+using Ro3Emu.Server.Data;
+using Ro3Emu.Server.Data.Config;
 using Ro3Emu.Server.Maps;
 
 namespace Ro3Emu.Server.Game;
@@ -18,6 +20,9 @@ public sealed partial class DungeonService
     /// [101018,1021301,1]); in each the fourth field is the running quest the region belongs to. Entering only while that
     /// quest runs keeps the region from re-entering the dungeon after the story moved on (inferred); the second field's
     /// meaning (always 1) is unverified and unused. Admission, loading and settlement are 30400's own.
+    /// The region belongs to the quest of the role that stepped in: a party member who is not the leader enters alone
+    /// (inferred: 30400's leader rule would refuse it with 1204 every step, and the client never asked to bring the
+    /// party); the leader brings the party through the usual ready check, as a 30400 of theirs would.
     /// </summary>
     public async Task<bool> EnterFromRegionAsync(GameSession s, MapRegion region)
     {
@@ -27,8 +32,14 @@ public sealed partial class DungeonService
         long task = parts.Length >= 4 && long.TryParse(parts[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out long t) ? t : 0;
         if (task != 0 && !(s.Tasks?.Infos.TryGetValue(task, out var info) == true && info.Status is TaskState.Running or TaskState.Finish))
             return false;
+        // The scene's own door (DungeonConfig _iDungeonConditionConfig, 1022001's asks for 1101, its quest still running) answers
+        // a step into the region with nothing: a player walking by a finished quest's region gets no "This feature is unavailable".
+        if (_data.Row("DungeonConfig", scene) is { } config && !_functions.ConditionMet(s, new DungeonConfig(config).DungeonConditionConfig))
+            return false;
         _log.LogInformation("{Name} enters region {Region}: dungeon {Scene} for task {Task}", s.Role?.Name, region.Id, scene, task);
-        await EnterAsync(s, new EnterDungeonReq { SceneEntry = scene });
+        var team = s.Role != null ? _teams.TeamOf(s.Role.Id) : default;
+        bool alone = team.TeamId != 0 && team.Leader != s.Role!.Id;
+        await EnterAsync(s, new EnterDungeonReq { SceneEntry = scene }, alone);
         return true;
     }
 }

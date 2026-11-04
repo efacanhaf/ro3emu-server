@@ -66,8 +66,7 @@ public sealed partial class AuctionService
     private long WorldCeiling(int entry) => data.Row("AuctionConfig", entry) is { } cfg
         ? Math.Max(0, GameData.Int(cfg, "_iWorldAuctionCeiling")) : 0;
 
-    private int OpenWorldLots(int entry) => store.Items().Count(r => r.Type == AuctionType.World && r.Entry == entry
-        && r.State != AuctionState.Settled);
+    private int OpenWorldLots(int entry) => store.OpenItems().Count(r => r.Type == AuctionType.World && r.Entry == entry);
 
     /// <summary>Exhibit start and the next WorldAuctionEnd o'clock strictly after it, in the realm's civil time.</summary>
     private (long Start, long End) WorldWindow(bool startNow)
@@ -157,7 +156,7 @@ public sealed partial class AuctionService
         long end = checked(start + Math.Max(1, Param("GuildAuctionTime", 30)) * 60);
         if (timedEvents.WindowEnd(activity) is { } windowEnd) end = Math.Min(end, windowEnd.ToUnixTimeSeconds());
         if (end <= start) return ErrorCodes.ActivityPeriod;
-        long[] members = participants.Distinct().Order().ToArray();
+        long[] members = [.. participants.Distinct().Order()];
         var (code, rows) = await PublishLotsAsync("auction/event-publish", $"act:{srcType}:{completionKey}",
             AuctionType.Act, srcType, 0, goods, members, start, end);
         if (rows.Length > 0)
@@ -205,7 +204,7 @@ public sealed partial class AuctionService
                     var row = new AuctionStore.Item
                     {
                         SourceKey = $"{source}:{index++}", Type = type, SrcType = srcType, GuildId = guildId,
-                        Entry = entry, Bind = bind, Eligible = eligible.ToList(), Start = start, End = end,
+                        Entry = entry, Bind = bind, Eligible = [.. eligible], Start = start, End = end,
                         State = start > Now ? AuctionState.Public : AuctionState.Bidding,
                         Price = (int)GameData.Int(cfg, "_iAuctionPrice"),
                         Raise = (int)GameData.Int(cfg, "_iBaseRaisePrice"),
@@ -232,7 +231,7 @@ public sealed partial class AuctionService
     {
         if (!loop.IsOnLoop) return await loop.InvokeAsync(() => EndOpenLotsAsync(select, reason));
         int ended = 0;
-        foreach (long id in store.Items().Where(r => r.State != AuctionState.Settled && select(r)).Select(r => r.Id).ToArray())
+        foreach (long id in store.OpenItems().Where(select).Select(r => r.Id).ToArray())
         {
             using (var scope = await EnterAuctionAsync("auction/end-now", () => RowKeys(store.Get(id))))
             {
@@ -259,13 +258,12 @@ public sealed partial class AuctionService
     }
 
     /// <summary>One priced entry per AuctionConfig item type (the World sub-tabs), lowest id first.</summary>
-    private int[] SampleEntries() => data.Table("AuctionConfig").Values
+    private int[] SampleEntries() => [.. data.Table("AuctionConfig").Values
         .Select(r => (Id: (int)GameData.Int(r, "_iID"), Type: (int)GameData.Int(r, "_iType")))
         .Where(r => AuctionPriced(r.Id)).GroupBy(r => r.Type).OrderBy(g => g.Key)
-        .Select(g => g.Min(r => r.Id)).ToArray();
+        .Select(g => g.Min(r => r.Id))];
 
-    private static int[] EntryArgs(string[] args, int skip) => args.Skip(skip)
-        .Select(a => int.Parse(a, CultureInfo.InvariantCulture)).ToArray();
+    private static int[] EntryArgs(string[] args, int skip) => [.. args.Skip(skip).Select(a => int.Parse(a, CultureInfo.InvariantCulture))];
 
     /// <summary>GM test aid "!worldauction open [itemId...]|close". Open lists system lots that bid at once.</summary>
     internal async Task<string> WorldGmAsync(string[] args)
@@ -303,7 +301,7 @@ public sealed partial class AuctionService
         if (!timedEvents.IsActive(activity)) timedEvents.SetTestWindow(activity, true);
         int[] entries = args.Length > 2 ? EntryArgs(args, 2) : SampleEntries();
         int code = await PublishEventAuctionAsync("gm:" + clock.GetUtcNow().ToUnixTimeMilliseconds(), tab,
-            entries.Select(e => (e, 1, 0)).ToArray(), [gmRole], startNow: true);
+            [.. entries.Select(e => (e, 1, 0))], [gmRole], startNow: true);
         return code == 0 ? $"Event Auction {tab}: {entries.Length} lot(s) listed (activity {activity} open)"
             : $"Event Auction {tab} publish failed: {code}";
     }

@@ -88,7 +88,7 @@ public abstract class AuctionTestsHost : IAsyncLifetime
     protected async Task Gm(BotClient bot, string command)
     {
         using var client = new HttpClient();
-        (await client.PostAsync($"{http}/ro3emu/gm?account={bot.Account}", new StringContent(command)))
+        (await client.PostAsync($"{http}/ro3emu/gm?account={bot.Account}", Operator.Command(command)))
             .EnsureSuccessStatusCode();
     }
 
@@ -108,7 +108,7 @@ public abstract class AuctionTestsHost : IAsyncLifetime
             Entry = Entry, State = AuctionState.Bidding,
             Start = now - 10, End = now + 120, Price = 500, Raise = 100,
             FixedPrice = 2000, MaxPrice = 2000, Currency = 1,
-            Eligible = eligible.Select(b => (long)b.Self!.Uuid).ToList(),
+            Eligible = [.. eligible.Select(b => (long)b.Self!.Uuid)],
         };
         SaveRows(row);
         return row;
@@ -257,6 +257,41 @@ public sealed partial class AuctionTests : AuctionTestsHost
     }
 
     [Fact]
+    public async Task OwnLotsAreServedFromMemoryUntilALotIsWritten()
+    {
+        await using var alice = await InWorld("Alice");
+        await Gm(alice, "!zeny 10000");
+        var row = Seed(AuctionType.Dungeon, alice);
+        var accounts = Service<AccountStore>();
+        int reads = 0;
+        accounts.ReadSyncObserved = (label, _) => { if (label == "auction/read-OfType") Interlocked.Increment(ref reads); };
+        try
+        {
+            async Task<QuerySelfAuctionRes> Own()
+            {
+                await alice.SendGameAsync(AuctionService.Self, new QuerySelfAuctionReq { AuctionType = AuctionType.Dungeon });
+                return await Next(alice, AuctionService.Self, QuerySelfAuctionRes.Parser);
+            }
+            Assert.Contains((await Own()).SelfAuctions, item => item.AuctionId == row.Id);
+            int first = reads;
+            Assert.True(first > 0);
+            for (int i = 0; i < 3; i++) await Own();
+            Assert.Equal(first, reads);
+
+            // A bid writes the lot: the next ask reads again and shows it.
+            Assert.Equal(0, (await Bid(alice, row.Id, 1000, BiddingType.Manual)).Result);
+            var after = (await Own()).SelfAuctions.Single(item => item.AuctionId == row.Id);
+            Assert.True(reads > first);
+            Assert.NotEqual(0, after.LastBiddingTime);
+
+            // So does a new lot.
+            var added = Seed(AuctionType.Dungeon, alice);
+            Assert.Contains((await Own()).SelfAuctions, item => item.AuctionId == added.Id);
+        }
+        finally { accounts.ReadSyncObserved = null; }
+    }
+
+    [Fact]
     public async Task IncreasingOwnAutoLimitOnlyDebitsDeltaAndKeepsPublicPrice()
     {
         await using var alice = await InWorld("Alice");
@@ -286,7 +321,7 @@ public sealed partial class AuctionTests : AuctionTestsHost
         await using var carol = await InWorld("Carol");
         foreach (var bot in new[] { alice, bob, carol }) await Gm(bot, "!zeny 10000");
         var unsold = Seed(AuctionType.Dungeon, alice, bob, carol);
-        unsold.GiveUp = unsold.Eligible.ToList();
+        unsold.GiveUp = [.. unsold.Eligible];
         unsold.End = clock.GetUtcNow().ToUnixTimeSeconds() - 1;
         SaveRows(unsold);
         await Service<AuctionService>().SettleAsync(unsold.Id);
@@ -318,8 +353,9 @@ public sealed partial class AuctionTests : AuctionTestsHost
             await bot.SendGameAsync(AuctionService.Quit, new QuitAuctionReq { AuctionId = row.Id });
             Assert.Equal(0, (await Next(bot, AuctionService.Quit, QuitAuctionRes.Parser)).Result);
         }
-        for (int i = 0; i < 100 && Service<AuctionStore>().Get(row.Id)!.State != AuctionState.Settled; i++)
-            await Task.Delay(50);
+        // The notice follows the settlement's completion: from the committed row alone a mailbox read can still be served
+        // the recipient's snapshot, which the writer drops just after the commit.
+        await Next(alice, AuctionService.DungeonDone, DungeonAuctionDoneNtf.Parser);
         var settled = Service<AuctionStore>().Get(row.Id)!;
         Assert.Equal(AuctionState.Settled, settled.State);
         Assert.Contains(settled.Winner, row.Eligible);

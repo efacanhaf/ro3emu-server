@@ -73,6 +73,7 @@ public sealed partial class MapTests
             combat.AfterLethalPublication.Add(finalizer);
             try
             {
+                await SwingWait.UntilDoneAsync(_app.Services.GetRequiredService<GameLoop>(), _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Account == alice.Account && s.Role != null), uid);
                 await alice.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1000001, TargetId = uid });
                 Assert.Equal(0, (await Next(alice, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
                 await Next(alice, MvpService.DeadNotify, MVPDeadNotify.Parser);
@@ -117,6 +118,7 @@ public sealed partial class MapTests
             };
             try
             {
+                await SwingWait.UntilDoneAsync(_app.Services.GetRequiredService<GameLoop>(), _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Account == alice.Account && s.Role != null), uid);
                 await alice.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1000001, TargetId = uid });
                 Assert.Equal(0, (await Next(alice, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
                 await refused.Task.WaitAsync(Wait);
@@ -127,7 +129,18 @@ public sealed partial class MapTests
                 Assert.Equal(0, MergedKillReceiptCount("monster-kill"));
                 Assert.DoesNotContain(alice.Inbox.Snapshot(), e => e.IsGame(CombatService.SkillHit)
                     && SkillHitInfo.Parser.ParseFrom(e.Body).Dsts.Any(d => d.DstID == uid && d.IsDead));
+                // The basic attack goes on swinging at the boss the refusal left at 1 HP: under load its next swing began
+                // between SwingWait and the retry below (3005 SkillBusy). Stop it while the refusal still holds, so the
+                // retry is this test's own cast.
+                await _app.Services.GetRequiredService<GameLoop>().InvokeAsync(() =>
+                {
+                    var player = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Account == alice.Account && s.Role != null);
+                    player.Attack = null;
+                    if (player.SkillCast is { } cast) cast.Cancelled = true;
+                    return Task.CompletedTask;
+                });
                 accounts.BeforeOwnedCommitForTest = null;
+                await SwingWait.UntilDoneAsync(_app.Services.GetRequiredService<GameLoop>(), _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Account == alice.Account && s.Role != null), uid);
                 await alice.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1000001, TargetId = uid });
                 Assert.Equal(0, (await Next(alice, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
                 await Next(alice, MvpService.DeadNotify, MVPDeadNotify.Parser);
@@ -161,6 +174,7 @@ public sealed partial class MapTests
             };
             try
             {
+                await SwingWait.UntilDoneAsync(_app.Services.GetRequiredService<GameLoop>(), _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Account == alice.Account && s.Role != null), uid);
                 await alice.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1000001, TargetId = uid });
                 Assert.Equal(0, (await Next(alice, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
                 await WaitMergedBossAsync(uid, m => m.Dead);
@@ -213,6 +227,7 @@ public sealed partial class MapTests
             };
             try
             {
+                await SwingWait.UntilDoneAsync(_app.Services.GetRequiredService<GameLoop>(), _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Account == alice.Account && s.Role != null), uid);
                 await alice.SendGameAsync(CombatService.UseSkill, new CastSkillReq { SkillId = 1000001, TargetId = uid });
                 Assert.Equal(0, (await Next(alice, CombatService.UseSkill, CastSkillRsp.Parser)).Result);
                 await retryEntered.Task.WaitAsync(Wait);

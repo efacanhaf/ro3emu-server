@@ -39,7 +39,15 @@ public sealed class DbWriterFaultTests : IDisposable
         var metrics = new DbAccessMetrics();
         using var writer = new DbWriter($"Data Source={Database}", metrics) { LazyMaxWait = TimeSpan.FromMilliseconds(30) };
         using var hold = new ManualResetEventSlim();
-        var blocker = writer.ExecuteAsync<int>(new Plan("block", _executed, () => hold.Wait(TimeSpan.FromSeconds(10))));
+        using var blocking = new ManualResetEventSlim();
+        var blocker = writer.ExecuteAsync<int>(new Plan("block", _executed, () =>
+        {
+            blocking.Set();
+            hold.Wait(TimeSpan.FromSeconds(10));
+        }));
+        // The writer opens its database before its loop, which can take longer than LazyMaxWait on a cold start. A lazy
+        // job queued by then is overdue and rightly runs first, so queue the rest once the blocker holds the writer.
+        Assert.True(blocking.Wait(TimeSpan.FromSeconds(10)));
         var durable = Enumerable.Range(0, 100).Select(i => writer.ExecuteAsync<int>(new Plan("d" + i, _executed, () => Thread.Sleep(1)))).ToList();
         var lazy = new[] { writer.ExecuteAsync<int>(new Plan("lazy0", _executed), lazy: true), writer.ExecuteAsync<int>(new Plan("lazy1", _executed), lazy: true) };
         await Task.Delay(80); // both lazy jobs are now older than LazyMaxWait
@@ -114,11 +122,24 @@ public sealed class DbWriterFaultTests : IDisposable
         accepted.AddRange(Enumerable.Range(0, 20).Select(i => writer.ExecuteAsync<int>(new Plan("q" + i, _executed))));
         accepted.Add(writer.ExecuteAsync<int>(new Plan("lazy", _executed), lazy: true));
         var stopping = Task.Run(writer.Dispose); // shutdown begins while 21 accepted jobs wait behind the blocker
-        await Task.Delay(50);
-        await Assert.ThrowsAsync<ObjectDisposedException>(() => writer.ExecuteAsync<int>(new Plan("late", _executed)));
-        hold.Set();
+        try
+        {
+            // Scheduling Dispose on the pool does not mean it has run yet. Wait until admission actually closes;
+            // a fixed delay could enqueue "late" as accepted work on a busy runner.
+            var deadline = DateTime.UtcNow.AddSeconds(5);
+            while (!writer.StopRequested)
+            {
+                Assert.True(DateTime.UtcNow < deadline, "The writer did not begin stopping.");
+                await Task.Delay(10);
+            }
+            await Assert.ThrowsAsync<ObjectDisposedException>(() => writer.ExecuteAsync<int>(new Plan("late", _executed)));
+        }
+        finally
+        {
+            hold.Set(); // release accepted work even if the refusal assertion fails
+            await stopping;
+        }
         Assert.All(await Task.WhenAll(accepted), result => Assert.Equal(1, result));
-        await stopping;
 
         SqliteConnection.ClearAllPools();
         using var db = new SqliteConnection($"Data Source={Database}");
@@ -189,12 +210,14 @@ public sealed class DbWriterFaultTests : IDisposable
         };
         Assert.Equal(1, await writer.ExecuteAsync<int>(new Plan("setup", _executed))); // the table exists
         using var hold = new ManualResetEventSlim();
+        using var entered = new ManualResetEventSlim();
         var blocker = writer.ExecuteAsync<int>(new Plan("block", _executed, () =>
         {
+            entered.Set();
             hold.Wait(TimeSpan.FromSeconds(10));
             Thread.Sleep(budget + TimeSpan.FromMilliseconds(50));
         }));
-        await Task.Delay(50); // the blocker's group is open; the rest queue behind it
+        Assert.True(entered.Wait(TimeSpan.FromSeconds(10))); // the blocker's group is open; the rest queue behind it
         var before = Enumerable.Range(0, 10).Select(i => writer.ExecuteAsync<int>(new Plan("a" + i, _executed))).ToList();
         var partial = writer.ExecuteAsync<int>(new PartialPlan("partial", _executed));
         var doomed = writer.ExecuteAsync<int>(new Plan("doomed", _executed));
@@ -217,19 +240,32 @@ public sealed class DbWriterFaultTests : IDisposable
     {
         var metrics = new DbAccessMetrics();
         using var hold = new ManualResetEventSlim();
+        using var reached = new ManualResetEventSlim();
         using var writer = new DbWriter($"Data Source={Database}", metrics)
         {
+            // A budget the group never reaches: its size must not depend on how fast this machine runs the jobs.
+            MaxGroupExecution = TimeSpan.FromMinutes(5),
             // The last job of the group holds the group's commit: an earlier job must not complete before it.
-            BeforeCommitForTest = label => { if (label == "test/last") hold.Wait(TimeSpan.FromSeconds(10)); },
+            BeforeCommitForTest = label =>
+            {
+                if (label != "test/last") return;
+                reached.Set();
+                hold.Wait(TimeSpan.FromSeconds(10));
+            },
         };
         Assert.Equal(1, await writer.ExecuteAsync<int>(new Plan("setup", _executed)));
+        using var entered = new ManualResetEventSlim();
         using var gate = new ManualResetEventSlim();
-        var opener = writer.ExecuteAsync<int>(new Plan("opener", _executed, () => gate.Wait(TimeSpan.FromSeconds(10))));
-        await Task.Delay(50);
+        var opener = writer.ExecuteAsync<int>(new Plan("opener", _executed, () =>
+        {
+            entered.Set();
+            gate.Wait(TimeSpan.FromSeconds(10));
+        }));
+        Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
         var early = writer.ExecuteAsync<int>(new Plan("early", _executed));
         var last = writer.ExecuteAsync<int>(new Plan("last", _executed));
         gate.Set();
-        await Task.Delay(150);
+        Assert.True(reached.Wait(TimeSpan.FromSeconds(10)));
         Assert.False(early.IsCompleted); // executed, not yet durable: its group waits on "last"
         hold.Set();
         Assert.Equal(1, await early);

@@ -193,7 +193,7 @@ public sealed partial class WardrobeService
         var current = session.Wardrobe!;
         var row = Row(req.AppearanceId);
         int result = row == null ? ErrorCodes.Parameter : Validate(session, current, req.AppearanceId, requireOwned: false);
-        if (result == 0 && Owns(current, req.AppearanceId)) result = ErrorCodes.Parameter; // (inferred) already unlocked.
+        if (result == 0 && Owns(current, req.AppearanceId)) result = ErrorCodes.ShopAppearanceOwned; // (inferred) already unlocked.
         var costs = row is { } r ? Materials(r) : [];
         if (result == 0 && costs.Count == 0) result = ErrorCodes.FeatureUnavailable; // No free unlock path inferred.
         if (result == 0 && costs.Any(c => c.Entry <= 0 || c.Count <= 0 || _data.Row("ItemConfig", c.Entry) == null))
@@ -245,7 +245,7 @@ public sealed partial class WardrobeService
             else appearanceId = (int)(GameData.Number(effects[0][2]) ?? 0);
         }
         if (result == 0) result = Validate(session, session.Wardrobe!, appearanceId, requireOwned: false);
-        if (result == 0 && Owns(session.Wardrobe!, appearanceId)) result = ErrorCodes.Parameter;
+        if (result == 0 && Owns(session.Wardrobe!, appearanceId)) result = ErrorCodes.ShopAppearanceOwned; // (inferred) already unlocked.
         if (result == 0)
         {
             var next = session.Wardrobe!.Clone();
@@ -323,7 +323,7 @@ public sealed partial class WardrobeService
             if (!Owns(next, id)) next.AllLightUpAppearances[id] = new DBAppearanceInfo { AppearanceId = id };
         var goods = bonus.Grants.Select(g => (g.Entry, g.Count, Bind: g.BindType)).ToList();
         var economy = _character.FamilyEconomy(session, Economy.CharacterFamilyEconomy.ShopAppearanceKind, cost,
-            goods.Select(g => (g.Entry, g.Count)).ToList(), new
+            [.. goods.Select(g => (g.Entry, g.Count))], new
             {
                 Version = 1, Shop = shopOutcome, Appearances = looks, Award = bonus.GroupId, AwardConfig = bonus.AwardId,
                 Grants = goods.Select(g => new { g.Entry, g.Count, g.Bind }),
@@ -422,7 +422,9 @@ public sealed partial class WardrobeService
         await session.SendGameAsync(CharacterService.EntityBaseChange, change);
         foreach (var viewer in _world.Viewers(session))
             try { await viewer.SendGameAsync(CharacterService.EntityBaseChange, change); }
-            catch (Exception e) when (e is IOException or ObjectDisposedException or InvalidOperationException) { }
+            catch (Exception e) when (e is IOException or ObjectDisposedException or PersistenceException
+                or InvalidOperationException)
+            { }
     }
 
     private JsonElement? Row(int id) => _data.Row("WardRobeConfig", id);

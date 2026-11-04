@@ -12,7 +12,7 @@ using Ro3Emu.Server.Maps;
 
 namespace Ro3Emu.Tests;
 
-public sealed class TerritoryWorldTests : IAsyncLifetime
+public sealed partial class TerritoryWorldTests : IAsyncLifetime
 {
     private readonly string _dataDir = Path.Combine(Path.GetTempPath(), "ro3emu-territory-world-" + Guid.NewGuid().ToString("N"));
     private static readonly TimeSpan Wait = TimeSpan.FromSeconds(20);
@@ -145,8 +145,8 @@ public sealed class TerritoryWorldTests : IAsyncLifetime
         {
             await OnLoop(() =>
             {
-                actors = Service<World>().AllUnits().Where(u => u.SceneEntry == mapId
-                    && u.Entity().EntityTemplateID == 4907011).ToArray();
+                actors = [.. Service<World>().AllUnits().Where(u => u.SceneEntry == mapId
+                    && u.Entity().EntityTemplateID == 4907011)];
                 return Task.CompletedTask;
             });
             if (actors.Length == 0) await Task.Delay(10);

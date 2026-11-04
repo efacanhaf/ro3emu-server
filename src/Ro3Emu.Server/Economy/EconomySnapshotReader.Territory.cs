@@ -11,7 +11,11 @@ public static partial class EconomySnapshotReader
     {
         private void ReadTerritoryRole(JsonElement state, long role, string key)
         {
-            Fields(state, "Epoch Seasons Camp LastCampChange Honor Valor Fatigue FatigueKills LastFatigue Donated Donations WorldLandClaims Pending Paid");
+            Fields(state, "Epoch Seasons Camp LastCampChange Honor Valor Fatigue FatigueKills LastFatigue Donated Donations WorldLandClaims Pending Paid Glory GlorySeasons");
+            // Battle Merit: counters and claimed rank markers only; its points are currency 15 in the purse.
+            if (Try(state, "Glory", out var glory)) Fields(glory, "Epoch Points Rank Claimed Day DayGain Counts");
+            if (Try(state, "GlorySeasons", out var glorySeasons))
+                foreach (var season in Properties(glorySeasons)) Fields(season.Value, "Epoch Points Rank Claimed Day DayGain Counts");
             if (!Try(state, "Pending", out var pending)) return;
             foreach (var grantSet in Properties(pending))
             {
@@ -65,7 +69,7 @@ public static partial class EconomySnapshotReader
         private readonly HashSet<string> _activeWarsEpochs = [];
         private void DecodeWarsWorld(JsonElement state, string key, bool archived)
         {
-            Fields(state, "Epoch LastStage Owners Rounds Battles Results SiegeHistory SiegeRuns Donations RuleResults WorldDrops NextWorldDropId WorldActivityRespawns WorldActivityOccurrences WorldPickupOccurrences");
+            Fields(state, "Epoch LastStage Owners Rounds Battles Results SiegeHistory SiegeRuns Donations RuleResults WorldDrops NextWorldDropId WorldActivityRespawns WorldActivityOccurrences WorldPickupOccurrences GlorySettle");
             string epoch = String(state, "Epoch");
             if (archived && (epoch.Length == 0 || _activeWarsEpochs.Contains(epoch)))
             { Issue(EconomyIssueKind.Coverage, key, "Archive epoch absent or duplicates active state."); return; }
@@ -225,7 +229,7 @@ public static partial class EconomySnapshotReader
                             long pending = SqlLong(r, 1);
                             if (pending is not (0 or 1)) throw new FormatException("Invalid guild challenge pending status.");
                             var delivered = Try(root, "Delivered", out var settled)
-                                ? Elements(settled).Select(x => x.GetInt64()).ToHashSet() : new HashSet<long>();
+                                ? Elements(settled).Select(x => x.GetInt64()).ToHashSet() : [];
                             if (Try(root, "Personal", out var personal)) foreach (var grant in Properties(personal))
                             {
                                 long role = long.Parse(grant.Name, CultureInfo.InvariantCulture);
@@ -355,6 +359,15 @@ public static partial class EconomySnapshotReader
                         case "flying_dragon":
                             // Starshatter ritual (FlyingDragonService): progress and helpers; the ritual's mail carries the goods.
                             ValidateProto(Convert.FromBase64String(value), DBFlyingDragonProduceInfo.Descriptor);
+                            break;
+                        case "rank_rewards":
+                            // Leaderboard rewards (RankRewardService): each board's last settlement; the letters carry the goods.
+                            using (var doc = Json(value))
+                                foreach (var board in Properties(doc.RootElement))
+                                    if (!long.TryParse(board.Name, NumberStyles.None, CultureInfo.InvariantCulture, out _)
+                                        || board.Value.GetString() is not { Length: 10 } period
+                                        || !DateTime.TryParseExact(period, "yyyyMMddHH", CultureInfo.InvariantCulture, DateTimeStyles.None, out _))
+                                        throw new FormatException("Invalid rank reward settlement.");
                             break;
                         default:
                             Issue(EconomyIssueKind.UnknownSchema, key, "Unclassified server_state key.");

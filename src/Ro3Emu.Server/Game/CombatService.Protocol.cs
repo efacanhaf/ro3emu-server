@@ -21,10 +21,10 @@ public sealed partial class CombatService
     /// <summary>Transient state is scoped to a role/connection; never leaks to another selected role.</summary>
     public sealed class ProtocolState
     {
-        public Dictionary<int, int> TemporarySlotRows { get; } = new();
+        public Dictionary<int, int> TemporarySlotRows { get; } = [];
         public string ParameterSignature { get; set; } = "";
         public bool TrainingPaused { get; set; }
-        public Dictionary<(long Target, bool White, int Tag), bool> SkillSelection { get; } = new();
+        public Dictionary<(long Target, bool White, int Tag), bool> SkillSelection { get; } = [];
     }
 
     private Dictionary<(int Group, int Level, int Mode), int>? _configuredModeRows;
@@ -60,6 +60,14 @@ public sealed partial class CombatService
 
     private static bool WheelHolds(GameSession session, int rowId, int mode) =>
         session.SkillPlans?.SkillWheel?.WhellSkills.Values.Any(w => w.SkillConfigId == rowId && w.Mode == mode) == true;
+    /// <summary>A group's configured row of a level in the mode the session's type 15 tuples select, or its mode 0 row when
+    /// that mode has none. The tuples' other fields are not applied: <see cref="CastExtraAsync"/> applies them.</summary>
+    internal JsonElement? ModeRow(GameSession session, int group, int level)
+    {
+        if (!ConfiguredModeRows.TryGetValue((group, level, 0), out int plain) || _data.Row("SkillConfig", plain) is not { } row) return null;
+        int mode = SkillParameterRules.Mode(group, SkillParameterRules.CategoriesOf(_data, row), SkillParameterRules.Active(session, _data));
+        return ConfiguredModeRows.TryGetValue((group, level, mode), out int selected) ? _data.Row("SkillConfig", selected) : row;
+    }
 
     public bool SkillModeAllowed(GameSession session, JsonElement row) =>
         EffectiveSkillRow(session, (int)GameData.Int(row, "_iID")) is { } effective
@@ -188,11 +196,68 @@ public sealed partial class CombatService
             && _data.Row("SkillConfig", effect.SkillId) != null
             ? ToPlayerAndViewersAsync(source, highLevel ? SkillEffectHigh : SkillEffect, effect) : Task.CompletedTask;
 
+    /// <summary>A Lua_Config_EffectData gfx at a monster, for a proc whose row names its effect. LC_PerformEffect_Mgr.NormalGfx
+    /// plays it on the unit sourceId names, and at targetPos when that unit is gone (the swing may have just killed it);
+    /// masterId is the owner LC_QualityCtrl.FilterSkillGfxPass filters by.</summary>
+    internal Task SendGfxAtAsync(GameSession owner, MonsterUnit at, long effect, long skill) => owner.Role == null ? Task.CompletedTask
+        : ToPlayerAndViewersAsync(owner, SkillEffect, new SkillEffectDisplayNotify
+        {
+            SourceId = at.Uid, MasterId = owner.Role.Id, TargetId = at.Uid, EffectId = (int)effect, EffectType = DisplayGfx,
+            TargetPos = at.Pos.Clone(), SkillId = skill,
+        });
+
+    private const int DisplayGfx = 2; // enum_DisplayEffectType.Gfx
+
     /// <summary>Server-timed bullet only when a skill script owns projectile travel.</summary>
     public Task SendSkillBulletAsync(GameSession source, SkillFixTimeBulletNotify bullet, bool highLevel = false) =>
         source.Role != null && bullet.SourceId == source.Role.Id && bullet.EffectId > 0 && bullet.FixedTime > 0
             && _data.Row("SkillConfig", bullet.SkillConfigId) != null
             ? ToPlayerAndViewersAsync(source, highLevel ? SkillBulletHigh : SkillBullet, bullet) : Task.CompletedTask;
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<long, int> _bulletEffects = new();
+
+    /// <summary>
+    /// The projectile a skill's hit flies: the first EffectData in [show*100, show*100+99] whose m_kDamage carries
+    /// m_kBulletData with a prefab (Fire Bolt 1200411 fx_bullet_magicfirearrow_new, Double Strafe 1300304), else 0.
+    /// The client launches such bullets only from 31120 (LC_Scene_Sync._skillFixTimeBullet ->
+    /// LC_PerformEffect_Agent.SkillCreateFixTimeBullet) or, for a template with m_kClientPoints, from the cast's own
+    /// timeline (LC_Skill_RunTimeContext.PlayClientEffect), so those get none from here. A 31101 hit never launches one.
+    /// </summary>
+    private int BulletEffect(long scriptShow) => _bulletEffects.GetOrAdd(scriptShow, show =>
+    {
+        if (_data.SkillTemplate(show) is { } template && SkillEffectData.HasClientPoints(template)) return 0;
+        var effects = _data.SkillTemplateTable("Lua_Config_EffectData");
+        for (long id = show * 100; id < show * 100 + 100; id++)
+            if (SkillEffectData.Find(effects, id)?.BulletName != null) return (int)id;
+        return 0;
+    });
+
+    /// <summary>
+    /// 31120 for each damaged target of a hit whose skill flies a bullet, sent just before the 31101 to the same viewers.
+    /// One notify launches <c>split</c> bullets m_fBulletHatchInterval apart (LC_BulletEmit_Mgr.Update), so Fire Bolt
+    /// Lv. 5 drops five. (inferred) one notify per target per hit, timed at the hit; fixedTime (unread by the client)
+    /// carries the bullet's configured life time.
+    /// </summary>
+    private async Task SendHitBulletsAsync(IEnumerable<GameSession> viewers, JsonElement row, SkillHitInfo hit, long masterId)
+    {
+        int effect = BulletEffect(GameData.Int(row, "_iScriptShow"));
+        if (effect == 0 || hit.Dsts.Count == 0) return;
+        var recipients = viewers.ToArray();
+        long now = Now;
+        foreach (var dst in hit.Dsts)
+        {
+            if (dst.DamageType is DamageType.Heal or DamageType.HealMana) continue;
+            var bullet = new SkillFixTimeBulletNotify
+            {
+                SourceId = hit.SrcID, TargetId = dst.DstID, EffectId = effect, FixedTime = BulletLifeTime(effect),
+                Split = Math.Max(1, hit.Split), SkillConfigId = hit.SkillId, MasterId = masterId, StartTimestampMs = now,
+            };
+            foreach (var viewer in recipients) await viewer.SendGameAsync(SkillBullet, bullet);
+        }
+    }
+
+    private int BulletLifeTime(int effect) =>
+        SkillEffectData.Find(_data.SkillTemplateTable("Lua_Config_EffectData"), effect)?.BulletLifeTime ?? 0;
 
     /// <summary>Reflect a real target eligibility transition for an AOI-visible unit (31122).</summary>
     public async Task SetSkillTargetSelectionAsync(GameSession viewer, WorldUnit target, int skillTag, bool white, bool enabled)
@@ -244,10 +309,13 @@ public sealed partial class CombatService
         await viewer.SendGameAsync(BossAllSkillCds, response);
     }
 
-    /// <summary>Clear scene-scoped target and boss presentation when the scene changes.</summary>
+    /// <summary>Clear scene-scoped target and boss presentation when the scene changes. The 31133 pause ends with it:
+    /// LC_System_DamageStatistics._onSwitchScene resumes the client's own count without a request, and
+    /// UI_Sys_GVE_ExitMenu_PauseWidgetBaseCtrl.OnOpen shows Resume again (inferred: the pause is per scene).</summary>
     public async Task ClearSceneSkillProtocolAsync(GameSession viewer)
     {
         viewer.SkillProtocol.SkillSelection.Clear();
+        viewer.SkillProtocol.TrainingPaused = false;
         if (viewer.Role != null) await viewer.SendGameAsync(BossClearSkillCds, new BossClearAllSkillShowCdNotify());
     }
 

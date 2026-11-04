@@ -5,7 +5,7 @@ namespace Ro3Emu.Server.Game;
 public sealed partial class DailyActivityService
 {
     /// <summary>Event owners project their authoritative state into the shared 5004 snapshot before every send.</summary>
-    public List<Action<GameSession, DBDailyActivityInfo>> EventProjections { get; } = new();
+    public List<Action<GameSession, DBDailyActivityInfo>> EventProjections { get; } = [];
 
     private Task SyncRowsAsync(GameSession session, DateTime? localNow = null)
     {
@@ -13,6 +13,8 @@ public sealed partial class DailyActivityService
         long seconds = ToUnix(now);
         var rows = Rows(session).Clone();
         foreach (var project in EventProjections) project(session, rows);
+        // Testing UnlimitedRewards (TEST AID, not original): Dodo's chain shows its allowance whatever the stored row says.
+        if (_testing.UnlimitedRewards && session.Daily != null) UpdateRingCount(rows, session.Daily, unlimited: true);
         // Derived times are refreshed after owner projections, without resetting progress/quests or replacing
         // their nested ActivityInfo phase state. CharacterService emits only changed map fields in 5004.
         ProjectWindows(rows, seconds);

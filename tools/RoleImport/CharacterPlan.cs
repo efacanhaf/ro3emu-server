@@ -36,8 +36,8 @@ public sealed class CharacterPlan
 {
     private readonly SnapshotDocument _snapshot;
     private readonly long _firstGuid;
-    private readonly Dictionary<long, long> _guids = new();
-    private readonly List<string> _notes = new();
+    private readonly Dictionary<long, long> _guids = [];
+    private readonly List<string> _notes = [];
 
     private CharacterPlan(SnapshotDocument snapshot, long firstGuid)
     {
@@ -56,7 +56,7 @@ public sealed class CharacterPlan
     /// </summary>
     public HashSet<string> ClearedBlobs { get; } = new(StringComparer.Ordinal) { "settings" };
 
-    public List<InvItem> Items { get; } = new();
+    public List<InvItem> Items { get; } = [];
     public IReadOnlyDictionary<long, long> GuidMap => _guids;
     public IReadOnlyList<string> Notes => _notes;
 
@@ -153,7 +153,7 @@ public sealed class CharacterPlan
     private static Dictionary<long, long> SortedIndex(JsonElement pack) =>
         pack.TryGetProperty("sortedIndex", out var sorted) && sorted.ValueKind == JsonValueKind.Object
             ? Map(sorted, null).ToDictionary(p => p.Key, p => Long(p.Value))
-            : new Dictionary<long, long>();
+            : [];
 
     private InvItem Item(long official, JsonElement node, int pack, long sort, int grid)
     {
@@ -181,8 +181,8 @@ public sealed class CharacterPlan
                 int field = (int)key;
                 if (value.ValueKind != JsonValueKind.Object) continue;
                 // ItemAttrValue is a oneof: the dump prints the case name ("val") next to the value.
-                if (value.TryGetProperty("longVal", out var longValue)) (item.Attrs ??= new())[field] = Long(longValue);
-                else if (value.TryGetProperty("strVal", out var strValue)) (item.StringAttrs ??= new())[field] = strValue.GetString() ?? "";
+                if (value.TryGetProperty("longVal", out var longValue)) (item.Attrs ??= [])[field] = Long(longValue);
+                else if (value.TryGetProperty("strVal", out var strValue)) (item.StringAttrs ??= [])[field] = strValue.GetString() ?? "";
             }
         }
         if (node.TryGetProperty("enchantment", out var enchantment) && enchantment.ValueKind == JsonValueKind.Object)
@@ -192,7 +192,7 @@ public sealed class CharacterPlan
                     GetTime = Long(value, "getTime"),
                     Attr = value.TryGetProperty("attr", out var attr)
                         ? Map(attr, null).ToDictionary(p => (int)p.Key, p => (int)Long(p.Value))
-                        : new Dictionary<int, int>(),
+                        : [],
                 };
         return item;
     }

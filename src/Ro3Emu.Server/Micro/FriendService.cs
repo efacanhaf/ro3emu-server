@@ -1,3 +1,4 @@
+using System.Globalization;
 using Google.Protobuf;
 using Ro3Emu.Server.Accounts;
 using Ro3Emu.Server.Accounts.Persistence;
@@ -21,7 +22,7 @@ public sealed class FriendService(AccountStore accounts, SocialOwnerCache cache,
 
     /// <summary>A role's friend list or a friend's affection changed (accepted friendship, gift intimacy); achievements
     /// 106016/106017 re-read the relation. Called after the owner keys are released; listeners post their work.</summary>
-    public List<Action<long>> RelationChanged { get; } = new();
+    public List<Action<long>> RelationChanged { get; } = [];
 
     private void NotifyRelation(long role)
     {
@@ -47,7 +48,7 @@ public sealed class FriendService(AccountStore accounts, SocialOwnerCache cache,
 
     private async Task<object?> InvokeOnLoopAsync(MicroSession session, string method, object? args)
     {
-        if (method is "queryNotification" or "readNotification" or "closeChat") return Ok(new());
+        if (method is "queryNotification" or "readNotification" or "closeChat") return Ok([]);
         bool fetch = method is "fetchFriendsInfo" or "fetchApplicants" or "fetchBlacklist" or "fetchBeBlacklist";
         if (!fetch && method is not ("apply" or "accept" or "acceptAll" or "refuse" or "refuseAll" or "refuseBatch"
             or "remove" or "addBlacklist" or "delBlacklist")) return null;
@@ -57,7 +58,8 @@ public sealed class FriendService(AccountStore accounts, SocialOwnerCache cache,
         if (CallerRole(session) is not long self) return MicroServiceRouter.Fail("no selected role");
         if (Uid(args, "Uid") != self)
         {
-            log.LogWarning("Friend {Method} refused: Uid {Uid} is not the caller's role {Role}", method, Uid(args, "Uid"), self);
+            string shown = MicroServiceRouter.Clip(method);
+            log.LogWarning("Friend {Method} refused: Uid {Uid} is not the caller's role {Role}", shown, Uid(args, "Uid"), self);
             return MicroServiceRouter.Fail("role mismatch");
         }
 
@@ -107,15 +109,15 @@ public sealed class FriendService(AccountStore accounts, SocialOwnerCache cache,
                 "accept" or "refuse" => Uid(args, "Applicant"),
                 _ => 0,
             };
-            long[] participants = (method is "acceptAll" or "refuseAll" or "refuseBatch"
-                    ? new[] { self }.Concat(mine.Applicants) : new[] { self, other })
-                .Where(id => id > 0).Distinct().ToArray();
+            long[] participants = [.. (method is "acceptAll" or "refuseAll" or "refuseBatch"
+                    ? new[] { self }.Concat(mine.Applicants) : [self, other])
+                .Where(id => id > 0).Distinct()];
             var loaded = await cache.LoadSocialAsync(participants);
             var notices = new List<Push>();
             try
             {
                 using (var scope = await owners.EnterAsync("micro/friend/" + method,
-                    participants.Select(id => ReservationKey.Role(id)).ToArray()))
+                    [.. participants.Select(id => ReservationKey.Role(id))]))
                 {
                     // The role may have been deselected while the participant set was staged.
                     if (CallerRole(session) != self) return MicroServiceRouter.Fail("no selected role");
@@ -144,8 +146,8 @@ public sealed class FriendService(AccountStore accounts, SocialOwnerCache cache,
 
     private sealed record Push(long Role, string Method);
     private sealed record Outcome(object Reply, Push[] Pushes);
-    private static object[] UidRows(IEnumerable<long> roles) => roles.Select(id => (object)new Dictionary<string, object?>
-    { ["uid"] = id.ToString() }).ToArray();
+    private static object[] UidRows(IEnumerable<long> roles) => [.. roles.Select(id => (object)new Dictionary<string, object?>
+    { ["uid"] = id.ToString() })];
 
     private async Task<Outcome> StageCommitAsync(string method, long self, long other, SocialSnapshot mine,
         IReadOnlyDictionary<long, SocialSnapshot?> snapshots)
@@ -192,7 +194,7 @@ public sealed class FriendService(AccountStore accounts, SocialOwnerCache cache,
         {
             "accept" or "refuse" => Ok(new() { ["Applicant"] = other.ToString() }),
             "remove" or "addBlacklist" or "delBlacklist" => Ok(new() { ["Target"] = other.ToString() }),
-            _ => Ok(new()),
+            _ => Ok([]),
         };
         Push[] pushes = method switch
         {
@@ -231,7 +233,7 @@ public sealed class FriendService(AccountStore accounts, SocialOwnerCache cache,
                 accepted.Add(applicant.ToString());
             }
         }
-        return method == "acceptAll" ? Ok(new() { ["Candidates"] = accepted.ToArray() }) : Ok(new());
+        return method == "acceptAll" ? Ok(new() { ["Candidates"] = accepted.ToArray() }) : Ok([]);
     }
 
     /// <summary>onFriendSyncStatus to the role's online friends when it logs in or out (tips 23610 / 23679).</summary>
@@ -290,9 +292,10 @@ public sealed class NameService(RoleStore roles) : IMicroService
 
 /// <summary>
 /// PartyService: only the party search directory; membership is romsg 42000-42052 on the game gate.
-/// Empty lists keep the "Search Party" panel open without "not implemented" errors.
+/// Empty lists keep the "Search Party" panel open without "not implemented" errors. Party type 4 is the Tavern's room
+/// list (LC_BarRoomServer.PartyQuerySummaryRequest / PartyQueryGroupCountRequest, TavernService.Directory).
 /// </summary>
-public sealed class PartyService(TeamService teams, FriendStore friends, SessionRegistry sessions, RoleStore roles, GameLoop loop) : IMicroService
+public sealed class PartyService(TeamService teams, TavernService tavern, FriendStore friends, SessionRegistry sessions, RoleStore roles, GameLoop loop) : IMicroService
 {
     public string Name => "PartyService";
 
@@ -303,7 +306,11 @@ public sealed class PartyService(TeamService teams, FriendStore friends, Session
         return await loop.InvokeAsync(async () => method switch
         {
             "getPartysSummary" => Summary(args),
-            "getSubPartysCountByType" => new Dictionary<string, object?> { ["Ret"] = MicroServiceRouter.Ret(true), ["GroupCount"] = teams.TargetCounts(Arg(args, 1) ?? "") },
+            "getSubPartysCountByType" => new Dictionary<string, object?>
+            {
+                ["Ret"] = MicroServiceRouter.Ret(true),
+                ["GroupCount"] = Arg(args, 2) == TavernService.PartyType.ToString(CultureInfo.InvariantCulture) ? tavern.Counts() : teams.TargetCounts(Arg(args, 1) ?? ""),
+            },
             "getParty" => GetParty(args),
             "getPartysByIDs" => await GetGroupsAsync(session, args),
             _ => null,
@@ -313,6 +320,7 @@ public sealed class PartyService(TeamService teams, FriendStore friends, Session
     private object Summary(object? args)
     {
         var list = args as object?[] ?? [];
+        if (list.Length > 0 && Number(list[0]) == TavernService.PartyType) return TavernSummary(list);
         long target = 0, playBook = 0;
         int map = 0;
         string area = "";
@@ -339,6 +347,28 @@ public sealed class PartyService(TeamService teams, FriendStore friends, Session
         };
     }
 
+    /// <summary>The Tavern's request: [4, {}, int conditions {Key, MinValue, MaxValue}, {}, start, size, directQuery].</summary>
+    private object TavernSummary(object?[] list)
+    {
+        List<(string Key, long Min, long Max)> conditions = [];
+        if (list.Length > 2 && list[2] is object?[] integers)
+            foreach (var value in integers.OfType<IDictionary<object, object?>>())
+                conditions.Add((Convert.ToString(Field(value, "Key"), CultureInfo.InvariantCulture) ?? "", Number(Field(value, "MinValue")), Number(Field(value, "MaxValue"))));
+        int offset = list.Length > 4 ? (int)Number(list[4]) : 0;
+        int limit = list.Length > 5 ? (int)Number(list[5]) : 100;
+        return new Dictionary<string, object?>
+        {
+            ["Ret"] = MicroServiceRouter.Ret(true),
+            ["SummaryList"] = tavern.Directory(conditions, offset, limit),
+        };
+    }
+
+    /// <summary>
+    /// The chat groups one getPartysByIDs may read (one read each). A role belongs to at most 10 (FriendExtraService), and
+    /// the client asks for its own; (inferred) twice that leaves room for a list that is a moment out of date.
+    /// </summary>
+    private const int MaxGroupsPerCall = 20;
+
     private object GetParty(object? args)
     {
         string? id = Arg(args, 1);
@@ -355,9 +385,9 @@ public sealed class PartyService(TeamService teams, FriendStore friends, Session
         if (string.IsNullOrEmpty(account)) return MicroServiceRouter.Fail("TID_NO_DOCUMENT");
         var active = sessions.All().Where(s => s.Role != null && string.Equals(s.Account, account, StringComparison.Ordinal))
             .Select(s => s.Role!.Id).ToHashSet();
-        var allowed = active.Count > 0 ? active : (await roles.ForAccountAsync(account)).Select(r => r.Id).ToHashSet();
+        var allowed = active.Count > 0 ? active : [.. (await roles.ForAccountAsync(account)).Select(r => r.Id)];
         var ids = args is IDictionary<object, object?> map && map.TryGetValue("PartyIDs", out var value) && value is object?[] list
-            ? list.Select(Convert.ToString).Where(id => id != null).Cast<string>() : [];
+            ? list.Take(MaxGroupsPerCall).Select(Convert.ToString).Where(id => id != null).Cast<string>() : [];
         var parties = new List<object>();
         foreach (string id in ids)
         {

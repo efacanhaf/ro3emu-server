@@ -24,6 +24,7 @@ public sealed partial class DungeonTests
     [MemberData(nameof(ScriptedScenes))]
     public async Task EveryInteractionAStepWaitsOnIsOfferedByTheClientsOwnRules(long scene)
     {
+        Service<Microsoft.Extensions.Options.IOptions<Ro3Emu.Server.ServerOptions>>().Value.ScriptedScenePacePercent = 10; // a ride (the Deniro's) lasts as long as its route
         await using var alice = await InWorld("Alice");
         await Gm(alice, "!lvl 99"); // a scene with a fight
         if (scene == 1022001) await Gm(alice, "!quest accept 10102200"); // Payon Forest's condition [1101, 10102200]
@@ -68,7 +69,7 @@ public sealed partial class DungeonTests
                             Assert.Equal(point.X, view.Entity.MovementInfo.Pos.X, 0.01f);
                             Assert.Equal(point.Z, view.Entity.MovementInfo.Pos.Z, 0.01f);
                             // It registers for interaction and offers the step's interaction (directly, or from its dialogue).
-                            Assert.NotEqual(0, catalog.Interactions(actor.NpcId).FirstOrDefault());
+                            Assert.NotEqual(0, catalog.Interactions(actor.NpcId)[0]);
                             int offered = Reachable(actor.NpcId, interaction);
                             Assert.True(ConditionHolds(offered, view.BuffGroups),
                                 $"interaction {offered} of {actor.NpcId}: NPC condition fails with buff groups [{string.Join(',', view.BuffGroups)}]");
@@ -195,7 +196,7 @@ public sealed partial class DungeonTests
     private int Reachable(int npcId, long interaction)
     {
         var data = Service<GameData>();
-        static int[] Modes(JsonElement row) => row.GetProperty("_iInteractionMode").EnumerateArray().Select(v => (int)(GameData.Number(v) ?? 0)).ToArray();
+        static int[] Modes(JsonElement row) => [.. row.GetProperty("_iInteractionMode").EnumerateArray().Select(v => (int)(GameData.Number(v) ?? 0))];
         static IEnumerable<string[]> Actions(JsonElement row, string field) => row.TryGetProperty(field, out var a) && a.ValueKind == JsonValueKind.Array
             ? a.EnumerateArray().Where(x => x.ValueKind == JsonValueKind.Array).Select(x => x.EnumerateArray().Select(v => v.ToString()).ToArray()) : [];
         var row = data.Row("NPCInteractConfig", interaction)!.Value;

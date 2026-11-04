@@ -31,12 +31,12 @@ public sealed class ActivitiesMessages(PraiseService praise, CasualBattleService
         routes.AdmitEconomic(id => id is FirstHeartService.GetTaskReward or FirstHeartService.GetScoreReward);
         routes.AdmitRole(id => id is TowerService.Info or TowerService.SetPets or TowerService.FirstPassRange
             or TowerService.ClaimFirstPass or TowerService.Sweep or TowerService.End or TowerService.Start);
-        routes.AdmitRole(id => id is DungeonService.SetJobPosition or DungeonService.SetGuide or DungeonService.ClaimFirstPass
+        routes.AdmitRole(id => id is DungeonService.SetJobPosition or DungeonService.SetGuide
             or DungeonService.Statistics or DungeonService.StatisticsHistory or DungeonService.StatisticsCurrent
             or DungeonService.StatisticsModule or DungeonService.QueryResult
             or DungeonService.HallOfFame or DungeonService.MarkBlessings or PraiseService.Praise);
-        // Final Trial honor claims pay their awards (DungeonService.RealmOfGods reserves the role and the claim).
-        routes.AdmitEconomic(id => id is DungeonService.ClaimHonor);
+        // Final Trial honor and first-clear claims pay their awards (DungeonService reserves the role and the claim).
+        routes.AdmitEconomic(id => id is DungeonService.ClaimHonor or DungeonService.ClaimFirstPass);
 
         routes.Map(82800, "genre", async (session, msgId, body) =>
         {
@@ -142,6 +142,14 @@ public sealed class ActivitiesMessages(PraiseService praise, CasualBattleService
         {
             await activities.CommonAsync(session, CommonActivityReq.Parser.ParseFrom(body.Span));
         });
+        // The cash shop (MG_Pay): free products, NewActivityService.Purchases. 2004 is the server's notice only.
+        routes.Map(NewActivityService.CreateOrder, "activities", async (session, msgId, body) =>
+            await activities.CreateOrderAsync(session, CreateOrderReq.Parser.ParseFrom(body.Span)));
+        routes.Map(NewActivityService.PayResult, "activities", async (session, msgId, body) =>
+            await activities.PayResultAsync(session, PayResultReq.Parser.ParseFrom(body.Span)));
+        routes.Map(NewActivityService.FirstRechargeAward, "activities", async (session, msgId, body) =>
+            await activities.FirstRechargeAwardsAsync(session));
+        routes.Map(NewActivityService.FirstRechargeUpdate, "activities", async (session, msgId, body) => { });
         routes.Map(NewActivityService.LevelAward, "activities", async (session, msgId, body) =>
         {
             await activities.LevelAwardAsync(session, GetThreeDayLevelAwardReq.Parser.ParseFrom(body.Span));
@@ -245,6 +253,16 @@ public sealed class ActivitiesMessages(PraiseService praise, CasualBattleService
             await timedBattles.UpgradeAsync(session, ChickenItemUpgradeReq.Parser.ParseFrom(body.Span)));
         routes.Map(TimedBattleService.ItemUpgradeAll, "timedBattles", async (session, msgId, body) =>
             await timedBattles.UpgradeAllAsync(session));
+        routes.Map(TimedBattleService.AdventureSelect, "timedBattles", async (session, msgId, body) =>
+            await timedBattles.SelectAdventureAsync(session, AdventureEventSelectReq.Parser.ParseFrom(body.Span)));
+        routes.Map(TimedBattleService.AdventureRefresh, "timedBattles", async (session, msgId, body) =>
+            await timedBattles.RefreshAdventureAsync(session, AdventureRefreshReq.Parser.ParseFrom(body.Span)));
+        routes.Map(TimedBattleService.SelectFollow, "timedBattles", async (session, msgId, body) =>
+            await timedBattles.SelectFollowAsync(session, SelectFollowReq.Parser.ParseFrom(body.Span)));
+        routes.Map(TimedBattleService.ChangeWatch, "timedBattles", async (session, msgId, body) =>
+            await timedBattles.ChangeWatchAsync(session, ChickenChangeWatchPlayerReq.Parser.ParseFrom(body.Span)));
+        routes.Map(TimedBattleService.OpenPanel, "timedBattles", async (session, msgId, body) =>
+            await timedBattles.OpenPanelAsync(session, ChickenOpenPanelReq.Parser.ParseFrom(body.Span)));
         routes.Map(83351, "timedBattles", async (session, msgId, body) =>
         {
             await timedBattles.OnePieceInfoAsync(session, HiddenTreasureRoundInfoReq.Parser.ParseFrom(body.Span));
@@ -397,6 +415,30 @@ public sealed class ActivitiesMessages(PraiseService praise, CasualBattleService
         routes.Map(DungeonService.ClaimHonor, "dungeons", async (session, msgId, body) =>
         {
             await dungeons.ClaimHonorAsync(session, MultiDungeonClaimHonorAwardReq.Parser.ParseFrom(body.Span));
+        });
+        routes.Map(CasualBattleService.Transfer, "dungeons", async (session, msgId, body) =>
+        {
+            await casual.TransferAsync(session, DungeonTeamTransferReq.Parser.ParseFrom(body.Span));
+        });
+        routes.Map(CasualBattleService.Follow, "dungeons", async (session, msgId, body) =>
+        {
+            await casual.FollowAsync(session, DungeonTeamFollowReq.Parser.ParseFrom(body.Span));
+        });
+        routes.Map(CasualBattleService.SwapPosition, "dungeons", async (session, msgId, body) =>
+        {
+            await casual.SwapPositionAsync(session, DungeonTeamSwapPositionReq.Parser.ParseFrom(body.Span));
+        });
+        routes.Map(CasualBattleService.SetFlag, "dungeons", async (session, msgId, body) =>
+        {
+            await casual.SetFlagAsync(session, DungeonTeamSetFlagReq.Parser.ParseFrom(body.Span));
+        });
+        routes.Map(CasualBattleService.Rally, "dungeons", async (session, msgId, body) =>
+        {
+            await casual.RallyAsync(session, DungeonTeamRallyReq.Parser.ParseFrom(body.Span));
+        });
+        routes.Map(CasualBattleService.RallyReply, "dungeons", async (session, msgId, body) =>
+        {
+            await casual.RallyReplyAsync(session, DungeonTeamRallyReplyReq.Parser.ParseFrom(body.Span));
         });
         routes.Map(PraiseService.Praise, "praise", async (session, msgId, body) =>
         {

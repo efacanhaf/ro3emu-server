@@ -12,7 +12,8 @@ namespace Ro3Emu.Server.Game;
 /// indicators; the boss panel's 31125 for an _iImportantSkill boss; then a 31101 at each attack point of the show, the
 /// damage from the shared formula (MonsterSkillHitAsync) and the row's _kBuff2 on the players hit. Where it lands follows
 /// BossSkill.Area, resolved at the hit, so a player who leaves the marked area in time is not hit; a ground area stays
-/// where it was marked. _kBuff1 goes on the boss, a summon spawns its minions, a charge moves the boss to its target
+/// where it was marked. An area also hits the tower pets and the allied companions inside it (inferred), each through
+/// its own damage path. _kBuff1 goes on the boss, a summon spawns its minions, a charge moves the boss to its target
 /// first (31112). Hit timing and charge distance are (inferred).
 /// </summary>
 public sealed partial class CombatService
@@ -28,8 +29,31 @@ public sealed partial class CombatService
     }
 
     private bool BossCastCurrent(MonsterUnit boss, long serial) =>
-        !boss.Dead && boss.Hp > 0 && !_buffs.UnitForbidden(boss, ForbiddenState.CastSkill)
+        !boss.Dead && boss.Hp > 0 && _world.Map(boss.WorldScene).Contains(boss) && !_buffs.UnitForbidden(boss, ForbiddenState.CastSkill)
             && boss.BossSkills is { } rt && rt.CastSerial == serial;
+
+    /// <summary>A boss's ground warnings. EffectData holds m_kWarningRange on 575 effects, 512 of them in no show's m_kShows, and the client draws them from an effect message
+    /// (LC_PerformEffect_Mgr), so only the server can start those. Each of this skill's (show * 100 up) ends at its first strike: the timing and the target point are (inferred).</summary>
+    private void BossGroundWarnings(MonsterUnit boss, BossSkill skill, long serial, Vec3 at, long targetId, int chant)
+    {
+        if (skill.HitMs.Length == 0) return;
+        long show = new Data.Config.SkillConfig(skill.Row).ScriptShow;
+        var effects = _data.SkillTemplateTable("Lua_Config_EffectData");
+        var shown = _data.SkillTemplate(show) is { } template ? template.GetRawText() : "";
+        double firstStrike = Math.Max(0, skill.HitMs[0] + chant - skill.ChantMs);
+        for (long id = show * 100; id < show * 100 + 100; id++)
+        {
+            if (!effects.TryGetValue(id.ToString(System.Globalization.CultureInfo.InvariantCulture), out var effect) || Data.Config.SkillEffectData.WarningSeconds(effect) is not { } seconds
+                || shown.Contains(id.ToString(System.Globalization.CultureInfo.InvariantCulture), StringComparison.Ordinal)) continue;
+            int warning = (int)id;
+            var point = at.Clone();
+            ScheduleRuntime(boss.WorldScene, TimeSpan.FromMilliseconds(Math.Max(0, firstStrike - seconds * 1000)), () => !BossCastCurrent(boss, serial) ? Task.CompletedTask
+                : _world.ToUnitViewersAsync(boss, SkillEffect, new SkillEffectDisplayNotify
+                {
+                    SourceId = boss.Uid, MasterId = boss.Uid, TargetId = targetId, EffectId = warning, EffectType = DisplayGfx, TargetPos = point, SkillId = skill.Id,
+                }));
+        }
+    }
 
     private async Task CastBossSkillAsync(MonsterUnit boss, GameSession? player, TowerPetUnit? pet, BossSkill skill, long serial)
     {
@@ -62,6 +86,7 @@ public sealed partial class CombatService
         }, highLevel: skill.HighLevel);
         if (!skill.Once && skill.CdMs > 0) await BossCooldownStartedAsync(boss, skill.Id, now + skill.CdMs);
         await FightingAsync(boss);
+        BossGroundWarnings(boss, skill, serial, hasTarget ? targetPos : origin, targetId, chant);
         int show = HitEffect(GameData.Int(skill.Row, "_iScriptShow"));
         for (int i = 0; i < skill.HitMs.Length; i++)
         {
@@ -98,6 +123,7 @@ public sealed partial class CombatService
         if (!skill.HitsPlayers) return;
         var victims = new List<GameSession>();
         var pets = new List<TowerPetUnit>();
+        var companions = new List<CompanionUnit>();
         if (skill.Area == BossSkillArea.Target)
         {
             // The locked target, unless it left the skill's reach or the scene meanwhile.
@@ -117,12 +143,17 @@ public sealed partial class CombatService
             if (boss.InstanceId != 0)
                 foreach (var unit in _world.Map(boss.WorldScene).Near(center.X, center.Z, reach + 0.5f))
                     if (unit is TowerPetUnit tp && !tp.Dead && tp.Hp > 0 && InBossArea(skill, origin, center, face, tp.X, tp.Z)) pets.Add(tp);
+                    else if (unit is CompanionUnit c && !c.Dead && c.Hp > 0 && InBossArea(skill, origin, center, face, c.X, c.Z)) companions.Add(c);
             victims.Sort((a, b) => MonsterService.Distance(center.X, center.Z, a.Position.X, a.Position.Z)
                 .CompareTo(MonsterService.Distance(center.X, center.Z, b.Position.X, b.Position.Z)));
             if (victims.Count > skill.MaxTargets) victims.RemoveRange(skill.MaxTargets, victims.Count - skill.MaxTargets);
             int room = Math.Max(0, skill.MaxTargets - victims.Count);
             if (pets.Count > room) pets.RemoveRange(room, pets.Count - room);
+            room -= pets.Count;
+            if (companions.Count > room) companions.RemoveRange(room, companions.Count - room);
         }
+        if (skill.Area != BossSkillArea.Target)
+            foreach (var landed in BossAreaLanded) await landed(boss, skill, origin, center, face);
         if (victims.Count > 0)
             await MonsterSkillHitAsync(boss, skill.Row, victims, boss.Uid, session, skill.Damages ? options.DamagePercent : 0, bossDebuffsOnly: true);
         if (skill.PushEffect > 0)
@@ -135,6 +166,13 @@ public sealed partial class CombatService
         {
             if (!BossCastCurrent(boss, serial)) break;
             if (!tp.Dead && tp.Hp > 0 && skill.Damages) await DamageTowerPetAsync(boss, tp, skill.Row, skill.Id, session, show, options.DamagePercent);
+        }
+        // (inferred) An area that hits tower pets hits the companions in it too, through the companion damage path.
+        foreach (var companion in companions)
+        {
+            if (!BossCastCurrent(boss, serial)) break;
+            if (!companion.Dead && companion.Hp > 0 && !companion.Removed && skill.Damages)
+                await DamageCompanionAsync(boss, companion, skill.Row, skill.Id, session, show, options.DamagePercent);
         }
     }
 
@@ -175,23 +213,9 @@ public sealed partial class CombatService
 
     /// <summary>A knockback or a pull of a player the skill hit, along the line from the boss, on the show's displacement
     /// effect (31112, MoveType 2, as a player skill moves its target).</summary>
-    private async Task PushPlayerAsync(MonsterUnit boss, BossSkill skill, GameSession p)
-    {
-        if (p.Dead || p.SceneLoading || p.Role is not { } role || p.WorldScene != boss.WorldScene) return;
-        float dx = p.Position.X - boss.X, dz = p.Position.Z - boss.Z, length = MathF.Sqrt(dx * dx + dz * dz);
-        if (length < 0.001f || skill.PushDistance < 0 && length <= -skill.PushDistance) return;
-        float go = skill.PushDistance >= 0 ? skill.PushDistance : -(length + skill.PushDistance);
-        var start = p.Position.Clone();
-        var end = WalkableEnd(p.SceneEntry, start, dx / length * go, dz / length * go);
-        await ToPlayerAndViewersAsync(p, SkillMove, new SkillStartMoveNotify
-        {
-            EntityID = (ulong)role.Id, StartPos = start, EndPos = end, SkillConfigId = skill.Id, EffectId = skill.PushEffect,
-            MoveType = 2, StartTimestampMs = Now, Face = p.Face, MoveTimeMs = Math.Max(1, skill.PushMs),
-        });
-        p.PreviousPosition = start;
-        p.Position = end;
-        await _world.MoveAsync(p, new WalkReq { Pos = end, Dir = p.Face, Face = p.Face, BStop = true }, forceTeleport: true);
-    }
+    private Task PushPlayerAsync(MonsterUnit boss, BossSkill skill, GameSession p) => p.WorldScene == boss.WorldScene
+        ? KnockPlayerAsync(p, boss.X, boss.Z, skill.PushDistance, skill.Id, skill.PushEffect, skill.PushMs)
+        : Task.CompletedTask;
 
     /// <summary>A charge or leap: the boss moves to just short of its target (within the skill's reach) on the show's
     /// displacement effect, as a player skill's caster move (31112, MoveType 1).</summary>
@@ -268,6 +292,30 @@ public sealed partial class CombatService
     /// <summary>A blast row's radius: _kRange in cm when real, else the default.</summary>
     private float BossSkillRadius(JsonElement row) => Numbers(row, "_kRange") is { Length: > 0 } range && range[0] >= 100
         ? (float)range[0] / 100 : _monsters.BossOptions.DefaultRadius;
+
+    /// <summary>
+    /// A raid trial's boss performance (DungeonService.RaidTrials): the row's show for <paramref name="ms"/> on the cast
+    /// wire, without hits (Orc Hero raising his shield, Ilmo beating the drum), at the boss or aimed at
+    /// <paramref name="at"/> facing <paramref name="face"/> (Osiris's Dark Pulse). Returns its session for an interrupt.
+    /// </summary>
+    internal async Task<long> PlayBossShowAsync(MonsterUnit boss, int skillId, int ms, Vec3? at = null, float? face = null)
+    {
+        long session = ++_sessionIds;
+        await SendMonsterTimelineAsync(boss, new UseInSkillInfo
+        {
+            SrcID = boss.Uid, SkillID = skillId, TargetPos = at ?? boss.Pos, Face = face ?? boss.Face, SessionId = session, SkillMs = ms,
+            StartTime = Now,
+        });
+        return session;
+    }
+
+    /// <summary>Ends a performance early (31103 Interrupted, its warnings cleared): the trial was solved.</summary>
+    internal Task InterruptBossShowAsync(MonsterUnit boss, long session) => session <= 0 || boss.Dead ? Task.CompletedTask
+        : _world.ToUnitViewersAsync(boss, SkillEnd, new SkillEndNotify
+        {
+            SrcID = boss.Uid, SessionId = session, Type = SkillEndNotify.Types.SkillEndType.Interrupted, ClearEffect = true,
+            InterruptedInfo = new SkillInterruptedInfo { Type = SkillInterruptedInfo.Types.SkillInterruptType.State },
+        });
 
     /// <summary>The boss's specials ended: interrupt the cast in flight (31103, its warnings cleared) and despawn its summons.</summary>
     private async Task EndBossSkillsAsync(MonsterUnit boss, BossSkillRuntime rt, bool interrupt)

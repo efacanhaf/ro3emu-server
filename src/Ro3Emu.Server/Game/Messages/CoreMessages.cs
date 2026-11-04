@@ -34,34 +34,6 @@ public sealed class CoreMessages(RoleSessionService roleSessions, ChatService ch
         routes.Map(GuildChallengeService.Notify, "handler", async (session, msgId, body) =>
         {
         });
-        routes.Map(2001, "handler", async (session, msgId, body) =>
-        {
-            var order = CreateOrderReq.Parser.ParseFrom(body.Span);
-            await session.SendGameAsync(2001, new CreateOrderResp
-            {
-                Result = ErrorCodes.FeatureUnavailable,
-                ChargeId = order.ChargeId, ChargeType = order.ChargeType
-            });
-        });
-        routes.Map(2002, "handler", async (session, msgId, body) =>
-        {
-            await session.SendGameAsync(2002, new PayResultResp
-            {
-                Result = ErrorCodes.FeatureUnavailable,
-                OrderId = PayResultReq.Parser.ParseFrom(body.Span).OrderId
-            });
-        });
-        routes.Map(2003, "handler", async (session, msgId, body) =>
-        {
-            await session.SendGameAsync(2003, new GetRechargeFirstAwardResp { Result = ErrorCodes.FeatureUnavailable });
-        });
-        routes.Map(2004, "handler", async (session, msgId, body) =>
-        {
-        });
-        routes.Map(2005, "handler", async (session, msgId, body) =>
-        {
-            await session.SendGameAsync(2005, new ItemExchangeResp { Result = ErrorCodes.FeatureUnavailable });
-        });
         routes.Map(WorldCoreService.TeleportObject, "handler", async (session, msgId, body) =>
         {
             // In the reverse dungeon (SceneService.MovesOnSurface) the client reports where it shows an NPC before every
@@ -289,7 +261,7 @@ public sealed class CoreMessages(RoleSessionService roleSessions, ChatService ch
             // C/D 16: every player's heartbeat used to be one Realm scope (S3: 10k per 5 min, the top Realm waiter,
             // other replies queued behind it up to 2.5 s). The role's own reconciliation runs under its reservation;
             // realm guild maintenance (at most once a second) admits its own guild keys.
-            async Task OwnAsync() { await daily.ReconcileAsync(session); await dungeons.ReconcileAsync(session); }
+            async Task OwnAsync() { await daily.ReconcileWindowsAsync(session); await dungeons.ReconcileAsync(session); }
             if (session.Owners is { } owners && session.Role is { } role)
                 await owners.RunSessionAsync("heartbeat",
                     [Ownership.ReservationKey.Role(role.Id), Ownership.ReservationKey.Lifecycle(role.Id)], session, OwnAsync);

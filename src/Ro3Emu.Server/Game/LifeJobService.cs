@@ -19,7 +19,7 @@ public sealed partial class LifeJobService
         UpgradeTitle = 33505, StudyRecipe = 33506, StudyCollection = 33507, StudyDrop = 33508,
         CheckCollect = 33509, ForgeTime = 33510, ChooseTitleEx = 33511, RefreshTitleEx = 33512,
         HealthAll = 33513, HealthOne = 33514, HealthNotify = 33515;
-    public const int VigorId = 1004, VigorUsesId = 1005;
+    public const int VigorId = 1004, VigorUsesId = 1005, VigorCurrencyId = 407;
 
     private readonly GameData _data;
     private readonly CharacterService _character;
@@ -30,7 +30,7 @@ public sealed partial class LifeJobService
     private readonly GameLoop _loop;
     private readonly TimeProvider _clock;
     private readonly ILogger<LifeJobService> _log;
-    private readonly Dictionary<GameSession, ForgeAttempt> _forging = new();
+    private readonly Dictionary<GameSession, ForgeAttempt> _forging = [];
     private sealed record ForgeAttempt(long Recipe, TimeSpan Started, int Duration, long Scene, long Job);
 
     /// <summary>Restriction consumption is durable separately from the current balance; epoch follows To-Do's 05:00.</summary>
@@ -48,6 +48,7 @@ public sealed partial class LifeJobService
         this._data = data; this._character = character; this._functions = functions; this._seasons = seasons;
         this._awards = awards; this._roles = roles; this._loop = loop; this._clock = clock; this._log = log;
         character.LifeItemUse = UseLifeItemAsync;
+        character.StateChanged.Add(SyncVigorChange);
         character.ExtraAttributes.Add(FoodAttributes);
         character.ProgressHandlers.Add(OnLevelChangedAsync);
         scene.Leaving.Add(CancelAsync);
@@ -72,6 +73,7 @@ public sealed partial class LifeJobService
         Reconcile(life, restriction, runtime);
         EnsureJobRows(life);
         NormalizeTitles(life);
+        UnlockEarnedCollections(s, life);
         restriction.RestrictCount[VigorId].LimitCount = VigorLimit(s, life);
         byte[] lifeBytesNext = life.ToByteArray(), restrictionBytesNext = restriction.ToByteArray(),
             runtimeBytesNext = JsonSerializer.SerializeToUtf8Bytes(runtime);
@@ -140,11 +142,13 @@ public sealed partial class LifeJobService
 
     /// <summary>Restrictions another service keeps (the Rift's RestrictConfig 1020): shown in the same 5018 map, never
     /// saved with or compared against the life restrictions.</summary>
-    public List<Func<GameSession, RestrictInfo?>> ProjectedRestrictions { get; } = new();
+    public List<Func<GameSession, RestrictInfo?>> ProjectedRestrictions { get; } = [];
 
     private DBRestrictInfo RestrictView(GameSession s)
     {
         var view = s.Restrictions!.Clone();
+        if (view.RestrictCount.TryGetValue(VigorId, out var vigor))
+            vigor.Count = Energy(s);
         foreach (var project in ProjectedRestrictions)
             if (project(s) is { } info) view.RestrictCount[info.Id] = info;
         return view;
@@ -153,6 +157,15 @@ public sealed partial class LifeJobService
     /// <summary>5018 with the projected restrictions; the sync sends only what changed.</summary>
     public Task SyncRestrictionsAsync(GameSession s) =>
         s.Restrictions == null ? Task.CompletedTask : CharacterService.SyncAsync(s, RestrictSync, RestrictView(s));
+
+    /// <summary>A reward or a claim that moves Vigor currency 407 changes the 5018 the client reads. A sent dataset is
+    /// compared first, because this runs on every bag change.</summary>
+    private void SyncVigorChange(GameSession s)
+    {
+        if (s.Restrictions == null || s.Synced.GetValueOrDefault(RestrictSync) is not DBRestrictInfo sent
+            || sent.RestrictCount.GetValueOrDefault(VigorId)?.Count == Energy(s)) return;
+        _ = SyncRestrictionsAsync(s);
+    }
 
     private async Task SyncAsync(GameSession s)
     {
@@ -176,9 +189,9 @@ public sealed partial class LifeJobService
     private bool Current(JsonElement row) => Numbers(row, "_kMultiverseArray") is var books
         && (books.Length == 0 || books.Contains(0) || books.Contains(_seasons.PlayBook));
     private static long[] Numbers(JsonElement row, string field) => row.TryGetProperty(field, out var a) && a.ValueKind == JsonValueKind.Array
-        ? a.EnumerateArray().Select(v => (long)(GameData.Number(v) ?? 0)).ToArray() : [];
+        ? [.. a.EnumerateArray().Select(v => (long)(GameData.Number(v) ?? 0))] : [];
     private static List<(int Entry, long Count)> Costs(JsonElement row, string field, int count = 1) =>
-        GameData.Pairs(row, field).Select(p => (checked((int)p.Id), checked((long)p.Value * count))).ToList();
+        [.. GameData.Pairs(row, field).Select(p => (checked((int)p.Id), checked((long)p.Value * count)))];
 
     /// <summary>33513/14 both send 33515; both maps must be present even for a single-id query (DAL lines 1542..1554).</summary>
     public Task HealthAsync(GameSession s, GetHealthCostReq? req = null, int error = 0)
@@ -237,7 +250,8 @@ public sealed partial class LifeJobService
             if (!next.LifeJobInfoMap.TryGetValue(job, out var known) || known.JobLevel == 0) next.LifeJobInfoMap[job] = NewJob(job);
             // (inferred) Free, condition-zero gathering entries are the initial profession curriculum.
             foreach (var c in _data.Table("LifeCollectionConfig").Values.Where(c => Current(c) && GameData.Int(c, "_iJobId") == job && GameData.Int(c, "_iCondition") == 0))
-                UnlockCollection(next, c);
+                UnlockCollection(s, next, c);
+            UnlockEarnedCollections(s, next); // a profession learned again keeps the resources its level earned
             if (await CommitAsync(s, "cd13c/life-switch", next, s.Restrictions!.Clone(), Copy(s.LifeRuntime), cost, [],
                 result: new { Job = job, Slot = req.OpJobType }) == null)
                 error = _character.ShortageOf(s, cost);
@@ -298,7 +312,7 @@ public sealed partial class LifeJobService
             if (s.LifeJob!.LifeJobInfoMap[job].GatherInfo.ItemDetails.ContainsKey(req.CollectionID)) error = ErrorCodes.LifeCollectionLearned;
             else
             {
-                var next = s.LifeJob.Clone(); UnlockCollection(next, row.Value);
+                var next = s.LifeJob.Clone(); UnlockCollection(s, next, row.Value);
                 await CommitAsync(s, "cd13c/life-collection", next, s.Restrictions!.Clone(), Copy(s.LifeRuntime), [], [],
                     result: new { Collection = req.CollectionID });
             }
@@ -306,12 +320,10 @@ public sealed partial class LifeJobService
         await s.SendGameAsync(StudyCollection, new StudyCollectionResp { Result = error });
     }
 
-    private void UnlockCollection(DBLifeJobInfo next, JsonElement collection)
+    private void UnlockCollection(GameSession s, DBLifeJobInfo next, JsonElement collection)
     {
         next.LifeJobInfoMap[GameData.Int(collection, "_iJobId")].GatherInfo.ItemDetails[GameData.Int(collection, "_iCollectionId")] = 1;
-        foreach (long id in Numbers(collection, "_iDropId"))
-            if (_data.Row("LifeDropConfig", id) is { } drop && GameData.Int(drop, "_iCondition") == 0 && Costs(drop, "_kUnlockcost").Count == 0)
-                next.LifeJobUnLockDrop[id] = 1;
+        UnlockEarnedDrops(s, next, collection);
     }
 
     public async Task LearnDropAsync(GameSession s, StudyCollectionDropReq req)
@@ -350,7 +362,15 @@ public sealed partial class LifeJobService
     public int GatheringDuration(GameSession s, long collectionId) => _data.Row("LifeCollectionConfig", collectionId) is { } row
         ? OperationDuration(s, row, false) : 1;
 
-    private static long Energy(GameSession s) => s.Restrictions?.RestrictCount.GetValueOrDefault(VigorId)?.Count ?? 0;
+    /// <summary>Usable vigor: restriction 1004 plus Vigor currency 407, the currency counting up to VitalityExtraLimit
+    /// (RestrictConfig 1004: "You can accumulate up to 5000 points"). (inferred) Currency above the limit is not lost: it
+    /// stays in the balance and counts again once vigor is spent.</summary>
+    private long Energy(GameSession s)
+    {
+        long held = s.Restrictions?.RestrictCount.GetValueOrDefault(VigorId)?.Count ?? 0;
+        long currency = s.Progress?.Currency.GetValueOrDefault(VigorCurrencyId) ?? 0;
+        return Math.Max(held, Math.Min(Param("VitalityExtraLimit", 5000), checked(held + currency)));
+    }
 
     /// <summary>
     /// A resolved collection outcome belongs to one pending interaction. Retrying its writer command must
@@ -362,14 +382,17 @@ public sealed partial class LifeJobService
         internal required byte[] BeforeLife { get; init; }
         internal required byte[] BeforeRestrict { get; init; }
         internal required byte[] BeforeRuntime { get; init; }
+        internal required long BeforeCurrencyVigor { get; init; }
         internal required DBLifeJobInfo Life { get; init; }
         internal required DBRestrictInfo Restrict { get; init; }
         internal required RuntimeState Runtime { get; init; }
         internal required AwardGrant[] Grants { get; init; }
+        internal required long CurrencyVigorCost { get; init; }
 
         internal bool Matches(GameSession s) => s.Role?.Id == RoleId && s.LifeJob != null && s.Restrictions != null
             && s.LifeJob.ToByteArray().AsSpan().SequenceEqual(BeforeLife)
             && s.Restrictions.ToByteArray().AsSpan().SequenceEqual(BeforeRestrict)
+            && s.Progress?.Currency.GetValueOrDefault(VigorCurrencyId) == BeforeCurrencyVigor
             && JsonSerializer.SerializeToUtf8Bytes(s.LifeRuntime).AsSpan().SequenceEqual(BeforeRuntime);
     }
 
@@ -384,6 +407,7 @@ public sealed partial class LifeJobService
         var beforeLife = s.LifeJob!.ToByteArray();
         var beforeRestrict = s.Restrictions!.ToByteArray();
         var beforeRuntime = JsonSerializer.SerializeToUtf8Bytes(s.LifeRuntime);
+        long beforeCurrencyVigor = s.Progress!.Currency.GetValueOrDefault(VigorCurrencyId);
         var grants = new List<AwardGrant>();
         var mainGrants = new List<AwardGrant>();
         var next = s.LifeJob!.Clone(); var restrict = s.Restrictions!.Clone(); var runtime = Copy(s.LifeRuntime);
@@ -409,8 +433,9 @@ public sealed partial class LifeJobService
                 next.GeneralCollectionTimesByMap[sceneEntry] = map = new GeneralCollectionTimesByMap();
             map.Times[pointId] = checked(map.Times.GetValueOrDefault(pointId) + 1);
         }
-        SpendEnergy(next, restrict, runtime, RollFreeVigor(s, row, false) ? 0 : VigorCost(s, row, false));
-        RecoverZeroVigor(s, restrict);
+        long currencyVigorCost = SpendEnergy(next, restrict, runtime,
+            RollFreeVigor(s, row, false) ? 0 : VigorCost(s, row, false), beforeCurrencyVigor);
+        RecoverZeroVigor(s, restrict, beforeCurrencyVigor - currencyVigorCost);
         AddExp(s, next, GameData.Int(row, "_iJobId"), OperationExp(s, row, false));
         Reconcile(next, restrict, runtime);
         NormalizeTitles(next);
@@ -418,8 +443,9 @@ public sealed partial class LifeJobService
         return (0, new GatherResolution
         {
             RoleId = s.Role!.Id, BeforeLife = beforeLife,
-            BeforeRestrict = beforeRestrict, BeforeRuntime = beforeRuntime, Life = next,
-            Restrict = restrict, Runtime = runtime, Grants = grants.ToArray()
+            BeforeRestrict = beforeRestrict, BeforeRuntime = beforeRuntime, BeforeCurrencyVigor = beforeCurrencyVigor,
+            Life = next, Restrict = restrict, Runtime = runtime, Grants = [.. grants],
+            CurrencyVigorCost = currencyVigorCost
         });
     }
 
@@ -429,7 +455,8 @@ public sealed partial class LifeJobService
     {
         if (!resolved.Matches(s)) return ErrorCodes.Cooldown;
         return await CommitAsync(s, "gather-yield", resolved.Life, resolved.Restrict, resolved.Runtime, [], resolved.Grants,
-            rewardSettlement: settlement, gatherCommitted: committed) != null ? 0 : ErrorCodes.ItemsShort;
+            rewardSettlement: settlement, gatherCommitted: committed,
+            vigorCurrencyCost: resolved.CurrencyVigorCost) != null ? 0 : ErrorCodes.ItemsShort;
     }
 
     /// <summary>
@@ -497,6 +524,8 @@ public sealed partial class LifeJobService
                 var outcomes = new Dictionary<long, List<AwardGrant>>();
                 var actualCosts = new List<(int Entry, long Count)>();
                 var next = s.LifeJob!.Clone(); var restrict = s.Restrictions!.Clone(); var runtime = Copy(s.LifeRuntime);
+                long currencyVigorAvailable = s.Progress!.Currency.GetValueOrDefault(VigorCurrencyId);
+                long currencyVigorCost = 0;
                 try
                 {
                     for (int n = 0; n < req.ItemNum; n++)
@@ -506,15 +535,18 @@ public sealed partial class LifeJobService
                         var operationCosts = Costs(row, "_kcost");
                         ApplySkillRewards(s, next, row, true, output, operationCosts);
                         actualCosts.AddRange(operationCosts);
-                        SpendEnergy(next, restrict, runtime, RollFreeVigor(s, row, true) ? 0 : VigorCost(s, row, true));
-                        RecoverZeroVigor(s, restrict);
+                        long usedCurrency = SpendEnergy(next, restrict, runtime,
+                            RollFreeVigor(s, row, true) ? 0 : VigorCost(s, row, true),
+                            currencyVigorAvailable - currencyVigorCost);
+                        currencyVigorCost = checked(currencyVigorCost + usedCurrency);
+                        RecoverZeroVigor(s, restrict, currencyVigorAvailable - currencyVigorCost);
                         grants.AddRange(output);
                         if (!outcomes.TryGetValue(tuple.Type, out var list)) outcomes[tuple.Type] = list = [];
                         list.AddRange(output);
                     }
                     AddExp(s, next, GameData.Int(row, "_iJobId"), OperationExp(s, row, true) * req.ItemNum);
                     var received = await CommitAsync(s, "cd13c/life-forge", next, restrict, runtime,
-                        actualCosts.GroupBy(c => c.Entry).Select(g => (g.Key, g.Sum(c => c.Count))).ToArray(), grants,
+                        [.. actualCosts.GroupBy(c => c.Entry).Select(g => (g.Key, g.Sum(c => c.Count)))], grants,
                         result: new
                         {
                             Recipe = req.ItemUniqueId, Batch = req.ItemNum,
@@ -523,7 +555,7 @@ public sealed partial class LifeJobService
                                 Type = p.Key,
                                 Grants = p.Value.Select(g => new { g.Entry, g.Count, g.BindType }).ToArray()
                             }).ToArray()
-                        });
+                        }, vigorCurrencyCost: currencyVigorCost);
                     if (received == null) error = _character.ShortageOf(s, cost);
                     else
                     {
@@ -563,12 +595,18 @@ public sealed partial class LifeJobService
         throw new AwardResolutionException("LifeFormula output weights overflow");
     }
 
-    private void SpendEnergy(DBLifeJobInfo next, DBRestrictInfo restrict, RuntimeState runtime, long amount)
+    private long SpendEnergy(DBLifeJobInfo next, DBRestrictInfo restrict, RuntimeState runtime, long amount,
+        long currencyVigorAvailable)
     {
         Reconcile(next, restrict, runtime);
         var energy = restrict.RestrictCount[VigorId];
-        energy.Count -= amount; energy.HistoryUseCount = checked(energy.HistoryUseCount + amount);
+        long currencyUsed = Math.Min(amount, currencyVigorAvailable);
+        long restrictionUsed = amount - currencyUsed;
+        if (restrictionUsed > energy.Count) throw new InvalidOperationException("Profession vigor balance changed before spending.");
+        energy.Count -= restrictionUsed;
+        energy.HistoryUseCount = checked(energy.HistoryUseCount + amount);
         runtime.EnergySpent = checked(runtime.EnergySpent + amount);
+        return currencyUsed;
     }
 
     /// <summary>Current row's next threshold and current row's base-level gate (LC_LifeJobHelper.CheckJobLevelUpCondition).</summary>
@@ -577,10 +615,12 @@ public sealed partial class LifeJobService
         var info = next.LifeJobInfoMap[job]; info.JobExp = checked(info.JobExp + gain);
         var rows = _data.Table("LifeJobLevelConfig").Values.Where(r => Current(r) && GameData.Int(r, "_iJobId") == job)
             .ToDictionary(r => GameData.Int(r, "_iLevel"));
-        while (rows.TryGetValue(info.JobLevel, out var row) && rows.ContainsKey(info.JobLevel + 1)
+        // A row holds what it takes to reach its level: LC_LifeJobHelper.GetLevelNextNeedEXP and CheckJobLevelUpCondition read level + 1.
+        while (rows.TryGetValue(info.JobLevel + 1, out var row)
             && GameData.Int(row, "_iNextNeedExp") is var need and > 0 && info.JobExp >= need
             && _functions.ConditionMet(s, GameData.Int(row, "_iCondition")))
         { info.JobExp -= need; info.JobLevel++; }
+        UnlockEarnedCollections(s, next);
     }
 
     private async Task OnLevelChangedAsync(GameSession s)
@@ -597,8 +637,9 @@ public sealed partial class LifeJobService
     private async Task<List<InvItem>?> CommitAsync(GameSession s, string kind, DBLifeJobInfo life, DBRestrictInfo restrict,
         RuntimeState runtime, IReadOnlyList<(int Entry, long Count)> cost, IReadOnlyList<AwardGrant> grants,
         IReadOnlyDictionary<long, int>? instances = null, RewardSettlement? rewardSettlement = null,
-        Action? gatherCommitted = null, object? result = null)
+        Action? gatherCommitted = null, object? result = null, long vigorCurrencyCost = 0)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(vigorCurrencyCost);
         if (grants.Any(g => g.ExpireTimeStamp != 0)) throw new AwardResolutionException("Life award requires expiring grant support");
         if (rewardSettlement == null)
         {
@@ -607,13 +648,17 @@ public sealed partial class LifeJobService
             restrict.RestrictCount[VigorId].LimitCount = VigorLimit(s, life);
         }
         long baseExp = rewardSettlement == null ? 0 : grants.Where(g => g.Entry == 100).Sum(g => (long)g.Count);
-        long jobExp = rewardSettlement == null ? 0 : grants.Where(g => g.Entry == 101).Sum(g => (long)g.Count);
+        long jobExp = rewardSettlement == null ? 0
+            : grants.Where(g => g.Entry == 101).Sum(g => (long)g.Count) + _character.JobExpFromBase(baseExp);
         IEnumerable<AwardGrant> itemGrants = rewardSettlement == null ? grants :
             grants.Where(g => g.Entry is not (100 or 101));
-        var semanticCost = cost.Concat((instances ?? new Dictionary<long, int>()).Select(pair =>
+        var payment = cost.ToList();
+        if (vigorCurrencyCost > 0) payment.Add((VigorCurrencyId, vigorCurrencyCost));
+        var semanticCost = payment.Concat((instances ?? new Dictionary<long, int>()).Select(pair =>
             (s.Items.Single(item => item.Guid == pair.Key).Entry, (long)pair.Value))).ToArray();
         var goods = itemGrants.Select(g => (g.Entry, g.Count)).ToArray();
-        var received = await _character.ExchangeLockedAsync(s, cost, [], instances, popup: false, sync: false,
+        // Only gathering passes a settlement. The client shows a gained item only from 31322, its bag sync shows none (LC_DAL_Reward).
+        var received = await _character.ExchangeLockedAsync(s, payment, [], instances, popup: rewardSettlement != null, sync: false,
             persist: tx =>
             {
                 tx.RoleBlob(s.Role!.Id, "lifejob", life.ToByteArray());
@@ -633,7 +678,7 @@ public sealed partial class LifeJobService
                             Result = result
                         }));
             },
-            boundGoods: itemGrants.Select(g => (g.Entry, g.Count, g.BindType)).ToArray(),
+            boundGoods: [.. itemGrants.Select(g => (g.Entry, g.Count, g.BindType))],
             baseExp: baseExp, jobExp: jobExp,
             rewardSettlement: rewardSettlement,
             committed: () =>

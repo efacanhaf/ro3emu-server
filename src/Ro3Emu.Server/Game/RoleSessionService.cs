@@ -8,7 +8,8 @@ namespace Ro3Emu.Server.Game;
 /// A role's session: create and select, the login -> world sequence, position and
 /// settings persistence, the handover cleanup and role switching. Its messages are mapped by CoreMessages.
 /// </summary>
-public sealed class RoleSessionService(RoleStore roles, Data.GameData data, BuffService buffs, SceneService scene, Micro.FriendService friends, SeasonService seasons, GuildService guilds, WildAfkService afk, TimeProvider clock, Deadlines deadlines, Ownership.RoleHandover handover, SessionRegistry sessions, Persistence.PositionPersistence positions, Persistence.SettingsPersistence settings, ReconnectService reconnects, RoleSystems systems, ILogger<RoleSessionService> log)
+public sealed partial class RoleSessionService(RoleStore roles, Data.GameData data, BuffService buffs, SceneService scene, Micro.FriendService friends, SeasonService seasons, GuildService guilds, WildAfkService afk, TimeProvider clock, Deadlines deadlines, Ownership.RoleHandover handover, SessionRegistry sessions, Persistence.PositionPersistence positions, Persistence.SettingsPersistence settings, ReconnectService reconnects, RoleSystems systems, ILogger<RoleSessionService> log,
+    Microsoft.Extensions.Options.IOptions<ServerOptions> options)
 {
     /// <summary>Novice; JobConfig[1000] picks the male/female unit.</summary>
     private const int NoviceCareer = 1000;
@@ -49,18 +50,29 @@ public sealed class RoleSessionService(RoleStore roles, Data.GameData data, Buff
 
     /// <summary>Essential unlinking runs after admitted role work, under the handover's cleanup capability.</summary>
     internal Func<string, GameSession, Exception?>? CleanupFailureForTest { get; set; }
+    /// <summary>How long one handover waits, in all, for room in a full database queue.</summary>
+    internal TimeSpan CleanupQueuePatience { get; set; } = TimeSpan.FromSeconds(60);
+
     internal async Task CleanupRoleAsync(GameSession session)
     {
         var failures = new List<Exception>();
         long? snapshotRole = session.Role?.Id;
+        var patience = new Accounts.Persistence.QueueFullPatience(CleanupQueuePatience);
         async Task Step(string name, Func<Task> work)
         {
-            try
+            while (true)
             {
-                if (CleanupFailureForTest?.Invoke(name, session) is { } injected) throw injected;
-                await work();
+                try
+                {
+                    if (CleanupFailureForTest?.Invoke(name, session) is { } injected) throw injected;
+                    await work();
+                    return;
+                }
+                // A full queue wrote nothing and only means the disk is behind: wait for room, the steps run again safely.
+                catch (Exception e) when (patience.MayRetry(e)) { LogCleanupWaits(log, snapshotRole, name); }
+                catch (Exception e) { failures.Add(e); return; }
+                await patience.WaitAsync();
             }
-            catch (Exception e) { failures.Add(e); }
         }
         await systems.LeaveAsync(session, Step, () => SavePosition(session));
         if (snapshotRole is { } released) roles.ReleaseLoginSnapshot(released);
@@ -77,6 +89,12 @@ public sealed class RoleSessionService(RoleStore roles, Data.GameData data, Buff
         if (name.Length is < 2 or > 16)
         {
             result = ErrNameLengthInvalid;
+        }
+        else if ((await roles.ForAccountAsync(session.Account!)).Count >= options.Value.AntiCheat.MaxRolesPerAccount)
+        {
+            // The role screen has m_iMaxRoleNumber (6) slots and no create button past them (LC_SelectRoleManager).
+            scene.Cheats.Refused(session, CheatMonitor.RoleLimit, $"role create past {options.Value.AntiCheat.MaxRolesPerAccount} roles");
+            result = ErrorCodes.Parameter;
         }
         else
         {
@@ -95,7 +113,7 @@ public sealed class RoleSessionService(RoleStore roles, Data.GameData data, Buff
         var resp = new AccountLoginCreateRoleResp { Result = result };
         if (role != null)
         {
-            resp.RoleBaseInfo = RoleProto.BaseInfo(role);
+            resp.RoleBaseInfo = RoleProto.BaseInfo(role, session.ClientAccount);
             resp.Appearances.Add(RoleProto.Appearances(role));
         }
         await session.SendGameAsync(MsgId.LoginRoleCreate, resp);
@@ -271,7 +289,7 @@ public sealed class RoleSessionService(RoleStore roles, Data.GameData data, Buff
         session.CurrentHp = null;
         session.CurrentSp = null;
         session.Dead = false;
-        session.CareerSpecial = null; session.CareerPendants = [];
+        session.CareerSpecial = null; session.CareerPendants = []; session.CareerMountPendant = 0;
         session.Personal = null;
         session.Mounts = null; session.MountState = new(); session.Wardrobe = null; session.Totems = null; session.Genre = null;
         session.TotemSwitchUtc = default;
@@ -292,7 +310,7 @@ public sealed class RoleSessionService(RoleStore roles, Data.GameData data, Buff
             Result = 0,
             RoleAssets = new RoleAssets
             {
-                BasicInfo = RoleProto.BaseInfo(role),
+                BasicInfo = RoleProto.BaseInfo(role, session.ClientAccount),
                 ServerTimeMs = NowMs(),
                 ServerInfo = new ServerBasicInfo
                 {
@@ -322,7 +340,10 @@ public sealed class RoleSessionService(RoleStore roles, Data.GameData data, Buff
         if (!await scene.EnterSceneAsync(session, role.SceneEntry, arrival, reason: 7))
         {
             EnsureSelection(session, lease);
-            // Unknown scene in the database (no MapConfig row): fall back to the spawn map.
+            // (inferred) A saved scene the server cannot place the role on (unknown, a dungeon scene outside its
+            // instance, one the client cannot load): the spawn map's born point, where a new character starts.
+            LogMovedToSpawn(log, role.Name, role.Id, role.SceneEntry, data.MapName(role.SceneEntry),
+                scene.Unplaceable(role.SceneEntry) ?? "refused", RoleStore.SpawnSceneEntry);
             await scene.EnterSceneAsync(session, RoleStore.SpawnSceneEntry, null, reason: 7);
             EnsureSelection(session, lease);
         }
@@ -331,15 +352,29 @@ public sealed class RoleSessionService(RoleStore roles, Data.GameData data, Buff
 
     internal async Task WalkAsync(GameSession session, WalkReq walk)
     {
-        if (session.Role == null || walk.Pos == null || session.SceneLoading || session.Dead || buffs.HasForbidden(session, ForbiddenState.Walk)) return;
+        if (session.Role == null || walk.Pos == null || session.SceneLoading) return;
+        if (session.Dead || buffs.HasForbidden(session, ForbiddenState.Walk))
+        {
+            // The client cannot move now: what it reports later may not include distance covered meanwhile.
+            SceneService.HoldWalk(session, DateTime.UtcNow, walking: false);
+            return;
+        }
         if (!await scene.AcceptWalkAsync(session, walk)) return;
         session.PreviousPosition = session.Position;
         session.Position = walk.Pos;
         session.Face = walk.Face;
+        session.WalkDir = float.IsFinite(walk.Dir) ? walk.Dir : walk.Face;
+        session.LastWalkUtc = DateTime.UtcNow; // also when the walk check is off
         session.Walking = !walk.BStop && walk.SpeedRate > 0;
         positions.MarkDirty(session, urgent: walk.BStop); // C/D 18: written lazily, never on the loop
         await systems.MovedAsync(session, walk);
     }
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "Role {Role} cleanup step {Step} waits for room in a full database queue")]
+    private static partial void LogCleanupWaits(ILogger logger, long? role, string step);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "Role {Name} ({Id}) was saved on scene {Scene} {Map}, where it cannot log in ({Why}): moved to the spawn map {Spawn}")]
+    private static partial void LogMovedToSpawn(ILogger logger, string name, long id, long scene, string map, string why, long spawn);
 
     /// <summary>The entity a remote client renders for this player (same shape as ENTITYSELF).</summary>
     public static EntityBase PlayerEntity(GameSession session) => SelfEntity(session);
@@ -363,13 +398,17 @@ public sealed class RoleSessionService(RoleStore roles, Data.GameData data, Buff
         if (session.Role is { } role && req.DbSettingInfo != null)
         {
             var stored = session.Settings ??= LoadSettings(role.Id);
-            // LC_DAL_OnHook._onSaveOnHookSetting sends only edited keys. Merge the wire submessage:
-            // parsing into the existing message preserves explicitly encoded false and leaves absent siblings alone.
-            // MergeFrom(a parsed proto3 object) would lose that presence information.
-            using (var input = new CodedInputStream(wire.ToArray()))
-                for (uint tag; (tag = input.ReadTag()) != 0;)
-                    if (tag == 18) stored.MergeFrom(input.ReadBytes()); // SaveSettingReq.dbSettingInfo, field 2
-                    else input.SkipLastField();
+            // The client's maps (clientSetting, commonSetting) take any key: settings past MaxSettingsBytes are a modified
+            // client filling the role's row, which every login sends back (inferred bound, far above the client's own).
+            var merged = stored.Clone();
+            MergeSettings(merged, wire);
+            if (merged.CalculateSize() > MaxSettingsBytes && merged.CalculateSize() > stored.CalculateSize())
+            {
+                scene.Cheats.Refused(session, CheatMonitor.Payload, $"settings of {merged.CalculateSize()} bytes");
+                await session.SendGameAsync(MsgId.SaveSetting, new SaveSettingResp { Result = ErrorCodes.Parameter });
+                return;
+            }
+            MergeSettings(stored, wire);
             if (req.Type.Contains(SettingType.WildAfk) && stored.WildAFKInfo != null)
             {
                 // AFK accounting follows this preference: durable now, together with its reconciliation.
@@ -382,6 +421,22 @@ public sealed class RoleSessionService(RoleStore roles, Data.GameData data, Buff
         }
         await session.SendGameAsync(MsgId.SaveSetting, new SaveSettingResp { Result = 0 });
     }
+
+    /// <summary>
+    /// LC_DAL_OnHook._onSaveOnHookSetting sends only edited keys. Merge the wire submessage: parsing into the existing message
+    /// preserves explicitly encoded false and leaves absent siblings alone. MergeFrom(a parsed proto3 object) would lose that
+    /// presence information.
+    /// </summary>
+    private static void MergeSettings(DBSettingInfo into, ReadOnlyMemory<byte> wire)
+    {
+        using var input = new CodedInputStream(wire.ToArray());
+        for (uint tag; (tag = input.ReadTag()) != 0;)
+            if (tag == 18) into.MergeFrom(input.ReadBytes()); // SaveSettingReq.dbSettingInfo, field 2
+            else input.SkipLastField();
+    }
+
+    /// <summary>(inferred) Largest saved settings of one role: the key bindings and panels of a real client stay far below.</summary>
+    private const int MaxSettingsBytes = 256 * 1024;
 
     private DBSettingInfo LoadSettings(long roleId)
     {
@@ -416,6 +471,7 @@ public sealed class RoleSessionService(RoleStore roles, Data.GameData data, Buff
             Gender = role.Sex,
             Name = role.Name,
             EntityCamp = session.EventFaction > 0 ? session.EventFaction : 1,
+            TeamId = session.UnitTeamId,
             Face = face,
             MovementInfo = new MovementInfo
             {

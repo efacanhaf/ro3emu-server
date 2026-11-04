@@ -8,7 +8,7 @@ public sealed partial class GuildService
 {
     public const uint CancelCreate = 32215, HelperOpe = 32220, HelperLeave = 32221, HelperChange = 32222,
         Recruit = 32257;
-    private readonly Dictionary<long, long> _guildlessRecruitMs = new();
+    private readonly Dictionary<long, long> _guildlessRecruitMs = [];
 
     /// <summary>32257 publishes to the client channel-8 IM surface; recipient-independent cooldown is inferred.</summary>
     private async Task RecruitCoreAsync(GameSession s, GuildRecruitReq req)
@@ -46,7 +46,7 @@ public sealed partial class GuildService
             || guild.Members[s.Role!.Id].Official != 1 ? ErrorCodes.GuildPermission : 0;
         if (code == 0)
         {
-            await DeleteGuildAsync(guild!);
+            await EndFoundingAsync(guild!, s.Role!.Id);
             await s.SendGameAsync(CancelCreate, new GuildCancleCreateResp { Result = 0 });
             foreach (var member in guild!.Members.Values)
             {
@@ -69,7 +69,7 @@ public sealed partial class GuildService
         else
         {
             int failure = 0;
-            foreach (var id in req.GuildIds.Distinct())
+            foreach (var id in req.GuildIds.Distinct().Take(50))
             {
                 int code = Own(s) != null ? ErrorCodes.AlreadyInGuild : await RespondAsync(s, store.Get(id));
                 if (code != 0 && failure == 0) failure = code;
@@ -109,7 +109,7 @@ public sealed partial class GuildService
     {
         foreach (var guild in store.List().Where(g => g.Status == (int)GuildStatus.PreCreate && g.HelperDeadlineMs <= NowMs()))
         {
-            await DeleteGuildAsync(guild);
+            await EndFoundingAsync(guild, guild.Members.Values.First(m => m.Official == 1).RoleId);
             foreach (var member in guild.Members.Values)
             {
                 if (Online(member.RoleId) is { } online) await ClearMember(online, guild);

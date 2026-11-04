@@ -60,6 +60,15 @@ public static partial class EconomySnapshotReader
     // Item actions: role.social_outfit is DBSocialOutfit (chat cosmetics unlocked by 349 items, with unlock and expiry
     // times, and the worn choices) and role.emoji_info is DBEmojiInfo (chat emoticon ids unlocked by 212 items). Unlocks,
     // no balance and no asset: the item is spent by the cd13a/character-item-action receipt that writes them.
+    // GM panel: role.gm_state is GmCommands.RoleGmState (AllFunctionsOpen, openallfunc kept across logins): a flag that
+    // opens client functions, no balance and no asset.
+    // Job EXP catch-up: role.job_exp_catchup is CharacterService.JobExpCatchUpState: the Job EXP paid to the role, what
+    // later job advances still owe it and the rank last paid, no balance and no asset; the EXP comes with its cd13e/grant
+    // receipts.
+    // Tavern: role.barroom is TavernService.RoleState (Star Power received from Tavern gifts, its week, active days and
+    // today's time in a room): counters, no balance and no asset; the gift drink is spent by the event/tavern-gift receipt.
+    // Shop gifts: role.gifts is ShopService.GiftState (sent and received gift orders): records, no balance and no asset;
+    // the currency is spent by the sender's exchange receipt and the appearance granted by the pick's own receipt.
     // Power: role.emblems EmblemState.Power (PowerService.Record) holds the role's last published power total and its
     // best total (maxHistoryPower), as normal/season parts. Rating counters, no balance and no asset: they only gate
     // Become Stronger stage claims (whose goods come with their own daily-stage receipt) and rank the Hero Registry.
@@ -72,7 +81,30 @@ public static partial class EconomySnapshotReader
     // casual_battle_obligation.payout is CasualBattleService.Payout: a frozen match result (rating delta, record,
     // numbers) and the DropPool ids its payment rolls. No goods: they are granted by the role's event/casual-battle
     // receipt that also writes the timed_battle state and marks the row delivered.
-    public const string ExpectedFormatManifestHash = "D5E7E8D429207929DD339BBB976CBDAEA16B4197AD5A969D76BFCE9CD3EC6E54";
+    // Battle Merit: role.territory_wars Glory (TerritoryWarsService.GloryState; past seasons in GlorySeasons) holds a season's earned points, the
+    // reached rank, claimed rank markers and today's counters. No balance and no asset: the points themselves are
+    // currency 15 in the purse, granted by the earner's event/battle-glory receipt with this state; a rank reward is
+    // its event/battle-glory-rank receipt, whose claimed marker is that receipt's once-only source. The territory
+    // WorldState.GlorySettle lists past season epochs whose standings are still to be mailed: keys, no balance; the
+    // season mail's goods are the 1090 letter's attachments, delivered once by its battle-merit-season delivery key.
+    // War warehouse: guild WartimeItems/WartimeStocked (GuildService.Wartime) hold the guild's war machines, which only
+    // leave the warehouse by being built on a war map; WartimeSlots are operator permissions and WartimePrepay the
+    // machines a member reserved for the blueprint they place. No balance and no asset: machines never reach a bag, a
+    // purse or a trade.
+    // Daily compensation: role.daily DailyState.Compensation lists, per ended day, the goods of the To-Do boxes that day
+    // reached and left unclaimed. An obligation, not a holding: the goods are sourced only by the 1058 letter's
+    // mail/deliver receipt (ActivityReward), delivered once by its daily-compensation delivery key, which also removes the day.
+    // Faction Quest: role.task_runtime FactionDay/FactionPoints (TaskRuntimeState) are the game day and the Faction Quest
+    // points counted that day against TerritoryWarzoneTaskPointsLimit. A counter, no balance and no asset.
+    // Free cash shop: role.activity_runtime Purchases (NewActivityService.Purchases) counts each top-up or product a role
+    // took, in total and on its game day. Counters, no balance and no asset: the goods come with the order's own
+    // newactivity receipt that also saves them.
+    // Leaderboard rewards: server_state rank_rewards (RankRewardService) names each rewarded board's last settlement
+    // time. A key, no balance: the goods are the rank letters' attachments, each delivered once by its delivery key.
+    // First-clear rewards: role.dungeons DungeonService.State.FirstPassPaid names the bosses whose _iPartAward was paid;
+    // once-only markers, no balance and no asset (the goods are paid by the dungeon/first-pass-award receipt that writes
+    // the marker).
+    public const string ExpectedFormatManifestHash = "28C4A131F91BD077AFFDDD4A3F3DBDC343B4BFDA03022E05219E99EA38E64ACE";
     public static string FormatManifestHash => State.FormatManifestHash;
 
     private sealed partial class State
@@ -143,6 +175,7 @@ public static partial class EconomySnapshotReader
             TypeShape(typeof(Ro3Emu.Server.Game.FestivalService.Round));
             entries.Add("server_state/season_history:Ro3Emu.Server.Game.SeasonService.Season");
             TypeShape(typeof(Ro3Emu.Server.Game.SeasonService.Season));
+            entries.Add("server_state/rank_rewards:board id -> yyyyMMddHH settlement");
             entries.Add("server_state/multi_dungeon_server:romsg.DBMultiDungeonServerInfo");
             Message(Romsg.DBMultiDungeonServerInfo.Descriptor);
             return Hash(string.Join("\n", entries));

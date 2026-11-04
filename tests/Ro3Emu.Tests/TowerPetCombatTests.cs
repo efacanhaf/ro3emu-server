@@ -62,7 +62,7 @@ public sealed class TowerPetCombatTests : IAsyncLifetime
         await bot.EnterWorldAsync(id);
         using var client = new HttpClient();
         foreach (string command in new[] { "!lvl 99", "!quest done 10105020", "!quest done 10104330" })
-            (await client.PostAsync($"{_http}/ro3emu/gm?account=petcombat", new StringContent(command))).EnsureSuccessStatusCode();
+            (await client.PostAsync($"{_http}/ro3emu/gm?account=petcombat", Operator.Command(command))).EnsureSuccessStatusCode();
         await bot.SendGameAsync(TowerService.SetPets, new SetClimTowerPetsReq { Pets = { 13001, 0, 0, 0 } });
         Assert.Equal(0, (await Next(bot, TowerService.SetPets, SetClimTowerPetsRes.Parser)).Result);
         await bot.SendGameAsync(TowerService.Start, new ClimTowerStartReq { Layer = 2 });
@@ -104,7 +104,7 @@ public sealed class TowerPetCombatTests : IAsyncLifetime
             x => x.EntityUuid == (ulong)pet.Uid && x.Property.Any(p => p.Idx == 2003 && p.Data == 218));
         var attack = await Next(bot, CombatService.SkillHit, SkillHitInfo.Parser,
             h => h.SrcID == pet.Uid && h.SkillId == 2354401 && h.Dsts.Any(d => d.Damage > 0));
-        Assert.All(attack.Dsts, d => Assert.InRange(d.Damage, 100, 300));
+        Assert.All(attack.Dsts, d => Assert.InRange(d.Damage, 40, 300)); // a level 12 pet against the floor's defense (CombatService.DefenseFactor)
         Assert.DoesNotContain(bot.Inbox.Snapshot().Where(e => e.IsGame(CombatService.SkillHit))
             .Select(e => SkillHitInfo.Parser.ParseFrom(e.Body)), h => h.SrcID == pet.Uid && h.SkillId == 2354301);
     }
@@ -164,6 +164,7 @@ public sealed class TowerPetCombatTests : IAsyncLifetime
         Assert.Equal(0, Service<BuffService>().ShieldAmount(caster));
         // Review regression: drive the same shield through the actual monster -> player commit path,
         // not just BuffService.AbsorbAsync. Both the wire absorption field and HP must agree.
+        s.NoRegenUntilMs = long.MaxValue; // the exact HP below must not meet a recovery tick
         long ownerHp = Service<CharacterService>().Stats(s)[2000];
         await Run(() => Service<MonsterService>().Attack!(attacker, s));
         var ownerFirst = await Next(bot, CombatService.SkillHit, SkillHitInfo.Parser,

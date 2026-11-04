@@ -278,6 +278,66 @@ public sealed class SocialMessages(ChatService chat, TeamService teams, EmblemSe
         {
             await guilds.EliteSaveAsync(session, QuickJoinEliteGroupReq.Parser.ParseFrom(body.Span));
         });
+        routes.Map(GuildService.ToolList, "guilds", async (session, msgId, body) =>
+        {
+            await guilds.ToolListAsync(session);
+        });
+        routes.Map(GuildService.ToolAssign, "guilds", async (session, msgId, body) =>
+        {
+            await guilds.ToolAssignAsync(session, GuildWartimeToolBelongOperReq.Parser.ParseFrom(body.Span));
+        });
+        routes.Map(GuildService.ToolExchange, "guilds", async (session, msgId, body) =>
+        {
+            await guilds.ToolExchangeAsync(session, GuildWartimeToolExchangeOperReq.Parser.ParseFrom(body.Span));
+        });
+        routes.Map(GuildService.Prepay, "guilds", async (session, msgId, body) =>
+        {
+            await guilds.PrepayAsync(session, GuildWartimeStorePrepayReq.Parser.ParseFrom(body.Span));
+        });
+        routes.Map(GuildService.BuildCannon, "guilds", async (session, msgId, body) =>
+        {
+            await guilds.BuildCannonAsync(session, GuildAttackCityBuildReq.Parser.ParseFrom(body.Span));
+        });
+        routes.Map(GuildService.CancelPrepay, "guilds", async (session, msgId, body) =>
+        {
+            await guilds.CancelPrepayAsync(session);
+        });
+        routes.Map(GuildService.VehicleUse, "guilds", async (session, msgId, body) =>
+        {
+            await guilds.VehicleUseAsync(session, GuildVehicleUseReq.Parser.ParseFrom(body.Span));
+        });
+        routes.Map(GuildService.MergePull, "guilds", async (session, msgId, body) =>
+        {
+            await guilds.MergePullAsync(session);
+        });
+        routes.Map(GuildService.MergeRecommend, "guilds", async (session, msgId, body) =>
+        {
+            await guilds.MergeRecommendAsync(session);
+        });
+        routes.Map(GuildService.MergeDetail, "guilds", async (session, msgId, body) =>
+        {
+            await guilds.MergeDetailAsync(session, MergeGuildDetailDataReq.Parser.ParseFrom(body.Span));
+        });
+        routes.Map(GuildService.MergeMembers, "guilds", async (session, msgId, body) =>
+        {
+            await guilds.MergeMembersAsync(session, SaveMergeMemberReq.Parser.ParseFrom(body.Span));
+        });
+        routes.Map(GuildService.MergeOpe, "guilds", async (session, msgId, body) =>
+        {
+            await guilds.MergeOpeAsync(session, MergeGuildOpeReq.Parser.ParseFrom(body.Span));
+        });
+        routes.Map(GuildService.MergeAsk, "guilds", async (session, msgId, body) =>
+        {
+            await guilds.MergeAskAsync(session, InviteMergeGuildReq.Parser.ParseFrom(body.Span));
+        });
+        routes.Map(GuildService.Peach, "guilds", async (session, msgId, body) =>
+        {
+            await guilds.PeachAsync(session, GuildPeachReq.Parser.ParseFrom(body.Span));
+        });
+        routes.Map(GuildService.PeachApply, "guilds", async (session, msgId, body) =>
+        {
+            await guilds.PeachApplyAsync(session);
+        });
         routes.Map(GuildService.BroadEmail, "guilds", async (session, msgId, body) =>
         {
             await guilds.BroadEmailAsync(session, GuildBroadEmailReq.Parser.ParseFrom(body.Span));

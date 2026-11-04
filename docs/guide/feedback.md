@@ -67,15 +67,35 @@ The context comes from an in-memory ring of the last 4096 log lines (`Diagnostic
 
 ## Reading reports (operator)
 
-Loopback only, on the server machine:
+On the web panel: **Admin → Reports** ([web panel](panel.md#report-inbox)) lists them with a status (new, in progress,
+done, won't fix), an assignee and notes, for every staff role.
+
+On the server machine, with the operator token from the data dir ([GM access](gm-access.md#the-loopback-tool)):
 
 ```bash
-curl -s 'http://127.0.0.1:5380/ro3emu/reports?format=text'          # all, readable
-curl -s 'http://127.0.0.1:5380/ro3emu/reports?since=12'             # JSON, reports after #12
-curl -s 'http://127.0.0.1:5380/ro3emu/reports?since=2026-10-12T00:00:00Z&limit=50'
+op="X-Ro3Emu-Operator: $(cat data/operator.token)"
+curl -s -H "$op" 'http://127.0.0.1:5380/ro3emu/reports?format=text'          # all, readable
+curl -s -H "$op" 'http://127.0.0.1:5380/ro3emu/reports?since=12'             # JSON, reports after #12
+curl -s -H "$op" 'http://127.0.0.1:5380/ro3emu/reports?since=2026-10-12T00:00:00Z&limit=50'
 ```
 
 `since` is a report id (reports after it) or an ISO-8601 time (reports at or after it); `limit` 1-1000 (default 200),
 oldest first. From another machine: `ssh <your server> curl -s ...`. The file itself is plain JSON lines too.
 
 Each report also writes one log line: `Feedback #N from <account> (<role>) via <source> at scene ...`.
+
+## Posting reports to Discord
+
+Set a channel webhook (Discord: Edit channel → Integrations → Webhooks → New webhook → Copy webhook URL) and every
+stored report is also posted there as one message: the text, the player (role, account, level, job), where (map,
+scene, position, line) and the source. The server log lines stay in the file; the message footer says how to read them.
+Mentions typed by players (`@everyone`, roles, users) never ping. If Discord is down or refuses the post, the server
+logs a warning and the report is still in the file.
+
+The URL lets anyone post to that channel, so pass it through the environment rather than a committed config file:
+
+```bash
+Ro3Emu__Feedback__DiscordWebhookUrl='https://discord.com/api/webhooks/...'
+```
+
+Use a private channel: reports name the player's account.

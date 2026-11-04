@@ -15,8 +15,8 @@ public sealed partial class GuildService
         IEnumerable<long> roleIds, Func<Task> command, bool maintenance = false, bool disband = false, bool characterGate = false)
     {
         var owners = ownerRegistry;
-        long[] requestedGuilds = guildIds.Where(id => id > 0).Distinct().ToArray();
-        long[] requestedRoles = roleIds.Where(id => id > 0).Distinct().ToArray();
+        long[] requestedGuilds = [.. guildIds.Where(id => id > 0).Distinct()];
+        long[] requestedRoles = [.. roleIds.Where(id => id > 0).Distinct()];
         var lease = actor?.Attachment;
         var role = actor?.Role;
         while (true)
@@ -71,15 +71,18 @@ public sealed partial class GuildService
     private ReservationKey[] GuildKeys(GameSession? actor, long? roleId, long[] requestedGuilds, long[] requestedRoles,
         bool maintenance, bool disband)
     {
-        var guilds = maintenance ? store.List() : requestedGuilds
+        var guilds = maintenance ? store.List() : [.. requestedGuilds
             .Append(actor?.Role is { } r ? store.ForRole(r.Id)?.Id ?? 0 : 0)
-            .Where(id => id > 0).Distinct().Select(store.Get).OfType<GuildStore.State>().ToArray();
-        return guilds.Select(g => ReservationKey.Entity("guild", g.Id.ToString()))
-            .Append(ReservationKey.Entity("guild-catalog", "ordinary"))
-            .Concat(maintenance || disband ? new[] { ReservationKey.Entity("guild_market", "1") } : [])
-            .Concat(guilds.SelectMany(g => g.Members.Keys).Concat(requestedRoles)
-                .Concat(roleId is { } id ? new[] { id } : []).Distinct().Select(id => ReservationKey.Role(id)))
-            .ToArray();
+            .Where(id => id > 0).Distinct().Select(store.Get).OfType<GuildStore.State>()];
+        return
+        [
+            .. guilds.Select(g => ReservationKey.Entity("guild", g.Id.ToString()))
+,
+            ReservationKey.Entity("guild-catalog", "ordinary"),
+            .. maintenance || disband ? new[] { ReservationKey.Entity("guild_market", "1") } : [],
+            .. guilds.SelectMany(g => g.Members.Keys).Concat(requestedRoles)
+                    .Concat(roleId is { } id ? new[] { id } : []).Distinct().Select(id => ReservationKey.Role(id)),
+        ];
     }
 
     /// <summary>The keys of the actor's own ordinary guild operation (own guild, its members, the catalog and the
@@ -87,6 +90,8 @@ public sealed partial class GuildService
     internal ReservationKey[] OwnGuildKeys(GameSession s) => GuildKeys(s, s.Role?.Id, [], [], false, false);
 
     public Task CreateAsync(GameSession s, GuildCreateReq req) => RunGuildAsync(s, [], [], () => CreateCoreAsync(s, req), characterGate: true);
+    /// <summary>The operator's guild: free and Normal at once whatever the host's GuildFounding.</summary>
+    internal Task CreateInstantAsync(GameSession s, GuildCreateReq req) => RunGuildAsync(s, [], [], () => CreateCoreAsync(s, req, instant: true), characterGate: true);
     public Task ApplyAsync(GameSession s, GuildEnterApplyReq req) => RunGuildAsync(s, req.GuildIds, [], () => ApplyCoreAsync(s, req), true);
     public Task ApplyOpeAsync(GameSession s, GuildEnterApplyOpeReq req) => RunGuildAsync(s, [], req.PlayerIds, () => ApplyOpeCoreAsync(s, req), true);
     public Task InviteAsync(GameSession s, GuildInviteReq req) => RunGuildAsync(s, [], req.TarPlayerID, () => InviteCoreAsync(s, req));
@@ -180,15 +185,26 @@ public sealed partial class GuildService
     private async Task DeleteGuildAsync(GuildStore.State guild, IEnumerable<long>? removed = null)
     {
         var transaction = roles.NewTransaction();
+        long[] prior = [.. guild.Members.Keys.Concat(removed ?? []).Distinct()];
+        // The last leaver may already be removed from the staged roster; resolve the durable actor.
+        transaction.WithEconomy(EnlistDisband(guild, transaction, prior, prior.First()));
+        await roles.CommitAsync(transaction, "guild/disband-recovery");
+    }
+
+    /// <summary>
+    /// A guild's end, staged: its market stalls and treasury go to recovery and the given roles' views lose the guild.
+    /// Shared by disbanding and by a merge, where only the members who stay behind lose it (GuildService.Merge). Returns the
+    /// economy envelope, which the caller attaches last (it freezes the transaction).
+    /// </summary>
+    private EconomyEnvelope EnlistDisband(GuildStore.State guild, RoleItemPlanBuilder transaction, IEnumerable<long> clearViews, long actorId,
+        EconomyEffect? refund = null)
+    {
         var market = store.LoadMarket();
         long escrow = market.Stalls.Where(stall => stall.GuildId == guild.Id).Sum(stall => stall.RemainCount);
         if (market.Stalls.RemoveAll(stall => stall.GuildId == guild.Id) > 0) store.EnlistMarket(market, transaction);
         store.EnlistRecoverDelete(guild, transaction, escrow);
-        long[] prior = guild.Members.Keys.Concat(removed ?? []).Distinct().ToArray();
         var empty = new GuildStore.State { Id = guild.Id };
-        EnlistViews(empty, transaction, prior);
-        // The last leaver may already be removed from the staged roster; resolve the durable actor.
-        long actorId = prior.First();
+        EnlistViews(empty, transaction, clearViews);
         var actor = roles.Get(actorId)!;
         var owner = new EconomyOwner(EconomyOwnerKind.Guild, guild.Id.ToString(System.Globalization.CultureInfo.InvariantCulture));
         var effects = new List<EconomyEffect>();
@@ -209,9 +225,9 @@ public sealed partial class GuildService
             effects.Add(new(new(EconomyAssetKind.GuildResource, asset), owner, EconomyCompartment.Recovery,
                 count, EconomyLegKind.Transfer, EconomyReason.GuildResourceTransfer, (int)asset));
         }
-        transaction.WithEconomy(new EconomyEnvelope(Guid.NewGuid().ToString("N"), actor.Account, actor.Id,
-            "guild-disband", "guild:" + guild.Id, "guild-disband:" + guild.Id, NowMs(), effects, []));
-        await roles.CommitAsync(transaction, "guild/disband-recovery");
+        if (refund != null) effects.Add(refund);
+        return new EconomyEnvelope(Guid.NewGuid().ToString("N"), actor.Account, actor.Id,
+            "guild-disband", "guild:" + guild.Id, "guild-disband:" + guild.Id, NowMs(), effects, []);
     }
 
     private EconomyEnvelope GuildPayment(GameSession actor, string kind, int entry, long amount)

@@ -15,7 +15,7 @@ namespace Ro3Emu.Server.Game;
 /// requests that change them. Numbers come from the client's own tables (AttriBaseLvConfig, AttributeConversionConfig,
 /// BaseLvConfig, JobLvConfig, BasePointConfig, EquipConfig).
 /// </summary>
-public sealed partial class CharacterService(RoleStore roles, ItemStore itemStore, GameData data, World world, ILogger<CharacterService> log)
+public sealed partial class CharacterService(RoleStore roles, ItemStore itemStore, GameData data, World world, SeasonService seasons, ILogger<CharacterService> log)
 {
     public const uint RoleBaseInfoSync = 5066;
     public const uint BaseAttrSync = 5067;
@@ -40,7 +40,7 @@ public sealed partial class CharacterService(RoleStore roles, ItemStore itemStor
 
     private const int ItemTypeCurrency = 1;
     private const int ItemTypeEquip = 5;
-    private const int ZenyId = 1;
+    internal const int ZenyId = 1;
     private const int BaseExpItem = 100;
     private const int JobExpItem = 101;
 
@@ -55,7 +55,7 @@ public sealed partial class CharacterService(RoleStore roles, ItemStore itemStor
     public Func<int, Dictionary<int, long>?>? TotemAttrFactory { get; set; }
 
     /// <summary>Transactional collection consumables. Called with StateLock held after common item validation.</summary>
-    public List<Func<GameSession, ItemUseReq, InvItem, JsonElement, int, Task<int?>>> SpecialItemUse { get; } = new();
+    public List<Func<GameSession, ItemUseReq, InvItem, JsonElement, int, Task<int?>>> SpecialItemUse { get; } = [];
 
     /// <summary>EntityBase.equipInfo holds the item ids of equipment grids 1..7 (MainHand, ViceHand, Armor, ...).</summary>
     private const int EquipInfoSlots = 7;
@@ -68,20 +68,27 @@ public sealed partial class CharacterService(RoleStore roles, ItemStore itemStor
     private static readonly int[] AoiProperties = [MaxHp, Hp, MaxSp, Sp, Speed, Lv, 2003];
 
     /// <summary>What a new character finds in the bag: Beginner Potions, a Novice Dagger, a Cotton Shirt, some Zeny.</summary>
-    private static readonly (int Entry, int Count)[] StarterKit = [(1000000, 20), (2010121, 1), (2550120, 1), (ZenyId, 1000)];
+    internal static readonly (int Entry, int Count)[] StarterKit = [(1000000, 20), (2010121, 1), (2550120, 1), (ZenyId, 1000)];
+
+    /// <summary>The ledger receipt of a starter kit (CharacterFamilyEconomy: its goods are StarterGrant sources). A
+    /// character with the kit and no such receipt got it before the kit was recorded (PanelBackend's duplication check).</summary>
+    internal const string StarterKitEconomyKind = "cd13a/character-starter-kit";
 
     // ---- helpers ----
 
     internal void Save(GameSession session) => roles.SaveProgress(session.Role!.Id, session.Progress!);
 
     /// <summary>An item entered the bag: entry and the count gained (card collection first sight, achievement counters).</summary>
-    public List<Action<GameSession, int, int>> ItemGained { get; } = new();
+    public List<Action<GameSession, int, int>> ItemGained { get; } = [];
+
+    /// <summary>The items of a committed award (quest reward, drop, gift). A GM grant or a shop exchange does not pass here.</summary>
+    public List<Action<GameSession, IReadOnlyList<(int Entry, int Count)>>> ItemsAwarded { get; } = [];
     internal sealed record FirstCardSightPlan(Action<RoleItemPlanBuilder> Persist, Action Apply);
     /// <summary>CardService enlists first sight in owned award/exchange commits and, for a kill, the slain monster's Codex kill (NPC id, 0 none).</summary>
     internal Func<GameSession, IReadOnlyList<int>, int, FirstCardSightPlan?>? StageFirstCardSight { get; set; }
 
     /// <summary>After a successful 31323 consume and its effects; quest engine queues objective evaluation.</summary>
-    public List<Action<GameSession, int, int>> ItemUsed { get; } = new();
+    public List<Action<GameSession, int, int>> ItemUsed { get; } = [];
 
     /// <summary>LifeJobService owns action 607/315 item transactions; null means ordinary item effects.</summary>
     internal Func<GameSession, InvItem, JsonElement, int, Task<int?>>? LifeItemUse { get; set; }
@@ -99,7 +106,7 @@ public sealed partial class CharacterService(RoleStore roles, ItemStore itemStor
     }
 
     /// <summary>After a committed inventory, equipment or stat change; listeners defer any grant work.</summary>
-    public List<Action<GameSession>> StateChanged { get; } = new();
+    public List<Action<GameSession>> StateChanged { get; } = [];
 
     /// <summary>For CardService: item, stat and look updates after socket changes (caller holds the lock).</summary>
     internal async Task ItemsChangedAsync(GameSession session, bool stats)
@@ -140,14 +147,14 @@ public sealed partial class CharacterService(RoleStore roles, ItemStore itemStor
     internal Func<GameSession, IEnumerable<(long Id, double Value)>>? TalentAttributes { get; set; }
 
     /// <summary>Runs after level / job level / job changes (SkillService resends skill points and the normal attack).</summary>
-    public List<Func<GameSession, Task>> ProgressHandlers { get; } = new();
+    public List<Func<GameSession, Task>> ProgressHandlers { get; } = [];
 
 }
 
 /// <summary>Per equipment grid (1..7) levels, kept with the role: strengthen, refine and refine luck (1/10000).</summary>
 public sealed class EquipLevels
 {
-    public Dictionary<int, int> Strength { get; set; } = new();
-    public Dictionary<int, int> Refine { get; set; } = new();
-    public Dictionary<int, int> Luck { get; set; } = new();
+    public Dictionary<int, int> Strength { get; set; } = [];
+    public Dictionary<int, int> Refine { get; set; } = [];
+    public Dictionary<int, int> Luck { get; set; } = [];
 }

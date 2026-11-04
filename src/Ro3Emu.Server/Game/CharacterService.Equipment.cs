@@ -4,6 +4,7 @@ using Romsg;
 using Ro3Emu.Server.Accounts;
 using Ro3Emu.Server.Accounts.Persistence;
 using Ro3Emu.Server.Data;
+using Ro3Emu.Server.Data.Config;
 using Ro3Emu.Server.Economy;
 using Ro3Emu.Server.Maps;
 
@@ -45,14 +46,13 @@ public sealed partial class CharacterService
     private (JsonElement Row, long Grids, long Level)[] ResonanceRows(string table)
     {
         if (!_resonanceRows.TryGetValue(table, out var rows))
-            _resonanceRows[table] = rows = data.Table(table).Values.OrderBy(r => GameData.Int(r, "_iEffectLev"))
+            _resonanceRows[table] = rows = [.. data.Table(table).Values.OrderBy(r => GameData.Int(r, "_iEffectLev"))
                 .Where(r => r.TryGetProperty("_kRequest", out var req) && req.ValueKind == JsonValueKind.Array && req.GetArrayLength() >= 2)
-                .Select(r => (r, (long)(GameData.Number(r.GetProperty("_kRequest")[0]) ?? 0), (long)(GameData.Number(r.GetProperty("_kRequest")[1]) ?? 0)))
-                .ToArray();
+                .Select(r => (r, (long)(GameData.Number(r.GetProperty("_kRequest")[0]) ?? 0), (long)(GameData.Number(r.GetProperty("_kRequest")[1]) ?? 0)))];
         return rows;
     }
 
-    private readonly Dictionary<string, (JsonElement Row, long Grids, long Level)[]> _resonanceRows = new();
+    private readonly Dictionary<string, (JsonElement Row, long Grids, long Level)[]> _resonanceRows = [];
 
     /// <summary>
     /// The reached resonance row. Only grids that wear an item count: the refine/strengthen level stays on an empty
@@ -139,10 +139,17 @@ public sealed partial class CharacterService
     private JsonElement? EquipRow(int entry) =>
         data.Row("ItemConfig", entry) is { } row && GameData.Int(row, "_iEquipId") is var equipId and > 0 ? data.Row("EquipConfig", equipId) : null;
 
-    /// <summary>EquipPosType (ItemConfig._iEquipPart) -> the grids it may go to (spec §4.2).</summary>
-    private static int[] GridsFor(int part) => part switch
+    /// <summary>
+    /// EquipPosType (ItemConfig._iEquipPart) -> the grids it may go to (spec §4.2). A one-handed weapon (MainHand, 2) may
+    /// also take the off-hand grid when the career wields two (LC_EquipmentHelper: GetWeaponStatusType reads JobConfig
+    /// _kWeaponForm, and a career without SingleHand 1 but with DoubleHand 3, TwoHandAndDoubleHand, puts a MainHand
+    /// weapon in ViceHand once MainHand is taken; today 5200/5300/5400, the Assassin line, with [2,3]).
+    /// </summary>
+    private static int[] GridsFor(int part, bool dualWield) => part switch
     {
-        1 or 2 => [1],
+        1 => [1],
+        2 when dualWield => [1, 2],
+        2 => [1],
         3 => [2],
         4 => [3],
         5 => [4],
@@ -151,6 +158,18 @@ public sealed partial class CharacterService
         8 or 9 or 10 => [part],
         _ => [],
     };
+
+    private int[] GridsFor(int entry, RoleProgress progress) =>
+        ItemConfig.Get(data, entry) is { } item ? GridsFor((int)item.EquipPart, DualWields(progress.Career)) : [];
+
+    /// <summary>enum_WeaponFromType SingleHand 1 / DoubleHand 3: the career's weapon forms allow a weapon in each hand.</summary>
+    private bool DualWields(long career) =>
+        JobConfig.Get(data, career) is { } job && job.WeaponForm.Contains(3) && !job.WeaponForm.Contains(1);
+
+    /// <summary>A one-handed weapon sits in the off-hand grid of a dual-wielding career: its weapon cards go there too.</summary>
+    internal bool IsDualWieldOffHand(GameSession session, int grid) =>
+        grid == 2 && DualWields(session.Progress!.Career)
+        && session.Items.Any(i => i.Pack == 2 && i.Grid == grid && ItemConfig.Get(data, i.Entry) is { EquipPart: 2 });
 
     /// <summary>
     /// 31400 equip / unequip (spec §4.7): bag 5009, equipment 5007 (before the reply, so the client's gear map exists),
@@ -177,7 +196,7 @@ public sealed partial class CharacterService
         else if (item != null && (int)req.Opr == 0 && item.Grid == 0 && data.Row("ItemConfig", item.Entry) is { } row && GameData.Int(row, "_iType") == ItemTypeEquip)
         {
             int part = (int)GameData.Int(row, "_iEquipPart");
-            var grids = GridsFor(part);
+            var grids = GridsFor(item.Entry, session.Progress!);
             if (grids.Length > 0)
             {
                 if (!grids.Contains(grid)) grid = grids.FirstOrDefault(g => staged.Where(i => i.Grid > 0 && i.Pack == 2 && i.Grid <= 8).All(e => e.Grid != g), grids[0]);
@@ -222,6 +241,8 @@ public sealed partial class CharacterService
         await SyncItemsAsync(session);
         await SyncAsync(session, EquipSync, BuildEquip(session));
 
+        // The client overwrites its resonance levels from this reply (LC_DAL_Equipment), and the 5007 increment does not restore
+        // them: left out, the panel showed level 0 at (7/7) until a relog, though the stats kept counting.
         await session.SendGameAsync(EquipItemOpr, new EquipItemOprResp
         {
             Result = 0,
@@ -229,6 +250,8 @@ public sealed partial class CharacterService
             Pos = (EquipGridType)grid,
             ItemGUID = item!.Guid,
             Item = ItemInfo(item),
+            RefineEffectLv = Resonance(session, "RefiningEffectTable"),
+            StrengthenEffectLv = Resonance(session, "StrengthenEffectTable"),
         });
         await EquipmentAppearanceChangedAsync(session);
         foreach (var handler in StateChanged) handler(session);

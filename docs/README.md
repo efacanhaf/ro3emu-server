@@ -1,27 +1,38 @@
 # Documentation
 
+## Guides: playing
+
+- [Play on your own PC](guide/play.md): RO3Emu.exe, its commands, what it changes in the game folder
+- [Play with friends and host a server](guide/hosting.md): Windows and Linux hosting, ports, backups, hardware
+- [What works](features.md): every playable system
+- [For developers](development.md): running from source, layout, tests, releases, architecture
+
 ## Guides: running a server
 
+- [Web panel](guide/panel.md): the built-in website for players and admins (port 5381), bans, nginx and https
 - [GM access](guide/gm-access.md): who may use GM commands (`Ro3Emu:GmAccounts`)
+- [GM panel](guide/gm-panel.md): what each button of the client's GM panel does
 - [Open content](guide/open-content.md): every feature the client can show is playable (`Ro3Emu:OpenContent`)
 - [Bug reports](guide/feedback.md): the in-game Feedback button and `/bug`, and how to read the reports
 - [Launcher and patch repository](guide/launcher.md): hosting the client for your players
 - [Tests](guide/testing.md): content tests on your exported data, rule tests on the invented fixture that CI runs
 - [Config tables](guide/config-tables.md): the typed views of the client's tables and the startup check of the export
 - [Security model](systems/security.md): what the server exposes, what it trusts, and how to report a vulnerability
+- [Account bans](systems/account-bans.md): the `account_ban` table, how the web panel bans and where the server checks it
 
 ## Systems: how each part is implemented
 
 | Area | Notes |
 |---|---|
-| Combat and skills | [skill protocol](systems/skill-protocol.md) · [buffs and resources](systems/skill-buffs.md) · [skill growth](systems/skill-growth.md) · [remaining skill messages](systems/skills-rest.md) · [totem effects](systems/totem-effects.md) |
-| Character and items | [Astral Level (Paragon)](systems/paragon.md) · [Starshatter ritual](systems/starshatter.md) · [title ranks](systems/titles.md) · [equipment affixes](systems/equipment-affixes.md) · [build presets](systems/genre.md) · [wardrobe](systems/wardrobe.md) · [mounts and totems](systems/mount-totem.md) |
+| Combat and skills | [monster AI](systems/monster-ai.md) · [skill protocol](systems/skill-protocol.md) · [buffs and resources](systems/skill-buffs.md) · [skill growth](systems/skill-growth.md) · [remaining skill messages](systems/skills-rest.md) · [totem effects](systems/totem-effects.md) |
+| Character and items | [levelling from Lv 20 to 40](systems/leveling.md) · [Astral Level (Paragon)](systems/paragon.md) · [Starshatter ritual](systems/starshatter.md) · [title ranks](systems/titles.md) · [equipment affixes](systems/equipment-affixes.md) · [build presets](systems/genre.md) · [wardrobe](systems/wardrobe.md) · [mounts and totems](systems/mount-totem.md) |
 | Pets | [pets](systems/pet.md) · [ordinary guardian skills](systems/pet-guardian-skills.md) · [pets in the world](systems/pet-world-follow.md) · [tower companions and Bonus Time](systems/tower-pets-afk.md) |
 | Life jobs | [life jobs and production](systems/lifejob.md) · [gathering](systems/gathering.md) |
-| Economy | [trade and stalls](systems/trade-stalls.md) · [auctions](systems/auction.md) · [mail](systems/mail.md) · [durable activity settlement](systems/durable-settlement.md) |
+| Social | [Tavern](systems/tavern.md) |
+| Economy | [gift codes](systems/gift-codes.md) · [currency redemption and paid products](systems/shop-currency.md) · [trade and stalls](systems/trade-stalls.md) · [auctions](systems/auction.md) · [mail](systems/mail.md) · [durable activity settlement](systems/durable-settlement.md) |
 | Guilds | [guilds](systems/guild.md) · [territory wars](systems/territory-wars.md) · [escort and guild trading](systems/territory-escort.md) |
 | Instances | [dungeons](systems/dungeon.md) · [story dungeon inventory](systems/dungeon-inventory.md) |
-| Activities | [overview](systems/activities.md) · [timed activities](systems/activities-timed-events.md) · [adventures](systems/activities-adventures.md) · [battle pass and month card](systems/activities-battlepass-monthcard.md) · [guild campfire](systems/activities-guild-campfire.md) · [lottery](systems/activities-lottery.md) |
+| Activities | [overview](systems/activities.md) · [timed activities](systems/activities-timed-events.md) · [Survivor Battle in the match](systems/survivor-battle.md) · [adventures](systems/activities-adventures.md) · [battle pass and month card](systems/activities-battlepass-monthcard.md) · [guild campfire](systems/activities-guild-campfire.md) · [lottery](systems/activities-lottery.md) · [leaderboard rewards](systems/leaderboard-rewards.md) |
 
 ## Research: client evidence
 

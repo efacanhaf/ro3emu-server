@@ -1,9 +1,7 @@
 {
-  // Ro3Emu.Patcher repository (static HTTP) and the channel this launcher follows. Point these at your own host
-  // (docs/guide/launcher.md); a launcher.json beside the exe overrides the built-in one.
-  "repository": "http://localhost:8790/",
-  "channel": "test",
-  // The game server's HTTP base; the launcher pings it for the online pill.
-  "server": "http://127.0.0.1:5380",
-  "serverName": "RO3Emu"
+  // Built into the exe. "ro3emu" is RO3Emu's own app (the one in the release zip): the game from Genesis' update servers,
+  // your own server on this PC, updates and news from RO3Emu's GitHub releases.
+  // A server's own launcher uses "operator" with its "repository", "channel", "server", "serverName" and "links"
+  // (docs/guide/launcher.md); build it with -p:LauncherConfigFile=<your file> or put a launcher.json beside the exe.
+  "mode": "ro3emu"
 }

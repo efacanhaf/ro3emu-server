@@ -79,7 +79,7 @@ public sealed class KillEconomyTests : IAsyncLifetime
     {
         await using var bot = await Enter();
         using (var client = new HttpClient())
-            (await client.PostAsync(_http + "/ro3emu/gm?account=killtest", new StringContent("!job 1100"))).EnsureSuccessStatusCode();
+            (await client.PostAsync(_http + "/ro3emu/gm?account=killtest", Operator.Command("!job 1100"))).EnsureSuccessStatusCode();
         var player = Session;
         var monster = await Service<GameLoop>().InvokeAsync(async () =>
         {
@@ -123,7 +123,7 @@ public sealed class KillEconomyTests : IAsyncLifetime
     {
         await using var bot = await Enter();
         using (var client = new HttpClient())
-            (await client.PostAsync(_http + "/ro3emu/gm?account=killtest", new StringContent("!job 1100"))).EnsureSuccessStatusCode();
+            (await client.PostAsync(_http + "/ro3emu/gm?account=killtest", Operator.Command("!job 1100"))).EnsureSuccessStatusCode();
         var player = Session;
         var monster = await Service<GameLoop>().InvokeAsync(async () =>
         {
@@ -177,6 +177,30 @@ public sealed class KillEconomyTests : IAsyncLifetime
         Assert.Equal(monster.RewardSource!.Key, Assert.Single(ledger.Receipts).SourceKeys!.Single());
         var newSpawn = Monster(); await OnLoop(() => Reward(player, newSpawn));
         Assert.NotEqual(monster.RewardSource, newSpawn.RewardSource); Assert.Equal(2, ReceiptCount());
+    }
+
+    [ClientDataFact]
+    public async Task LootedEquipmentIsDescribedAsItsBagItemForTheQuickEquipOffer()
+    {
+        await using var bot = await Enter(); var player = Session; var monster = Monster();
+        await OnLoop(() =>
+        {
+            Service<CharacterService>().AutoDecomposeReturns = (_, _) => [];
+            return Task.CompletedTask;
+        });
+        await OnLoop(() => Reward(player, monster));
+        var packet = GetRewardNotify.Parser.ParseFrom((await bot.Inbox.WaitAsync(e => e.IsGame(CharacterService.GetRewardNotify)
+            && GetRewardNotify.Parser.ParseFrom(e.Body).RewardType.Contains(8), TimeSpan.FromSeconds(10))).Body);
+        // The weapon is the bag's new piece: its instance id, appraisal and score (LC_EquipmentHelper.CanFastEquip).
+        var weapon = Assert.Single(packet.Rewards, r => r.ItemEntry == 2010121);
+        var bagPiece = player.Items.Where(i => i.Entry == 2010121).MaxBy(i => i.Guid)!;
+        Assert.Equal(bagPiece.Guid, weapon.ItemGuid);
+        Assert.True(weapon.ItemInfos.ContainsKey(2)); // ItemAttrTypeScore
+        Assert.True(weapon.ItemInfos.ContainsKey(3)); // ItemAttrTypeAppraise
+        // Stackables keep entry and count.
+        var zeny = Assert.Single(packet.Rewards, r => r.ItemEntry == 1);
+        Assert.Equal(7, zeny.Stack);
+        Assert.Equal(0, zeny.ItemGuid);
     }
 
     [ClientDataFact]

@@ -9,8 +9,8 @@ using Ro3Emu.Server.Economy;
 namespace Ro3Emu.Server.Accounts;
 
 /// <summary>
-/// Accounts and login tokens in SQLite. An unknown identity is registered on its first login (research server,
-/// no sign-up page).
+/// Accounts and login tokens in SQLite. An unknown identity is registered on its first login (research server), or on
+/// the web panel's sign-up page through the same code (<see cref="RegisterAsync"/>).
 /// </summary>
 public sealed partial class AccountStore : IDisposable
 {
@@ -26,6 +26,19 @@ public sealed partial class AccountStore : IDisposable
     private readonly Lazy<DbReadPool> _readers;
     private readonly Game.GameLoop? _loop;
     private readonly ILogger<AccountStore>? _log;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _standingEconomyIssues = new();
+
+    /// <summary>Stored rows the economy decoder could not read, each logged once: operations go on without them, so this is
+    /// what tells the operator (EconomyEnvelopePlan).</summary>
+    internal int StandingEconomyIssues => _standingEconomyIssues.Count;
+
+    internal void ReportStandingEconomyIssue(EconomyIssue issue)
+    {
+        if (_standingEconomyIssues.TryAdd(issue.Key, 0) && _log != null) LogStandingEconomyIssue(_log, issue.Key, issue.Kind, issue.Detail);
+    }
+
+    [LoggerMessage(Level = LogLevel.Error, Message = "Economy decoder cannot read the stored row {Key} ({Kind}): {Detail}. Its value is left out of economy checks until it is repaired.")]
+    private static partial void LogStandingEconomyIssue(ILogger logger, string key, EconomyIssueKind kind, string detail);
     private readonly object _runtimeGate = new();
     private bool _disposed;
     private int _failNextEconomyAcknowledgementForTest;
@@ -45,7 +58,7 @@ public sealed partial class AccountStore : IDisposable
         _log = log;
         // A half-done restore may have moved the live file away; opening now would create an empty realm (C/D 19).
         DatabaseRestore.ThrowIfUnfinished(options.Value.DataDir);
-        Directory.CreateDirectory(options.Value.DataDir);
+        PrivateFiles.Directory(options.Value.DataDir);
         _databasePath = Path.Combine(options.Value.DataDir, "ro3emu.db");
         _escrowCatalog = new Lazy<EconomyCatalog>(() =>
         {
@@ -67,6 +80,8 @@ public sealed partial class AccountStore : IDisposable
             wal.CommandText = "PRAGMA journal_mode=WAL;";
             wal.ExecuteNonQuery();
         }
+        // SQLite gives the WAL and shared-memory files the database file's mode, so they follow it.
+        PrivateFiles.Files(_databasePath, _databasePath + "-wal", _databasePath + "-shm");
         using var cmd = db.CreateCommand();
         cmd.CommandText = """
             CREATE TABLE IF NOT EXISTS account (
@@ -98,7 +113,7 @@ public sealed partial class AccountStore : IDisposable
             """;
         cmd.ExecuteNonQuery();
         _writer = new(() => new DbWriter(_connectionString, AccessMetrics, _metrics, _log)
-        { RoleWritesCommitted = Snapshots.Committed, Caches = Caches });
+        { RoleWritesCommitted = Snapshots.Committed, Caches = Caches, StandingIssue = ReportStandingEconomyIssue });
         _readers = new(() => new DbReadPool(_databasePath, AccessMetrics, _metrics, _log));
         foreach (var plan in DatabaseSchema.Plans()) WriteSync<int>(plan);
     }
@@ -150,7 +165,9 @@ public sealed partial class AccountStore : IDisposable
         catch { db.Dispose(); throw; }
     }
 
-    public enum LoginResult { Ok, Registered, BadPassword }
+    /// <summary>Banned: the credential matched (or registered the name) but the account has an active ban. Unknown: no
+    /// account has the name and the sign-in was told not to register it (ServerOptions.RefuseUnknownAccounts).</summary>
+    public enum LoginResult { Ok, Registered, BadPassword, Banned, Unknown }
 
     private bool OnLoop => _loop?.IsOnLoop == true || _metrics != null && ReferenceEquals(ServerMetrics.LoopOwner, _metrics);
     private DbWriter Writer { get { lock (_runtimeGate) { ObjectDisposedException.ThrowIf(_disposed, this); return _writer.Value; } } }
@@ -221,6 +238,8 @@ public sealed partial class AccountStore : IDisposable
         object?[] result;
         try { result = await Writer.ExecuteAsync<object?[]>(plan); }
         catch (EconomyOperationConflictException) { throw; }
+        // Not admitted: nothing was written, so this is a definite failure, never an unknown outcome to resolve.
+        catch (DbQueueFullException) { throw; }
         catch (Exception original)
         {
             object?[]? resolved;
@@ -265,6 +284,8 @@ public sealed partial class AccountStore : IDisposable
         object?[] result;
         try { result = await Writer.ExecuteAsync<object?[]>(plan); }
         catch (EconomyOperationConflictException) { throw; }
+        // Not admitted: nothing was written, so this is a definite failure, never an unknown outcome to resolve.
+        catch (DbQueueFullException) { throw; }
         catch (Exception original)
         {
             object?[]? resolved;
@@ -416,14 +437,13 @@ public sealed partial class AccountStore : IDisposable
         FlushStagedFor(plan);
         bool cached = false;
         if (plan.RolePins.Count != 0)
-            plan.Expect(plan.RolePins.Distinct().Select(role =>
+            plan.Expect([.. plan.RolePins.Distinct().Select(role =>
             {
                 if (!fresh && OwnerVector(role) is { } vector) { cached = true; return vector; }
                 return ReadVector(role, overtaken: fresh);
-            }).ToArray());
+            })]);
         if (plan.EntityWrites.Count != 0)
-            plan.ExpectEntities(plan.EntityWrites.Distinct()
-                .Select(key => ReadSync<OwnerRevisionValue>(new OwnerRevisionReadPlan(key))).ToArray());
+            plan.ExpectEntities([.. plan.EntityWrites.Distinct().Select(key => ReadSync<OwnerRevisionValue>(new OwnerRevisionReadPlan(key)))]);
         return cached;
     }
     private DbPlan Prepare(DbPlan plan)
@@ -478,11 +498,12 @@ public sealed partial class AccountStore : IDisposable
     }
     public async Task<bool> VerifyAsync(string name, string password) => await VerifiedAccountAsync(name, password).ConfigureAwait(false) != null;
 
-    /// <summary>The account's stored name when the password matches, else null.</summary>
+    /// <summary>The account's stored name when the password matches and the account is not banned, else null.</summary>
     public async Task<string?> VerifiedAccountAsync(string name, string password)
     {
         var credentials = await ReadAsync<AccountCredentials?>(new AccountCredentialsRead(name)).ConfigureAwait(false);
-        return credentials != null && await MatchesAsync(password, credentials).ConfigureAwait(false) ? credentials.Name : null;
+        return credentials != null && await MatchesAsync(password, credentials).ConfigureAwait(false)
+            ? await UnlessBannedAsync(credentials.Name, "password").ConfigureAwait(false) : null;
     }
 
     public LoginResult Login(string name, string password)
@@ -495,16 +516,29 @@ public sealed partial class AccountStore : IDisposable
 
     /// <summary>
     /// Login or first-time registration. <see cref="SignIn.Account"/> is the account's stored name, which can differ
-    /// from <paramref name="name"/> in letter case; tokens and sessions must carry it, never the typed spelling.
+    /// from <paramref name="name"/> in letter case; tokens and sessions must carry it, never the typed spelling. The ban
+    /// is checked only once the password matched, so a wrong password answers the same whether or not the account is
+    /// banned; a name that has no account but a ban row is refused before it is registered. With
+    /// <paramref name="register"/> false a name that has no account is answered Unknown and nothing is written.
     /// </summary>
-    public async Task<SignIn> SignInAsync(string name, string password)
+    public async Task<SignIn> SignInAsync(string name, string password, bool register = true)
+    {
+        var signIn = await CheckOrRegisterAsync(name, password, register).ConfigureAwait(false);
+        if (signIn.Result is LoginResult.BadPassword or LoginResult.Banned or LoginResult.Unknown) return signIn;
+        return await UnlessBannedAsync(signIn.Account, "sign-in").ConfigureAwait(false) == null
+            ? signIn with { Result = LoginResult.Banned } : signIn;
+    }
+
+    private async Task<SignIn> CheckOrRegisterAsync(string name, string password, bool register)
     {
         var existing = await ReadAsync<AccountCredentials?>(new AccountCredentialsRead(name)).ConfigureAwait(false);
         if (existing != null) return await Check(existing).ConfigureAwait(false);
-        byte[] salt = RandomNumberGenerator.GetBytes(16);
-        byte[] hash = await Task.Run(() => AccountHash.Hash(password, salt)).ConfigureAwait(false);
-        if (await WriteAsync<bool>(new AccountRegisterPlan(name, hash, salt, DateTime.UtcNow.ToString("O"))).ConfigureAwait(false))
-            return new(LoginResult.Registered, name);
+        if (!register) return new(LoginResult.Unknown, name);
+        switch (await TryRegisterAsync(name, password).ConfigureAwait(false))
+        {
+            case Registration.Banned: return new(LoginResult.Banned, name);
+            case Registration.Created: return new(LoginResult.Registered, name);
+        }
         // A concurrent registration won the unique-name constraint; compare against its committed credentials.
         existing = await ReadAsync<AccountCredentials?>(new AccountCredentialsRead(name)).ConfigureAwait(false)
             ?? throw new InvalidOperationException("Account registration collision did not leave a visible account.");
@@ -515,8 +549,54 @@ public sealed partial class AccountStore : IDisposable
     }
 
     public readonly record struct SignIn(LoginResult Result, string Account);
+
+    public enum Registration { Created, Taken, Banned }
+
+    /// <summary>
+    /// Creates the account the game's first login would create for this name and password (the panel's sign-up):
+    /// the same row, the same hash, the same ban check. Taken when the name exists in any letter case.
+    /// </summary>
+    public async Task<Registration> RegisterAsync(string name, string password) =>
+        await ReadAsync<AccountCredentials?>(new AccountCredentialsRead(name)).ConfigureAwait(false) != null
+            ? Registration.Taken : await TryRegisterAsync(name, password).ConfigureAwait(false);
+
+    private async Task<Registration> TryRegisterAsync(string name, string password)
+    {
+        // A ban outlives its account (deleting an account keeps its ban row), so a banned name is refused before it is
+        // registered again.
+        if (await UnlessBannedForRegistrationAsync(name).ConfigureAwait(false) == null) return Registration.Banned;
+        byte[] salt = RandomNumberGenerator.GetBytes(16);
+        byte[] hash = await Task.Run(() => AccountHash.Hash(password, salt)).ConfigureAwait(false);
+        return await WriteAsync<bool>(new AccountRegisterPlan(name, hash, salt, DateTime.UtcNow.ToString("O"))).ConfigureAwait(false)
+            ? Registration.Created : Registration.Taken;
+    }
+
+    /// <summary>
+    /// Sets <paramref name="replacement"/> as the password once <paramref name="current"/> matched (a banned account cannot),
+    /// and drops the account's login tokens, so a client still holding one signs in again with the new password.
+    /// </summary>
+    public async Task<bool> ChangePasswordAsync(string name, string current, string replacement)
+    {
+        if (await VerifiedAccountAsync(name, current).ConfigureAwait(false) is not { } account) return false;
+        byte[] salt = RandomNumberGenerator.GetBytes(16);
+        byte[] hash = await Task.Run(() => AccountHash.Hash(replacement, salt)).ConfigureAwait(false);
+        return await WriteAsync<bool>(new AccountPasswordPlan(account, hash, salt)).ConfigureAwait(false);
+    }
     private static Task<bool> MatchesAsync(string password, AccountCredentials existing)
         => Task.Run(() => CryptographicOperations.FixedTimeEquals(existing.Hash, AccountHash.Hash(password, existing.Salt)));
+
+    /// <summary>
+    /// The spelling each account last typed at /sdk/login. The client keeps that spelling and only asks for its GM button
+    /// when the role's account equals it, case-sensitively (Lua LC_DAL_GM [GMPanelCapability] identity check); everything
+    /// server-side keeps the stored name. In memory: after a restart the stored name is sent until the next login.
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _typedNames = new(StringComparer.OrdinalIgnoreCase);
+
+    public void RecordTypedName(string account, string typed) => _typedNames[account] = typed;
+
+    /// <summary>The account name to show the client: its typed spelling when it is the same name, else the stored one.</summary>
+    public string ClientAccount(string account) =>
+        _typedNames.TryGetValue(account, out var typed) && string.Equals(typed, account, StringComparison.OrdinalIgnoreCase) ? typed : account;
 
     /// <summary>Token returned by /sdk/login, presented as the verifySdk ticket.</summary>
     public string IssueSdkToken(string account) => IssueToken("sdk", account, 24);
@@ -549,10 +629,14 @@ public sealed partial class AccountStore : IDisposable
         return WriteAsync<string>(new AccountTokenPlan(kind, account, token, now, now + 86400));
     }
 
+    /// <summary>The token's account, or null when the token is unknown or expired or the account is banned.</summary>
     private string? ResolveToken(string kind, string? token)
-        => string.IsNullOrEmpty(token) ? null : ReadSync<string?>(new AccountTokenRead(kind, token, DateTimeOffset.UtcNow.ToUnixTimeSeconds()));
-    private Task<string?> ResolveTokenAsync(string kind, string? token)
-        => string.IsNullOrEmpty(token) ? Task.FromResult<string?>(null) : ReadAsync<string?>(new AccountTokenRead(kind, token, DateTimeOffset.UtcNow.ToUnixTimeSeconds()));
+        => string.IsNullOrEmpty(token) ? null
+            : UnlessBanned(ReadSync<string?>(new AccountTokenRead(kind, token, DateTimeOffset.UtcNow.ToUnixTimeSeconds())), kind + " token");
+    private async Task<string?> ResolveTokenAsync(string kind, string? token)
+        => string.IsNullOrEmpty(token) ? null
+            : await UnlessBannedAsync(await ReadAsync<string?>(new AccountTokenRead(kind, token, DateTimeOffset.UtcNow.ToUnixTimeSeconds()))
+                .ConfigureAwait(false), kind + " token").ConfigureAwait(false);
 
     public void Dispose()
     {

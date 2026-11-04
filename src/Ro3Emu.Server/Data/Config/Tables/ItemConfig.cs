@@ -6,12 +6,15 @@ namespace Ro3Emu.Server.Data.Config;
 [ConfigTable("ItemConfig")]
 public readonly partial record struct ItemConfig(JsonElement Row)
 {
+    [ConfigField("_QuickUse")] public partial long[] QuickUse { get; }
     [ConfigField("_iAuction")] public partial long Auction { get; }
     [ConfigField("_iAward")] public partial long Award { get; }
     [ConfigField("_iBagTab")] public partial long BagTab { get; }
     [ConfigField("_iCD")] public partial long Cd { get; }
     [ConfigField("_iCardGroup")] public partial long CardGroup { get; }
     [ConfigField("_iCardPart")] public partial long CardPart { get; }
+    /// <summary>[text id, @{1}, @{2}, ...]: the description and the values its placeholders show.</summary>
+    [ConfigField("_iDescription")] public partial JsonElement? Description { get; }
     [ConfigField("_iEnchantSlot")] public partial long EnchantSlot { get; }
     [ConfigField("_iEquipId")] public partial long EquipId { get; }
     [ConfigField("_iEquipPart")] public partial long EquipPart { get; }
@@ -28,6 +31,8 @@ public readonly partial record struct ItemConfig(JsonElement Row)
     [ConfigField("_iSort")] public partial long Sort { get; }
     [ConfigField("_iStackLimit")] public partial long StackLimit { get; }
     [ConfigField("_iSubType")] public partial long SubType { get; }
+    /// <summary>enum_ItemTimeBoundType: 0 none, 1 from acquisition, 2 absolute, 3 activity, 4 activity end.</summary>
+    [ConfigField("_iTimeBoundEnum")] public partial long TimeBoundEnum { get; }
     [ConfigField("_iTrade")] public partial long Trade { get; }
     [ConfigField("_iType")] public partial long Type { get; }
     [ConfigField("_iUseEffect")] public partial JsonElement? UseEffect { get; }
@@ -38,5 +43,10 @@ public readonly partial record struct ItemConfig(JsonElement Row)
     [ConfigField("_kIcon")] public partial string Icon { get; }
     [ConfigField("_kJobNeed")] public partial long[] JobNeed { get; }
     [ConfigField("_kMultiverseArray")] public partial long[] MultiverseArray { get; }
+    [ConfigField("_kParam1")] public partial string Param1 { get; }
+    /// <summary>The item's large picture (a card's art); "item_null_*" when it has none.</summary>
+    [ConfigField("_kPic")] public partial string Pic { get; }
+    /// <summary>For _iTimeBoundEnum 1: [minutes].</summary>
+    [ConfigField("_kTimeBoundPara")] public partial long[] TimeBoundPara { get; }
     [ConfigField("_kUseTimes")] public partial long[] UseTimes { get; }
 }

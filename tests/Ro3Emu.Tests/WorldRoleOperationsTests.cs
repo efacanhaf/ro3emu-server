@@ -5,6 +5,8 @@ using Ro3Emu.Bot;
 using Ro3Emu.Server;
 using Ro3Emu.Server.Accounts;
 using Ro3Emu.Server.Game;
+using Ro3Emu.Server.Data;
+using Ro3Emu.Server.Data.Config;
 
 namespace Ro3Emu.Tests;
 
@@ -59,7 +61,7 @@ public sealed class WorldRoleOperationsTests : IAsyncLifetime
     private async Task Gm(string account, string command)
     {
         using var http = new HttpClient();
-        var response = await http.PostAsync($"{_http}/ro3emu/gm?account={account}", new StringContent(command));
+        var response = await http.PostAsync($"{_http}/ro3emu/gm?account={account}", Operator.Command(command));
         response.EnsureSuccessStatusCode();
     }
 
@@ -71,6 +73,17 @@ public sealed class WorldRoleOperationsTests : IAsyncLifetime
         {
             var login = await Next(alice, CharacterService.ItemsSync, DBItemsInfoIncrement.Parser);
             potion = login.PackInfo[1].All.Items.Values.Single(i => i.ItemEntry == 1000000).ItemGuid;
+            // Every bar slot is present from login: the client only updates slots it already has.
+            Assert.Equal([0, 1, 2, 3, 4, 5], login.ShortcutBarInfos.All.Value.Select(s => s.SlotIndex));
+            Assert.All(login.ShortcutBarInfos.All.Value, s => Assert.Equal(0, s.ItemGuid));
+
+            // The tutorial drags a potion onto slot 5. The client applies element-wise increments, never a new list.
+            await alice.SendGameAsync(CharacterService.ShortcutBarSave, new ShortcutBarSaveReq { SlotIndex = 4, ItemGuid = potion });
+            Assert.Equal(0, (await Next(alice, CharacterService.ShortcutBarSave, ShortcutBarSaveRes.Parser)).Result);
+            var slotFive = await Next(alice, CharacterService.ItemsSync, DBItemsInfoIncrement.Parser, m => m.ShortcutBarInfos != null);
+            Assert.Null(slotFive.ShortcutBarInfos.All);
+            Assert.Equal(6, slotFive.ShortcutBarInfos.Inc.Value.Count);
+            Assert.Equal(potion, slotFive.ShortcutBarInfos.Inc.Value[4].ItemGuid);
 
             await alice.SendGameAsync(CharacterService.ShortcutBarSave, new ShortcutBarSaveReq { SlotIndex = 0, ItemGuid = potion });
             Assert.Equal(0, (await Next(alice, CharacterService.ShortcutBarSave, ShortcutBarSaveRes.Parser)).Result);
@@ -94,6 +107,8 @@ public sealed class WorldRoleOperationsTests : IAsyncLifetime
         var persisted = await Next(again, CharacterService.ItemsSync, DBItemsInfoIncrement.Parser);
         Assert.Equal(19, persisted.PackInfo[1].All.Items[potion].Stack);
         Assert.Contains(persisted.ShortcutBarInfos.All.Value, s => s.SlotIndex == 0 && s.ItemGuid == potion);
+        Assert.Contains(persisted.ShortcutBarInfos.All.Value, s => s.SlotIndex == 4 && s.ItemGuid == 0);
+        Assert.Equal(6, persisted.ShortcutBarInfos.All.Value.Count);
         Assert.Equal(1000000, Assert.Single(persisted.QuickUseInfos.All.Value).ItemEntry);
     }
 
@@ -152,6 +167,10 @@ public sealed class WorldRoleOperationsTests : IAsyncLifetime
             Assert.Equal(0, (await Next(alice, CharacterService.ChangeStatPlan, PlanAttrPointChangeResq.Parser)).Result);
             var swapped = await Next(alice, CharacterService.BaseAttrSync, BaseAttrInfoIncrement.Parser, m => !m.SyncAllMark && m.CurPlanIndex == 1);
             Assert.Equal(1, swapped.CurPlanIndex);
+            var tankStats = await Next(alice, CharacterService.OnePropertyChange, OnePropertyChange.Parser,
+                m => m.Property.Propertys.Any(p => p.PropertyId == 1 && p.Data == 1));
+            Assert.Single(tankStats.AttrModTypes);
+            Assert.Equal((int)EAttrModType.Base, tankStats.AttrModTypes[0]);
 
             await alice.SendGameAsync(CharacterService.ChangeStatPlan, new PlanAttrPointChangeReq { DestPlanIndex = 77 });
             var rejected = await Next(alice, CharacterService.ChangeStatPlan, PlanAttrPointChangeResq.Parser);
@@ -160,6 +179,10 @@ public sealed class WorldRoleOperationsTests : IAsyncLifetime
 
             await alice.SendGameAsync(CharacterService.ChangeStatPlan, new PlanAttrPointChangeReq { DestPlanIndex = 0 });
             Assert.Equal(0, (await Next(alice, CharacterService.ChangeStatPlan, PlanAttrPointChangeResq.Parser)).Result);
+            var attackStats = await Next(alice, CharacterService.OnePropertyChange, OnePropertyChange.Parser,
+                m => m.Property.Propertys.Any(p => p.PropertyId == 1 && p.Data == 5));
+            Assert.Single(attackStats.AttrModTypes);
+            Assert.Equal((int)EAttrModType.Base, attackStats.AttrModTypes[0]);
         }
         await using var again = await InWorld("Alice", create: false);
         var plans = await Next(again, CharacterService.BaseAttrSync, BaseAttrInfoIncrement.Parser);
@@ -219,7 +242,23 @@ public sealed class WorldRoleOperationsTests : IAsyncLifetime
     {
         await using (var alice = await InWorld("Alice"))
         {
-            await Next(alice, CharacterService.ItemsSync, DBItemsInfoIncrement.Parser);
+            var fresh = await Next(alice, CharacterService.ItemsSync, DBItemsInfoIncrement.Parser);
+            // A new role still gets both configs with every window slot, or the client's Add buttons hit a nil config.
+            Assert.Equal([0, 0, 0], fresh.MedicinesAutoUse.All.HpConfig.ItemEntrys);
+            Assert.Equal([0, 0, 0], fresh.MedicinesAutoUse.All.SpConfig.ItemEntrys);
+
+            // Add All and Add send every slot, with 0 for the empty ones.
+            var addAll = new MedicinesAutoUseSetReq
+            {
+                Type = MedicineAutoUseType.Hp, OpType = MedicineAutoUseOpType.Medicine,
+                SetData = new MedicinesAutoUse { Condition = 60 },
+            };
+            addAll.SetData.ItemEntrys.Add([1000000, 0, 0]);
+            await alice.SendGameAsync(CharacterService.MedicinesAutoUseSet, addAll);
+            var added = await Next(alice, CharacterService.MedicinesAutoUseSet, MedicinesAutoUseSetResp.Parser);
+            Assert.Equal(0, added.Result);
+            Assert.Equal([1000000, 0, 0], added.SetData.ItemEntrys);
+
             var medicine = new MedicinesAutoUseSetReq
             {
                 Type = MedicineAutoUseType.Hp, OpType = MedicineAutoUseOpType.Switch,
@@ -230,7 +269,11 @@ public sealed class WorldRoleOperationsTests : IAsyncLifetime
             var saved = await Next(alice, CharacterService.MedicinesAutoUseSet, MedicinesAutoUseSetResp.Parser);
             Assert.Equal(0, saved.Result);
             Assert.Equal(50, saved.SetData.Condition);
+            Assert.Equal([1000000, 0, 0], saved.SetData.ItemEntrys);
 
+            // Not an archer (PublicParamConfig ArrowsCanUseJob): even the endless Fire Arrow must be owned.
+            await alice.SendGameAsync(CharacterService.ArrowSwitch, new ItemArrowSwitchReq { ItemId = 1002012 });
+            Assert.Equal(ErrorCodes.ItemMissing, (await Next(alice, CharacterService.ArrowSwitch, ItemArrowSwitchResp.Parser)).Result);
             await alice.SendGameAsync(CharacterService.ArrowSwitch, new ItemArrowSwitchReq { ItemId = 1002011 });
             Assert.Equal(ErrorCodes.ItemMissing, (await Next(alice, CharacterService.ArrowSwitch, ItemArrowSwitchResp.Parser)).Result);
             await Gm("alice", "!item 1002011 10");
@@ -348,36 +391,43 @@ public sealed class WorldRoleOperationsTests : IAsyncLifetime
     }
 
     [ClientDataFact]
-    public async Task LuckyTurnSpendsTicketsAndGrantsConfiguredWeightedAwardsExactlyOncePerPaidRequest()
+    public async Task LuckyTurnSpendsGemsAndStopsTheWheelOnTheSlotItGranted()
     {
+        // #bug-reports "Dodo Pink Gem hard lock": the wheel (UI_Sys_Main_EntrustLotteryPanelCtrl) stays locked until a
+        // GetRewardNotify of ManifestTypeRunRing (18) names the slots it stops on. The slots are award 84011's preview.
+        const int Gem = 1250001, RunRing = 18;
+        var data = _app.Services.GetRequiredService<GameData>();
+        long award = MultiverseGroupConfig.Get(data, 84011)!.Value.ValueDefault;
+        var slots = Assert.Single(AwardConfig.Get(data, award)).Preview.Select(t => ((int)t[0], (int)t[1])).ToArray();
         await using (var alice = await InWorld("Alice"))
         {
             var session = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Role?.Name == "Alice");
             await Next(alice, CharacterService.ItemsSync, DBItemsInfoIncrement.Parser);
-            await Gm("alice", "!item 1250001 11");
-            long before = session.Progress!.Currency.GetValueOrDefault(1);
+            await Gm("alice", $"!item {Gem} 11");
 
             await alice.SendGameAsync(TaskService.TaskLuckyTurn, new LuckyTurnReq { Type = 0, Version = 1 });
+            var one = await Next(alice, CharacterService.GetRewardNotify, GetRewardNotify.Parser, m => m.RewardType.Contains(RunRing));
             Assert.Equal(0, (await Next(alice, TaskService.TaskLuckyTurn, LuckyTurnResp.Parser)).Result);
-            Assert.InRange(session.Progress.Currency[1] - before, 2_000, 12_000);
-            Assert.Equal(10, session.Items.Where(i => i.Grid == 0 && i.Entry == 1250001).Sum(i => i.Stack));
+            int slot = Assert.Single(one.RewardIndexes);
+            Assert.InRange(slot, 0, slots.Length - 1);
+            var granted = Assert.Single(one.Rewards);
+            Assert.Equal(slots[slot], (granted.ItemEntry, (int)granted.Stack));
+            Assert.Equal(10, session.Items.Where(i => i.Grid == 0 && i.Entry == Gem).Sum(i => i.Stack));
 
-            long afterOne = session.Progress.Currency[1];
             await alice.SendGameAsync(TaskService.TaskLuckyTurn, new LuckyTurnReq { Type = 1, Version = 1 });
+            var ten = await Next(alice, CharacterService.GetRewardNotify, GetRewardNotify.Parser, m => m.RewardType.Contains(RunRing));
             Assert.Equal(0, (await Next(alice, TaskService.TaskLuckyTurn, LuckyTurnResp.Parser)).Result);
-            Assert.InRange(session.Progress.Currency[1] - afterOne, 20_000, 120_000);
-            Assert.DoesNotContain(session.Items, i => i.Grid == 0 && i.Entry == 1250001);
+            Assert.Equal(10, ten.RewardIndexes.Count);
+            Assert.All(ten.RewardIndexes, i => Assert.InRange(i, 0, slots.Length - 1));
+            Assert.DoesNotContain(session.Items, i => i.Grid == 0 && i.Entry == Gem);
 
-            long paid = session.Progress.Currency[1];
             await alice.SendGameAsync(TaskService.TaskLuckyTurn, new LuckyTurnReq { Type = 0, Version = 1 });
             Assert.Equal(ErrorCodes.ItemsShort, (await Next(alice, TaskService.ApiError, APIErrorMsg.Parser,
                 m => m.OriginMsgId == TaskService.TaskLuckyTurn)).ErrorCode);
-            Assert.Equal(paid, session.Progress.Currency[1]);
         }
         await using var again = await InWorld("Alice", create: false);
         var saved = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Role?.Name == "Alice");
-        Assert.DoesNotContain(saved.Items, i => i.Grid == 0 && i.Entry == 1250001);
-        Assert.True(saved.Progress!.Currency.GetValueOrDefault(1) > 0);
+        Assert.DoesNotContain(saved.Items, i => i.Grid == 0 && i.Entry == Gem);
     }
 
     private static string RepoRoot()

@@ -3,10 +3,14 @@ using Ro3Emu.Server.Accounts;
 namespace Ro3Emu.Server.Game.Ownership;
 
 /// <summary>Loop-owned role identities and migration reservations; SessionRegistry remains a connection directory.</summary>
-public sealed class OwnerRegistry
+public sealed partial class OwnerRegistry
 {
     private readonly GameLoop _loop;
     private readonly RoleStore _roles;
+    private readonly ILogger<OwnerRegistry>? _log;
+    private long _rolesInRecovery;
+    /// <summary>Roles that cannot log in again until a restart (RoleOwnerState.RecoveryRequired). Any thread may read it.</summary>
+    public long RolesInRecovery => Interlocked.Read(ref _rolesInRecovery);
     private readonly Dictionary<long, RoleOwner> _rolesById = [];
     private long _operation, _admissionSequence;
     public ReservationCoordinator Reservations { get; } = new();
@@ -19,15 +23,25 @@ public sealed class OwnerRegistry
     /// <summary>Replacement admissions that encountered an unresolved predecessor handover/readiness fence.</summary>
     public long HandoverConflicts { get; internal set; }
     internal Action<string>? DeferredForTest { get; set; }
-    public OwnerRegistry(GameLoop loop, RoleStore roles)
+    public OwnerRegistry(GameLoop loop, RoleStore roles, ILogger<OwnerRegistry>? log = null)
     {
-        _loop = loop; _roles = roles; loop.Owners = this;
+        _loop = loop; _roles = roles; _log = log; loop.Owners = this;
         // Diagnostics (C/D 15 inventories): RO3EMU_OWNER_AUDIT=<file> appends every uncovered expansion to the file
         // and lets it proceed under its parent, so one full test run lists every dependency of a narrowed scope.
         if (Environment.GetEnvironmentVariable("RO3EMU_OWNER_AUDIT") is { Length: > 0 } auditFile)
             UncoveredForTest = line => { lock (AuditFileLock) File.AppendAllText(auditFile, line + Environment.NewLine); };
     }
     private static readonly object AuditFileLock = new();
+
+    private void RecoveryChanged(RoleOwner owner, bool entered)
+    {
+        long now = entered ? Interlocked.Increment(ref _rolesInRecovery) : Interlocked.Decrement(ref _rolesInRecovery);
+        if (entered && _log != null) LogRecoveryRequired(_log, owner.RoleId, now);
+    }
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "Role {Role} needs recovery: it cannot log in again until the server restarts ({Count} such roles now)")]
+    private static partial void LogRecoveryRequired(ILogger logger, long role, long count);
+
     public RoleOwner Get(long id)
     {
         AssertLoop();
@@ -35,7 +49,7 @@ public sealed class OwnerRegistry
         {
             var vector = _roles.ReadRevisionVector(id);
             if (vector.Deleted) throw new InvalidOperationException($"Deleted role {id}.");
-            _rolesById.Add(id, owner = new RoleOwner(id, vector.Epoch) { Revisions = vector.Parts });
+            _rolesById.Add(id, owner = new RoleOwner(id, vector.Epoch) { Revisions = vector.Parts, RecoveryChanged = RecoveryChanged });
         }
         return owner;
     }
@@ -49,7 +63,10 @@ public sealed class OwnerRegistry
         if (snapshot.Deleted) throw new Accounts.Persistence.OwnerRevisionConflictException();
         if (!_rolesById.TryGetValue(snapshot.RoleId, out var owner))
             _rolesById.Add(snapshot.RoleId, owner = new RoleOwner(snapshot.RoleId, snapshot.Epoch)
-            { Revisions = snapshot.Parts.ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal) });
+            {
+                Revisions = snapshot.Parts.ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal),
+                RecoveryChanged = RecoveryChanged,
+            });
         if (owner.LifecycleEpoch != snapshot.Epoch || owner.State == RoleOwnerState.Deleted)
             throw new Accounts.Persistence.OwnerRevisionConflictException();
         return owner;
@@ -85,6 +102,15 @@ public sealed class OwnerRegistry
             owner.Attachment = null;
             owner.Revisions = new Dictionary<string, long>();
         }
+    }
+    /// <summary>A deleted role came back (the web panel's restore, under its lifecycle reservation, with a new lifecycle
+    /// epoch): its owner of an earlier life, detached, is dropped, so the next use registers it from the database.</summary>
+    internal void RoleRestored(long roleId)
+    {
+        AssertLoop();
+        if (_rolesById.TryGetValue(roleId, out var owner) && owner.State is RoleOwnerState.Deleted or RoleOwnerState.Detached
+            && owner.Attachment == null && owner.Detaching == null)
+            _rolesById.Remove(roleId);
     }
     internal void BindLegacySelection(GameSession session)
     {
@@ -136,9 +162,12 @@ public sealed class OwnerRegistry
     // Deferred admissions by origin (C/D 16 diagnostics): count, total and max queued time, and which origin held a
     // conflicting key when the admission first had to wait. Read off the loop by the metrics endpoint, hence the lock.
     private readonly Dictionary<long, string> _origins = [];
+    // Admission time of each keyed operation and the gate it waits at while keeping its keys, for the stuck-work report.
+    private readonly Dictionary<long, long> _admittedAt = [];
+    private readonly Dictionary<long, string> _waitingAt = [];
     private sealed class WaitUse { public long Count; public double WaitMs, MaxWaitMs; public readonly Dictionary<string, long> BlockedBy = []; }
     private readonly Dictionary<string, WaitUse> _waitByOrigin = [];
-    internal void Forget(long operation) => _origins.Remove(operation);
+    internal void Forget(long operation) { _origins.Remove(operation); _admittedAt.Remove(operation); }
     // The blocking origin and the kind of key it holds: entity kind only, never an id or an account name, so there is
     // one label per conflict shape and the 16 slots per origin do not fill with individual keys.
     private string BlockerLabel(ReservationKey[] keys) => Reservations.Blocker(keys) is { } blocker
@@ -297,6 +326,7 @@ public sealed class OwnerRegistry
         catch { Reservations.Abandon(operation); throw; }
         if (deferred) { RecordQueueAgeCore(queuedAt); RecordWait(realmLabel ?? origin, blockedBy!, queuedAt); }
         _origins[operation] = realmLabel ?? origin;
+        _admittedAt[operation] = System.Diagnostics.Stopwatch.GetTimestamp();
         return new(this, permit, new OwnerContext(this, operation, ++_admissionSequence, origin)
         {
             RequestCurrent = request?.RequestCurrent, RequestSession = request?.RequestSession,
@@ -348,6 +378,7 @@ public sealed class OwnerRegistry
         }
         if (retry is { QueuedAt: not 0 }) { RecordQueueAgeCore(retry.QueuedAt); RecordWait(origin, retry.BlockedBy, retry.QueuedAt); }
         _origins[operation] = origin;
+        _admittedAt[operation] = System.Diagnostics.Stopwatch.GetTimestamp();
         return new(this, permit, new OwnerContext(this, operation, ++_admissionSequence, origin)
         {
             RequestCurrent = request?.RequestCurrent, RequestSession = request?.RequestSession,
@@ -362,11 +393,13 @@ public sealed class OwnerRegistry
         ReservationKey[] keys, CancellationToken cancellation = default)
     {
         AssertLoop();
-        if (Current is { RuntimeOnly: false })
+        if (Current is { RuntimeOnly: false } parent)
         {
             var borrowed = await EnterAsync(origin, keys, cancellation);
+            _waitingAt[parent.Operation] = origin;
             try { await gate.WaitAsync(cancellation); return borrowed; }
             catch { borrowed.Dispose(); throw; }
+            finally { _waitingAt.Remove(parent.Operation); }
         }
         using var retry = Retries();
         while (true)
@@ -383,6 +416,22 @@ public sealed class OwnerRegistry
             await changed.WaitAsync(cancellation);
         }
     }
+    /// <summary>Stuck-work report (GameLoop): the keyed operations admitted longer than <paramref name="age"/> ago, oldest
+    /// first, with their origin, keys and the gate they wait at.</summary>
+    internal string LongHeld(TimeSpan age)
+    {
+        AssertLoop();
+        static string Key(ReservationKey key) => $"{key.Kind}:{key.Id}{(key.Part.Length == 0 ? "" : "/" + key.Part)}";
+        var held = Reservations.Held
+            .Where(x => x.Value.Length != 0 && _admittedAt.ContainsKey(x.Key))
+            .Select(x => (x.Key, Keys: x.Value, Age: System.Diagnostics.Stopwatch.GetElapsedTime(_admittedAt[x.Key])))
+            .Where(x => x.Age >= age).OrderByDescending(x => x.Age).Take(8)
+            .Select(x => $"{x.Key}:{_origins.GetValueOrDefault(x.Key, "?")}:{x.Age.TotalMilliseconds:F0}ms[{string.Join(",", x.Keys.Select(Key))}]"
+                + (_waitingAt.TryGetValue(x.Key, out var gate) ? " waiting at " + gate : ""))
+            .ToArray();
+        return held.Length == 0 ? "none" : string.Join("; ", held);
+    }
+
     public async Task RunAsync(string origin, ReservationKey[] keys, Func<Task> work)
     { using var scope = await EnterAsync(origin, keys); await work(); }
     /// <summary>Combat/scene continuations retain their existing runtime guards. Their durable sections
@@ -432,7 +481,7 @@ public sealed class OwnerRegistry
     {
         conflicts = Reservations.Conflicts, deferred = Deferred, maxQueueAgeMs = MaxQueueAgeMs,
         totalQueueWaitMs = TotalQueueWaitMs, realmScopes = RealmScopes, runtimeIntents = RuntimeIntents,
-        handovers = HandoverCount, handoverConflicts = HandoverConflicts, realmByOrigin = RealmByOrigin(), waitByOrigin = WaitByOrigin()
+        handovers = HandoverCount, handoverConflicts = HandoverConflicts, rolesInRecovery = RolesInRecovery, realmByOrigin = RealmByOrigin(), waitByOrigin = WaitByOrigin()
     };
 
     private object RealmByOrigin()

@@ -5,6 +5,7 @@ using Google.Protobuf;
 using Romsg;
 using Ro3Emu.Server.Accounts;
 using Ro3Emu.Server.Data;
+using Ro3Emu.Server.Data.Config;
 
 namespace Ro3Emu.Server.Game;
 
@@ -19,7 +20,7 @@ namespace Ro3Emu.Server.Game;
 /// A row is reached (status 1, stamptime in ms) when every slot holds its R, and never reverts. Claims (status 2,
 /// AchievementLevelInfo.curLevelRewardLevel) commit their grant and the new state as one owned-award economy
 /// transaction ("cd13e/achievement-award"). Points and levels are derived from reached rows with the client's algorithm.
-/// Fifteen rows whose source does not exist or whose meaning is unresolved stay at status 0 (§5, "Blocked").
+/// Nine rows whose source does not exist or whose meaning is unresolved stay at status 0 (§5, "Blocked").
 /// 76004 (share) has no sender in the client and stays unrouted.
 /// </summary>
 public sealed class AchievementService : IGameTicker
@@ -39,13 +40,13 @@ public sealed class AchievementService : IGameTicker
         CAffection = 106016, CTavernQuest = 106007, CTavernStar = 106008, CFashionLevel = 303001, CAppearance = 303002,
         CAppearanceCount = 303003, CJobRank = 101019, CLoginDays = 101011;
 
-    /// <summary>No source in this server (tavern), no table (fashion level) or an unresolved meaning (§5, §10.5).</summary>
-    private static readonly HashSet<long> BlockedConditions =
-        [CTavernQuest, CTavernStar, CFashionLevel, CAppraiseRare, CJobTalent];
+    /// <summary>An unresolved meaning (§5, §10.5).</summary>
+    private static readonly HashSet<long> BlockedConditions = [CAppraiseRare, CJobTalent];
 
-    /// <summary>Event counters: no history, the slot is the count since the feature exists (spec §5 "E").</summary>
+    /// <summary>Event counters: no history, the slot is the count since the feature exists (spec §5 "E"). 106007
+    /// TaskFinishRepeated [task, n] counts deliveries of the task (the Tavern's daily quest, <see cref="OnTaskCompletions"/>).</summary>
     private static readonly HashSet<long> CounterConditions =
-        [CCraftQualityOnce, CCraftCount, CAppraiseCount, CAppraiseStunt, CCardCount, CMvp, CLoginDays];
+        [CCraftQualityOnce, CCraftCount, CAppraiseCount, CAppraiseStunt, CCardCount, CMvp, CLoginDays, CTavernQuest];
 
     /// <summary>Friend conditions read the social relation from the database: login and relation hooks only.</summary>
     private static readonly HashSet<long> FriendConditions = [CFriends, CAffection];
@@ -75,9 +76,11 @@ public sealed class AchievementService : IGameTicker
 
     private sealed class Catalog
     {
-        public Dictionary<long, Row> Rows { get; } = new();
+        public Dictionary<long, Row> Rows { get; } = [];
         /// <summary>0 = AchievementLevel (global), 100-105 = AchievementType rows of the type, sorted by _iLevel.</summary>
-        public Dictionary<int, Tier[]> Tiers { get; } = new();
+        public Dictionary<int, Tier[]> Tiers { get; } = [];
+        /// <summary>The Wardrobe's Fashion Rating levels (GenericStageRewardsConfig type 3), sorted by _iScore.</summary>
+        public (long Score, long Level)[] FashionLevels { get; set; } = [];
     }
 
     private readonly GameData _data;
@@ -91,14 +94,14 @@ public sealed class AchievementService : IGameTicker
     private readonly TimeProvider _clock;
     private readonly ILogger<AchievementService> _log;
     private Catalog? _catalog;
-    private readonly HashSet<GameSession> _recheckQueued = new();
-    private readonly HashSet<GameSession> _dirty = new();
+    private readonly HashSet<GameSession> _recheckQueued = [];
+    private readonly HashSet<GameSession> _dirty = [];
     private int _sweepIndex;
     // Config lookups of the probes (GameData rows are frozen after preload).
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, (long Type, long SubType, long Quality)> _items = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, long> _petQuality = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<long, long> _wardrobeType = new();
-    private readonly HashSet<GameSession> _friendQueued = new();
+    private readonly HashSet<GameSession> _friendQueued = [];
     private TimeSpan _lastTick;
 
     public AchievementService(GameData data, RoleStore roles, CharacterService character, AwardService awards,
@@ -183,17 +186,19 @@ public sealed class AchievementService : IGameTicker
             }
             catalog.Rows[id] = new Row(id, (int)GameData.Int(row, "_iType"), GameData.Int(row, "_iGroup"),
                 (int)GameData.Int(row, "_iPoint"), GameData.Int(row, "_iAward"), targets, required, blocked,
-                targets.Select(t => t is [CTeamBoss, _, var multi, var npc] ? BossRecord(multi, npc) : null).ToArray(),
-                targets.Select(t => t is [CGodBoss, var npc, ..] ? GodRealms.Select(m => BossRecord(m, npc)).OfType<string>().ToArray() : []).ToArray());
+                [.. targets.Select(t => t is [CTeamBoss, _, var multi, var npc] ? BossRecord(multi, npc) : null)],
+                [.. targets.Select(t => t is [CGodBoss, var npc, ..] ? GodRealms.Select(m => BossRecord(m, npc)).OfType<string>().ToArray() : [])]);
         }
-        catalog.Tiers[0] = _data.Table("AchievementLevel").Values.Select(r =>
+        catalog.Tiers[0] = [.. _data.Table("AchievementLevel").Values.Select(r =>
                 new Tier((int)GameData.Int(r, "_iLevel"), GameData.Int(r, "_iPoint"), GameData.Int(r, "_iAward")))
-            .OrderBy(t => t.Level).ToArray();
+            .OrderBy(t => t.Level)];
         foreach (var group in _data.Table("AchievementType").Values.GroupBy(r => (int)GameData.Int(r, "_iTypeID")))
             if (group.Key > 0)
-                catalog.Tiers[group.Key] = group.Select(r =>
+                catalog.Tiers[group.Key] = [.. group.Select(r =>
                         new Tier((int)GameData.Int(r, "_iLevel"), GameData.Int(r, "_iPoint"), GameData.Int(r, "_iAward")))
-                    .OrderBy(t => t.Level).ToArray();
+                    .OrderBy(t => t.Level)];
+        catalog.FashionLevels = [.. GenericStageRewardsConfig.All(_data).Where(r => r.Type == DailyActivityService.FashionStage)
+            .Select(r => (r.Score, r.Level)).OrderBy(l => l.Score)];
         int blockedCount = catalog.Rows.Values.Count(r => r.Blocked);
         _log.LogInformation("Achievements: {Rows} rows, {Blocked} blocked, {Types} level tables", catalog.Rows.Count, blockedCount, catalog.Tiers.Count);
         return catalog;
@@ -213,7 +218,7 @@ public sealed class AchievementService : IGameTicker
         _ => -1,
     };
 
-    /// <summary>Spec §5 "Blocked": the 17 rows whose source or meaning is missing. 303004's fashion variant lists
+    /// <summary>Spec §5 "Blocked": the rows whose source or meaning is missing. 303004's fashion variant lists
     /// grids 8-13, whose WardRobeConfig mapping is inferred only.</summary>
     private static bool IsBlocked(long[] t) => BlockedConditions.Contains(t[0])
         || t[0] == CEquipQuality && (t.Length < 4 || t[3..].Any(grid => grid is < 1 or > 7));
@@ -336,7 +341,7 @@ public sealed class AchievementService : IGameTicker
             case CRefineLevel: // highest refine level on any grid
                 return s.EquipLevels.Refine.Values.DefaultIfEmpty(0).Max();
             case CCardQuality: // [1, type, subtype, quality]: a card of quality >= p4 seen (collection or bag)
-                return (s.Library?.Cards.Keys.ToList() ?? new List<int>()).Concat(s.Items.Select(i => i.Entry))
+                return (s.Library?.Cards.Keys.ToList() ?? []).Concat(s.Items.Select(i => i.Entry))
                     .Any(entry => CardOf(entry, t[2], t[3]) && Quality(entry) >= t[4]) ? r : 0;
             case CCardInserted: // [quality, n]: socketed cards of quality >= p1
                 return s.Items.Count(i => i.Grid < 0 && IsCard(i.Entry) && Quality(i.Entry) >= t[1]);
@@ -375,6 +380,10 @@ public sealed class AchievementService : IGameTicker
                 var types = t.Skip(3).Take((int)Math.Max(0, t[2])).ToHashSet();
                 return OwnedAppearances(s).Count(id => types.Contains(_wardrobeType.GetOrAdd(id,
                     key => _data.Row("WardRobeConfig", key) is { } w ? GameData.Int(w, "_iType") : -1)));
+            case CTavernStar: // [n]: Star Power received from Tavern gifts (TavernService, 5043 popularity)
+                return s.Tavern?.Popularity;
+            case CFashionLevel: // [level]: the Wardrobe's Fashion Rating level
+                return s.Wardrobe == null ? null : FashionLevel(WardrobeService.FashionScore(_data, s.Wardrobe));
             case CJobRank: // [rank]: JobConfig._iJobRank >= p1
                 return s.Progress == null ? null
                     : _data.Row("JobConfig", s.Progress.Career) is { } job && GameData.Int(job, "_iJobRank") >= t[1] ? r : 0;
@@ -386,6 +395,12 @@ public sealed class AchievementService : IGameTicker
     private bool CardOf(int entry, long type, long subtype) => Item(entry) is var item && item.Type == type && item.SubType == subtype;
 
     private long PetQuality(int pet) => _petQuality.GetOrAdd(pet, id => _data.Row("PetBaseConfig", id) is { } row ? GameData.Int(row, "_iQuality") : -1);
+
+    /// <summary>The highest _iLevel whose _iScore the fashion score reaches, the level the Wardrobe's level panel
+    /// shows and claims up to (UI_Sys_WardrobeLevelPanelCtrl, see DailyActivityService.StageError). That 303001 reads
+    /// this level is inferred from its text, "Reach Wardrobe Fashion Rating Lv. @{1}".</summary>
+    private long FashionLevel(long score) =>
+        Rows().FashionLevels.Where(l => l.Score <= score).Select(l => l.Level).DefaultIfEmpty(0).Max();
 
     /// <summary>LC_InteractCondition operator table (lua :313-356): 1 ==, 2 ~=, 3 &gt;, 4 &gt;=, 5 &lt;, 6 &lt;=.</summary>
     private static bool Compare(long op, long value, long param) => op switch
@@ -652,6 +667,20 @@ public sealed class AchievementService : IGameTicker
         }, "achievement friends", discarded: () => _friendQueued.Remove(s));
     }
 
+    /// <summary>106007 for <paramref name="count"/> more deliveries of <paramref name="task"/> (TaskService.QuestDelivered,
+    /// and the Tavern's GM op GMAddBarroomTaskFinishTimes); only tasks some row counts are posted.</summary>
+    public void OnTaskCompletions(GameSession s, long task, int count)
+    {
+        _countedTasks ??= [.. Rows().Rows.Values.SelectMany(r => r.Targets).Where(t => t is [CTavernQuest, _, _]).Select(t => t[1])];
+        if (count > 0 && _countedTasks.Contains(task))
+            PostEvent(s, t => t is [CTavernQuest, var wanted, _] && wanted == task ? count : 0);
+    }
+
+    private HashSet<long>? _countedTasks;
+
+    /// <summary>A snapshot source outside the hooks above changed (Tavern Star Power, 106008).</summary>
+    public void OnStateChanged(GameSession s) => QueueRecheck(s);
+
     private void PostEvent(GameSession s, Func<long[], long> amount)
     {
         if (!Ready(s)) return;
@@ -728,7 +757,7 @@ public sealed class AchievementService : IGameTicker
         if (level <= claimed) return AlreadyReceived;
         // (inferred) a claim at level N settles every lower unclaimed tier too (the award list marks every
         // _iLevel <= rewardLevel row as received, UI_Sys_Achievement_AwardWidgetCtrl.lua:124-200).
-        tierAwards = tiers.Where(t => t.Level > claimed && t.Level <= level && t.Award != 0).Select(t => t.Award).ToArray();
+        tierAwards = [.. tiers.Where(t => t.Level > claimed && t.Level <= level && t.Award != 0).Select(t => t.Award)];
         return 0;
     }
 
@@ -757,7 +786,7 @@ public sealed class AchievementService : IGameTicker
         try
         {
             int? playBook = PlayBook(s);
-            plans = awardGroups.Select(group => _awards.Resolve(s, group, playBook)).ToArray();
+            plans = [.. awardGroups.Select(group => _awards.Resolve(s, group, playBook))];
         }
         catch (AwardResolutionException e)
         {
@@ -810,7 +839,7 @@ public sealed class AchievementService : IGameTicker
             var next = state.Clone();
             var claimed = ids.Select(id => $"{id}@{state.Infos[id].Stamptime}").ToList();
             foreach (long id in ids) next.Infos[id].Status = AchievementStatusType.GetReward;
-            code = await CommitClaimAsync(s, next, ids.Select(id => Rows().Rows[id].Award).Where(a => a != 0).ToList(),
+            code = await CommitClaimAsync(s, next, [.. ids.Select(id => Rows().Rows[id].Award).Where(a => a != 0)],
                 "task", string.Join(",", claimed), new { Ids = ids });
         }
         resp.Result = code;

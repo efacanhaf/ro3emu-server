@@ -38,10 +38,10 @@ public sealed partial class BuffService
         public int Compare((float D2, object Target) a, (float D2, object Target) b) => a.D2.CompareTo(b.D2);
     }
 
-    private readonly List<HaloInstance> _halos = new();
-    private readonly List<GameSession> _haloPlayers = new();
-    private readonly List<WorldUnit> _haloUnits = new();
-    private readonly List<(float D2, object Target)> _haloCandidates = new();
+    private readonly List<HaloInstance> _halos = [];
+    private readonly List<GameSession> _haloPlayers = [];
+    private readonly List<WorldUnit> _haloUnits = [];
+    private readonly List<(float D2, object Target)> _haloCandidates = [];
 
     /// <summary>CombatService: may this player's aura treat that player as an enemy (territory/event PvP).</summary>
     internal Func<GameSession, GameSession, bool>? HaloHostilePlayer { get; set; }
@@ -163,7 +163,7 @@ public sealed partial class BuffService
             foreach (var target in halo.Affected)
                 if (!halo.Desired.Contains(target)) await TakeAuraAsync(target, halo);
             foreach (var target in halo.Desired)
-                if (!halo.Affected.Contains(target) || !HoldsAura(target, halo, halo.RefreshBefore))
+                if (!halo.Affected.Contains(target) || StacksEveryTick(halo) || !HoldsAura(target, halo, halo.RefreshBefore))
                     await GiveAuraAsync(target, halo, durationMs);
             halo.Affected.Clear();
             halo.Affected.UnionWith(halo.Desired);
@@ -171,9 +171,24 @@ public sealed partial class BuffService
         finally { halo.Busy = false; }
     }
 
+    /// <summary>King's Grace: "Up to ${10} enemies within range gain ${5}% [Slow] every ${9} seconds, stacking up to ${10} times. At ${10} stacks" it becomes a Stun of ${6} s.</summary>
+    private const int KingsGraceAuraGroup = 11620, KingsGraceSlowGroup = 11621, KingsGraceStacks = 5, Stun = 901601, KingsGraceStunMs = 1000;
+
+    private static bool StacksEveryTick(HaloInstance halo) => halo.Rule.Id / 100 == KingsGraceAuraGroup;
+
     private async Task GiveAuraAsync(object target, HaloInstance halo, int durationMs)
     {
         if (durationMs <= 0) return;
+        if (StacksEveryTick(halo) && target is WorldUnit slowed && _world.Map(slowed.WorldScene).Contains(slowed))
+        {
+            foreach (int id in halo.Rule.Applied) await AddSupportAsync(slowed, id, durationMs, halo.CarrierId);
+            if (UnitPiles(slowed, KingsGraceSlowGroup) >= KingsGraceStacks)
+            {
+                await TakeAuraAsync(slowed, halo);
+                await AddSupportAsync(slowed, Stun, KingsGraceStunMs, halo.CarrierId);
+            }
+            return;
+        }
         foreach (int id in halo.Rule.Applied)
         {
             if (target is GameSession p)

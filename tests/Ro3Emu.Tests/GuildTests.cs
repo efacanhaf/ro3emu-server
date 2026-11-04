@@ -65,7 +65,7 @@ public sealed partial class GuildTests : IAsyncLifetime
     private async Task Level(string name)
     {
         using var client = new HttpClient();
-        (await client.PostAsync($"{_http}/ro3emu/gm?account={name.ToLowerInvariant()}", new StringContent("!lvl 21"))).EnsureSuccessStatusCode();
+        (await client.PostAsync($"{_http}/ro3emu/gm?account={name.ToLowerInvariant()}", Operator.Command("!lvl 21"))).EnsureSuccessStatusCode();
     }
 
     private static GuildCreateReq Create(string name, string notice = "") => new()
@@ -309,6 +309,8 @@ public sealed partial class GuildTests : IAsyncLifetime
         await Level("helperone");
         await Level("helpertwo");
         await Level("helperthree");
+        _app.Services.GetRequiredService<Microsoft.Extensions.Options.IOptions<Ro3Emu.Server.ServerOptions>>().Value.GuildFounding = "responders";
+        await GiveEmperium("founder");
         var create = Create("Helpers", "Join us");
         create.AutoCreateHelper = true;
         await founder.SendGameAsync(GuildService.Create, create);
@@ -316,7 +318,7 @@ public sealed partial class GuildTests : IAsyncLifetime
         var pre = await Next(founder, GuildService.Full, GuildFullInfoNtf.Parser, x => x.Guid > 0);
         Assert.Equal(GuildStatus.PreCreate, pre.Status);
         using (var client = new HttpClient())
-            (await client.PostAsync($"{_http}/ro3emu/gm?account=founder", new StringContent("!lvl 99"))).EnsureSuccessStatusCode();
+            (await client.PostAsync($"{_http}/ro3emu/gm?account=founder", Operator.Command("!lvl 99"))).EnsureSuccessStatusCode();
         await founder.SendGameAsync(GuildService.MarketList, new ListOnBlackMarketReq { UnitPrice = 500, Count = 10 });
         Assert.Equal(ErrorCodes.FeatureUnavailable,
             (await Next(founder, GuildService.MarketList, ListOnBlackMarketRsp.Parser)).Result);
@@ -383,8 +385,8 @@ public sealed partial class GuildTests : IAsyncLifetime
         Assert.Equal(ErrorCodes.FeatureUnavailable, (await Next(seller, GuildService.MarketList, ListOnBlackMarketRsp.Parser)).Result);
         using (var client = new HttpClient())
         {
-            (await client.PostAsync($"{_http}/ro3emu/gm?account=seller", new StringContent("!lvl 99"))).EnsureSuccessStatusCode();
-            (await client.PostAsync($"{_http}/ro3emu/gm?account=buyer", new StringContent("!lvl 99"))).EnsureSuccessStatusCode();
+            (await client.PostAsync($"{_http}/ro3emu/gm?account=seller", Operator.Command("!lvl 99"))).EnsureSuccessStatusCode();
+            (await client.PostAsync($"{_http}/ro3emu/gm?account=buyer", Operator.Command("!lvl 99"))).EnsureSuccessStatusCode();
         }
         await seller.SendGameAsync(GuildService.MarketList, new ListOnBlackMarketReq { UnitPrice = 500, Count = 20 });
         Assert.Equal(0, (await Next(seller, GuildService.MarketList, ListOnBlackMarketRsp.Parser, x => x.Result == 0)).Result);
@@ -427,7 +429,7 @@ public sealed partial class GuildTests : IAsyncLifetime
         {
             await Level(name);
             using var client = new HttpClient();
-            (await client.PostAsync($"{_http}/ro3emu/gm?account={name}", new StringContent("!lvl 99"))).EnsureSuccessStatusCode();
+            (await client.PostAsync($"{_http}/ro3emu/gm?account={name}", Operator.Command("!lvl 99"))).EnsureSuccessStatusCode();
         }
         long orphanId = await CreateGuild(orphan, "Gone");
         long sellerId = await CreateGuild(seller, "Remain");
@@ -547,7 +549,7 @@ public sealed partial class GuildTests : IAsyncLifetime
         Assert.Equal(ErrorCodes.ItemsShort, (await Next(alice, GuildService.Edit, GuildEditResp.Parser)).Result);
         Assert.Equal("First", _app.Services.GetRequiredService<GuildStore>().Get(id)!.Name);
         using (var client = new HttpClient())
-            (await client.PostAsync($"{_http}/ro3emu/gm?account=alice", new StringContent("!item 3 20"))).EnsureSuccessStatusCode();
+            (await client.PostAsync($"{_http}/ro3emu/gm?account=alice", Operator.Command("!item 3 20"))).EnsureSuccessStatusCode();
         var session = _app.Services.GetRequiredService<SessionRegistry>().All().Single(x => x.Role?.Id == (long)alice.Self!.Uuid);
         long funded = session.Progress!.Currency.GetValueOrDefault(3);
         Assert.Equal(20, funded);

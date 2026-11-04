@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 using Ro3Emu.Server.Data;
+using Ro3Emu.Server.Data.Config;
 using Ro3Emu.Server.Maps;
 using Romsg;
 
@@ -14,11 +15,17 @@ namespace Ro3Emu.Server.Game;
 public sealed class DungeonCatalog(GameData data, WorldData worldData, MonsterService monsters,
     SeasonService seasons, IOptions<ServerOptions> options, ReconstructedDungeons? reconstructed = null)
 {
-    public sealed record Spawn(int NpcId, MapPoint Point);
+    public sealed record Spawn(int NpcId, MapPoint Point, IReadOnlyList<(float X, float Y, float Z)>? Route = null);
     /// <summary>
     /// A wave; <paramref name="Quest"/> is the DungeonQuestConfig quest it plays (0: none known). A scripted step
     /// (<paramref name="Step"/>, ReconstructedDungeons.Scripted) has no monsters: it completes on its client events.
     /// </summary>
+    /// <summary>The scene a scripted scene continues into after its clear, 0 when none.</summary>
+    public long ScriptedContinuation(long scene) => reconstructed?.Scripted(scene)?.ContinuesTo ?? 0;
+
+    /// <summary>Whether a scripted scene returns the player to the field after its clear.</summary>
+    public bool ScriptedLeavesAfterClear(long scene) => reconstructed?.Scripted(scene)?.LeavesAfterClear ?? false;
+
     public sealed record Wave(int Number, IReadOnlyList<Spawn> Spawns, int Quest = 0, ReconstructedDungeons.ScriptedStep? Step = null);
     /// <summary><paramref name="Layer"/>: a Valhalla Trials run (HeroicSpiritLayerConfig row), see ValhallaService.</summary>
     public sealed record Plan(JsonElement Config, JsonElement? Multi, JsonElement? Boss, int Mark,
@@ -269,8 +276,7 @@ public sealed class DungeonCatalog(GameData data, WorldData worldData, MonsterSe
         var explicitPoints = serverPoints.Where(p => GameData.Int(p, "npcId") > 0).ToArray();
         if (explicitPoints.Any(p => monsters.Template((int)GameData.Int(p, "npcId")) == null)) return [];
         if (explicitPoints.Length > 0)
-            return explicitPoints.GroupBy(p => GameData.Int(p, "GroupId")).OrderBy(g => g.Key)
-                .Select((g, i) => new Wave(i + 1, g.Select(p => new Spawn((int)GameData.Int(p, "npcId"), Point(p))).ToArray())).ToArray();
+            return [.. explicitPoints.GroupBy(p => GameData.Int(p, "GroupId")).OrderBy(g => g.Key).Select((g, i) => new Wave(i + 1, [.. g.Select(p => new Spawn((int)GameData.Int(p, "npcId"), Point(p)))]))];
 
         var mapped = new List<Spawn>();
         foreach (var row in data.Table("NpcLevelPointRespawnConfig").Values
@@ -322,8 +328,9 @@ public sealed class DungeonCatalog(GameData data, WorldData worldData, MonsterSe
     /// <summary>
     /// A scripted scene's steps (ReconstructedDungeons.Scripted): one wave without monsters per step. Every reference
     /// must resolve in the client data and the scene's map, or the scene is refused like any unresolved encounter:
-    /// the quests the tracker shows, the actors' NPCConfig rows, points and buffs, the stories, regions and points,
-    /// and the interactions and dungeon messages the step's actors can actually send.
+    /// the quests the tracker shows, the actors' NPCConfig rows, points and buffs, the companions' rows (each one able to
+    /// fight beside the player), the stories, regions and points, and the interactions and dungeon messages the step's
+    /// actors can actually send.
     /// </summary>
     private IReadOnlyList<Wave> ScriptedWaves(ReconstructedDungeons.ScriptedScene scene, MapWorld map)
     {
@@ -336,8 +343,16 @@ public sealed class DungeonCatalog(GameData data, WorldData worldData, MonsterSe
                 if (data.Row("NPCConfig", actor.NpcId) is not { } npc || GameData.Int(npc, "_iNPCType") is not (1 or 2)
                     || !map.Points.ContainsKey(actor.Point)
                     || actor.Buffs.Any(b => data.Row("BuffConfig", b) is not { } buff || GameData.Int(buff, "_iBuffID") <= 0)) return [];
+            // A companion is a client NPC that can fight beside the player (CompanionUnit.Build); it carries no buffs.
+            if (step.Companions.Any(c => !map.Points.ContainsKey(c.Point) || c.Buffs.Count > 0
+                    || CompanionUnit.Build(data, monsters, c.NpcId) == null)) return [];
             if (step.Story != 0 && data.Row("PlotInterpretation", step.Story) == null) return [];
             if (step.TeleportAfter != 0 && !map.Points.ContainsKey(step.TeleportAfter)) return [];
+            if (step.HoldAfterMs is < 0 or > 60000) return [];
+            // A ride needs its route, an actor that walks (a UnitConfig speed) and an actor interaction that completes the step.
+            if (step.RideAfter != 0 && (!map.GuidePaths.ContainsKey(step.RideAfter)
+                || !step.Complete.Any(t => t.Kind is ReconstructedDungeons.TriggerKind.Interaction or ReconstructedDungeons.TriggerKind.Message)
+                || !step.Actors.Any(a => NPCConfig.Get(data, a.NpcId) is { } n && UnitConfig.Get(data, n.UnitId) is { Speed: > 0 }))) return [];
             foreach (var t in step.Complete.Concat(step.Ignore))
             {
                 bool known = t.Kind switch
@@ -358,13 +373,21 @@ public sealed class DungeonCatalog(GameData data, WorldData worldData, MonsterSe
             if (step.Shelter is { } shelter && (!step.Fight.Any(f => f.NpcId == shelter.Boss) || !step.Actors.Any(a => a.NpcId == shelter.Cover)
                     || data.Row("ChatConfig", shelter.Tip) == null || data.Row("SkillConfig", shelter.Skill) == null
                     || shelter.EveryMs <= shelter.WarnMs || shelter.WarnMs < 0 || shelter.Width <= 0 || shelter.Depth <= 0)) return [];
-            foreach (var (interaction, skill, shots) in step.Strikes ?? [])
-                if (step.Fight.Count == 0 || shots < 0 || data.Row("SkillConfig", skill) == null
-                    || !step.Actors.Any(a => Interactions(a.NpcId).Contains(interaction))) return [];
+            if (step.React is { } react && !ReactionResolves(step, react)) return [];
+            if (step.Cannon is { } cannon && (step.Fight.Count == 0 || data.Row("SkillConfig", cannon.Fire) == null
+                    || !step.Actors.Any(a => Interactions(a.NpcId).Contains(cannon.Interaction)))) return [];
             var fight = new List<Spawn>();
             foreach (var spawn in step.Fight)
             {
-                if (!map.Points.TryGetValue(spawn.Point, out var at) || monsters.Template(spawn.NpcId) == null) return [];
+                if (monsters.Template(spawn.NpcId) == null) return [];
+                if (spawn.Route != 0)
+                {
+                    // A flying unit starts where its patrol starts (DungeonService.FlyAsync).
+                    if (!map.PatrolPaths.TryGetValue(spawn.Route, out var route)) return [];
+                    fight.Add(new Spawn(spawn.NpcId, new MapPoint(route[0].X, route[0].Y, route[0].Z, 0), route));
+                    continue;
+                }
+                if (!map.Points.TryGetValue(spawn.Point, out var at)) return [];
                 fight.Add(new Spawn(spawn.NpcId, at));
             }
             waves.Add(new Wave(waves.Count + 1, fight, step.Quest, step));
@@ -373,6 +396,18 @@ public sealed class DungeonCatalog(GameData data, WorldData worldData, MonsterSe
         if (scene.Unplayed.Any(q => scene.Steps.Any(s => s.Quest == q) || !data.Table("DungeonQuestConfig").Values.Any(r =>
                 GameData.Int(r, "_iDungeonID") == scene.Scene && GameData.Int(r, "_iQuestID") == q))) return [];
         return waves;
+    }
+
+    /// <summary>A step's reactions: its speaker and every reacting actor are actors of the step, its lines ChatConfig rows
+    /// and its effects BuffConfig rows of a buff group.</summary>
+    private bool ReactionResolves(ReconstructedDungeons.ScriptedStep step, ReconstructedDungeons.Reaction react)
+    {
+        bool Shown(int npc) => step.Actors.Any(a => a.NpcId == npc);
+        bool Line(int chat) => data.Row("ChatConfig", chat) != null;
+        bool Resolves(ReconstructedDungeons.Response? r) => r == null
+            || (r.Say == 0 || Line(r.Say)) && (r.Buff == 0
+                || Shown(r.On) && Data.Config.BuffConfig.Get(data, r.Buff) is { BuffId: > 0 });
+        return Shown(react.Speaker) && react.Start.All(Line) && Resolves(react.Ignored) && Resolves(react.Complete);
     }
 
     /// <summary>
@@ -446,14 +481,27 @@ public sealed class DungeonCatalog(GameData data, WorldData worldData, MonsterSe
         if (!Interactions(DraculaCage).Contains(DraculaUnlock)) return null;
         waves.Add(new Wave(waves.Count + 1, [], 0, new ReconstructedDungeons.ScriptedStep("find the key", 0, (0, 1), actors, 0,
             [new(ReconstructedDungeons.TriggerKind.Interaction, DraculaUnlock)],
-            DraculaBushes.SelectMany(Interactions).Select(i => new ReconstructedDungeons.StepTrigger(
-                ReconstructedDungeons.TriggerKind.Interaction, i)).ToArray(), 0, [], false)));
+            [.. DraculaBushes.SelectMany(Interactions).Select(i => new ReconstructedDungeons.StepTrigger(
+                ReconstructedDungeons.TriggerKind.Interaction, i))], 0, [], false)));
         return new Plan(config, null, null, 0, 1, (int)GameData.Int(config, "_iRoleCntLimit"), waves);
     }
 
     /// <summary>A scene-editor point (m_kAllPoints) of the scene's map.</summary>
+    /// <summary>The reconstructions (raid trials, scripted scenes), when registered.</summary>
+    internal ReconstructedDungeons? Reconstructed => reconstructed;
+
+    /// <summary>A scene's map (points, regions, dungeon point groups).</summary>
+    internal MapWorld? Map(long scene) => worldData.Map(scene);
+
     public MapPoint? ScenePoint(long scene, long point) =>
         worldData.Map(scene)?.Points.TryGetValue(point, out var p) == true ? p : null;
+
+    /// <summary>The guide routes (m_kGuidePoints) of the scene's scene editor file.</summary>
+    public IReadOnlyList<long> GuideRoutes(long scene) => worldData.Map(scene)?.GuideRoutes ?? [];
+
+    /// <summary>The points of a guide route of the scene (m_kGuidePoints), or null when it has none.</summary>
+    public IReadOnlyList<(float X, float Y, float Z)>? GuidePath(long scene, long route) =>
+        worldData.Map(scene)?.GuidePaths.TryGetValue(route, out var path) == true ? path : null;
 
     /// <summary>A scene-editor region (m_kRegins) of the scene's map.</summary>
     public MapRegion? SceneRegion(long scene, long region) =>

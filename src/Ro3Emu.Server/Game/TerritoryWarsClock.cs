@@ -13,6 +13,7 @@ public sealed class TerritoryWarsClock(GameData data, SeasonService seasons, Tim
 {
     public sealed record Stage(int Id, int Type, int Round, int ResultRule, long StartTime, long EndTime);
     public long Now => time.GetUtcNow().ToUnixTimeSeconds();
+    public DateTimeOffset LocalNow => time.GetLocalNow();
     public long SeasonStart => seasons.StartTime;
     public int PlayBook => seasons.PlayBook;
     private IReadOnlyList<Stage>? _exported;
@@ -31,7 +32,7 @@ public sealed class TerritoryWarsClock(GameData data, SeasonService seasons, Tim
             if (_stages == null || _builtCycle != cycle)
             {
                 long shift = cycle * seasons.OpenContent.TerritoryWarPeriod;
-                _stages = (_exported ??= Build()).Select(s => s with { StartTime = s.StartTime + shift, EndTime = s.EndTime + shift }).ToArray();
+                _stages = [.. (_exported ??= Build()).Select(s => s with { StartTime = s.StartTime + shift, EndTime = s.EndTime + shift })];
                 _builtCycle = cycle;
             }
             return _stages;
@@ -94,7 +95,7 @@ public sealed class TerritoryWarsClock(GameData data, SeasonService seasons, Tim
                     (int)GameData.Int(row, "_iResultRule"), start, end));
             }
         }
-        return result.OrderBy(s => s.StartTime).ThenBy(s => s.Id).ToArray();
+        return [.. result.OrderBy(s => s.StartTime).ThenBy(s => s.Id)];
     }
 
     internal long Resolve(JsonElement row, bool end)

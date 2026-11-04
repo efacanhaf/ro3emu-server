@@ -6,6 +6,8 @@ using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using Ro3Emu.Server.Economy;
 
+namespace Ro3Emu.EconomyProbe;
+
 /// <summary>E01 offline evidence only. Readers pin SQLite/WAL transactions; no repair or checkpoint is issued.</summary>
 public static class EconomyProbeCli
 {
@@ -48,7 +50,8 @@ public static class EconomyProbeCli
                     Verdict = verdict.ToString(), Scope = "Receipt and retained ledger consistency; no balance comparison."
                 },
                     Summary(command, verdict, snapshot.Cut, ledger.Issues, ledger.UncoveredMutationFamilies) +
-                    $"\nReceipts: {ledger.Receipts.Count}; legs: {ledger.Legs.Count}; range: ({from}, {through}].\n");
+                    $"\nReceipts: {ledger.Receipts.Count}; legs: {ledger.Legs.Count}; range: ({from}, {through}]." +
+                    $"\nCompacted receipts (intent checks skipped): {ledger.CompactedReceipts}.\n");
                 return Exit(verdict);
             }
             var opening = JsonSerializer.Deserialize<SnapshotArtifact>(File.ReadAllBytes(args[4]),
@@ -57,7 +60,7 @@ public static class EconomyProbeCli
             EconomyLedgerWindow? window = opening.Cut.CommitSequence is { } start && snapshot.Cut.CommitSequence is { } end
                 ? EconomyLedgerReader.Read(database, catalog, snapshot.Cut.RealmId, start, end) : null;
             if (command == "restore-check")
-                snapshot = snapshot with { Issues = snapshot.Issues.Concat(Integrity(database)).ToArray() };
+                snapshot = snapshot with { Issues = [.. snapshot.Issues, .. Integrity(database)] };
             var check = EconomyExactnessChecker.Check(opening, snapshot, window);
             var text = new StringBuilder(Summary(command, check.Verdict, snapshot.Cut, check.Issues, check.UncoveredMutationFamilies));
             text.AppendLine().AppendLine("| Asset | Opening | Closing | Sources | Sinks | Residual | Leg residual |")

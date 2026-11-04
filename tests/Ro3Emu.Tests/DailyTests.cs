@@ -67,7 +67,7 @@ public sealed class DailyTests : IAsyncLifetime
     private async Task Gm(string account, string line)
     {
         using var http = new HttpClient();
-        (await http.PostAsync($"{_httpUrl}/ro3emu/gm?account={account}", new StringContent(line))).EnsureSuccessStatusCode();
+        (await http.PostAsync($"{_httpUrl}/ro3emu/gm?account={account}", Operator.Command(line))).EnsureSuccessStatusCode();
     }
 
     private void Sql(string command)
@@ -321,6 +321,7 @@ public sealed class DailyTests : IAsyncLifetime
 
         long coinsBefore = await State(s => s.Progress!.Currency.GetValueOrDefault(2));
         long chipsBefore = await State(s => s.Progress!.Currency.GetValueOrDefault(407));
+        long vigorBefore = await State(s => s.Restrictions!.RestrictCount[LifeJobService.VigorId].Count);
         await bot.SendGameAsync(DailyActivityService.StageGain, new StageRewardGainReq { StageId = 7001 });
         var gain = await Next(bot, DailyActivityService.StageGain, StageRewardGainResp.Parser);
         Assert.Equal(0, gain.Result);
@@ -329,6 +330,8 @@ public sealed class DailyTests : IAsyncLifetime
         Assert.Equal(20, await State(s => s.Progress!.Currency.GetValueOrDefault(5))); // threshold, not spend
         Assert.Equal(100, await State(s => s.Items.Where(i => i.Entry == 1250900 && i.BindType == 0).Sum(i => i.Stack)));
         Assert.Equal(chipsBefore + 200, await State(s => s.Progress!.Currency.GetValueOrDefault(407)));
+        Assert.Equal(vigorBefore + 200, await State(s => ((DBRestrictInfo)s.Synced[LifeJobService.RestrictSync])
+            .RestrictCount[LifeJobService.VigorId].Count));
         Assert.Equal(coinsBefore + 40000, await State(s => s.Progress!.Currency.GetValueOrDefault(2)));
 
         string stageSource = await State(s => $"daily-stage/{s.Role!.Id}/{s.Daily!.DailyEpoch}/7001");
@@ -373,13 +376,13 @@ public sealed class DailyTests : IAsyncLifetime
 
         var paid = await Batch(bot, 7001, 7002, 7001);
         Assert.Equal(0, paid.Result);
-        Assert.Equal(new[] { 7001, 7002, 7001 }, paid.Req.StageIds.ToArray());
-        Assert.Equal(new[] { 7001, 7002 }, (await State(s => s.Daily!.Claims.Order().ToArray())));
+        Assert.Equal([7001, 7002, 7001], [.. paid.Req.StageIds]);
+        Assert.Equal((int[])[7001, 7002], (await State(s => s.Daily!.Claims.Order().ToArray())));
         Assert.True(await State(s => s.Progress!.Currency.GetValueOrDefault(2)) >= coins + 40000); // 7001 alone pays 40,000
         Assert.Equal(40, await State(s => s.Progress!.Currency.GetValueOrDefault(5))); // threshold, not spend
         var synced = await Next(bot, DailyActivityService.StageSync, DBStageRewardInfoIncrement.Parser,
             m => m.AllStageRewardsFinished?.All?.Value.Count == 2);
-        Assert.Equal(new[] { 7001, 7002 }, synced.AllStageRewardsFinished.All.Value.Order().ToArray());
+        Assert.Equal([7001, 7002], [.. synced.AllStageRewardsFinished.All.Value.Order()]);
         string source = await State(s => $"daily-stage/{s.Role!.Id}/{s.Daily!.DailyEpoch}/7001,7002");
         Assert.Equal(1, OwnedSourceCount(source, "cd13e/daily-stage"));
 
@@ -389,7 +392,7 @@ public sealed class DailyTests : IAsyncLifetime
         await bot.DisposeAsync();
 
         await using var again = await InWorld("Alice", create: false);
-        Assert.Equal(new[] { 7001, 7002 }, (await State(s => s.Daily!.Claims.Order().ToArray())));
+        Assert.Equal((int[])[7001, 7002], (await State(s => s.Daily!.Claims.Order().ToArray())));
         Assert.Equal(ErrorCodes.RewardClaimed, (await Batch(again, 7001, 7002)).Result);
         Assert.Equal(1, OwnedSourceCount(source, "cd13e/daily-stage"));
     }
@@ -472,8 +475,51 @@ public sealed class DailyTests : IAsyncLifetime
         Assert.Equal(0, await State(s => s.Progress!.Currency.GetValueOrDefault(5)));
         Assert.Equal(0, await State(s => s.DailyRows!.ActivityData[101].TaskCompleteTimes));
         Assert.Equal(initialKeys, await State(s => s.DailyRows!.ActivityData.Keys.Order().ToArray()));
-        Assert.Equal(new[] { 1 }, await State(s => s.Daily!.Claims.Order().ToArray()));
+        Assert.Equal((int[])[1], await State(s => s.Daily!.Claims.Order().ToArray()));
         Assert.Equal(0, await State(s => s.Tasks!.CompleteTaskNum.GetValueOrDefault(500080)));
+    }
+
+    /// <summary>
+    /// Daily Quest Compensation Mail (PublicParamConfig.DailyTaskCompensationMail 1058): a To-Do box the ending day reached
+    /// but did not claim is reissued by mail at the reset, once, with what its claim pays (DailyActivityService.Compensation).
+    /// </summary>
+    [ClientDataFact]
+    public async Task ResetMailsTheReachedUnclaimedToDoBoxesOnce()
+    {
+        await using var bot = await InWorld("Alice");
+        await Gm("alice", "!quest done 10105090");
+        await Gm("alice", "!lvl 34"); // pool 80002 / group 3502's level-34 EXP row is 127716
+        await Gm("alice", "!quest done 500080");
+        await Gm("alice", "!quest done 500070");
+        Assert.Equal(40, await State(s => s.Progress!.Currency.GetValueOrDefault(5)));
+        await bot.SendGameAsync(DailyActivityService.StageGain, new StageRewardGainReq { StageId = 7001 });
+        Assert.Equal(0, (await Next(bot, DailyActivityService.StageGain, StageRewardGainResp.Parser)).Result);
+        long role = await State(s => s.Role!.Id);
+        var roles = _app.Services.GetRequiredService<RoleStore>();
+        MailService.Mailbox Mailbox() => roles.LoadMailbox(role) is { Length: > 0 } blob
+            ? JsonSerializer.Deserialize<MailService.Mailbox>(blob) ?? new() : new();
+        // Each reset starts from a different past day: a reset's ledger source is its (previous, new) epoch pair.
+        async Task ResetAsync(int days) => await OwnedFixtureAsync(role, "daily reset fixture", async s =>
+        {
+            s.Daily!.DailyEpoch -= 86400 * days;
+            roles.SaveDaily(s.Role!.Id, JsonSerializer.SerializeToUtf8Bytes(s.Daily));
+            await _app.Services.GetRequiredService<DailyActivityService>().ReconcileAsync(s);
+        });
+
+        await ResetAsync(1);
+        var letter = Assert.Single(Mailbox().Letters, l => l.TemplateId == 1058);
+        // Box 7002 (40 liveness) only: 7001 was claimed, 7003 needs 60.
+        Assert.Contains(letter.Attachments, a => a.Entry == 100 && a.Count == 127716);
+        Assert.Contains(letter.Attachments, a => a.Entry == 407 && a.Count == 200);
+        Assert.Contains(letter.Attachments, a => a.Entry == 1200701 && a.Count == 1);
+        Assert.Empty(await State(s => s.Daily!.Compensation));
+        Assert.Empty(JsonSerializer.Deserialize<DailyActivityService.DailyState>(roles.LoadDaily(role)!)!.Compensation);
+
+        await ResetAsync(2); // a day without liveness owes nothing
+        Assert.Single(Mailbox().Letters, l => l.TemplateId == 1058);
+        await bot.DisposeAsync();
+        await using var again = await InWorld("Alice", create: false);
+        Assert.Single(Mailbox().Letters, l => l.TemplateId == 1058);
     }
 
     [ClientDataFact]
@@ -834,7 +880,7 @@ public sealed class DailyTests : IAsyncLifetime
             Assert.Equal(1, await State(s => s.DailyRows!.ActivityData[3302].TaskCompleteTimes));
             Assert.Equal(20, await State(s => s.Progress!.Currency.GetValueOrDefault(5)));
         }
-        Assert.Equal(new[] { 3001, 3011, 3021 }, roots.Order());
+        Assert.Equal([3001, 3011, 3021], roots.Order());
     }
 
     [ClientDataFact]

@@ -8,4 +8,5 @@ public readonly partial record struct GameplayStatusButtonConfig(JsonElement Row
 {
     [ConfigField("_iButtonFuncType")] public partial long ButtonFuncType { get; }
     [ConfigField("_kAction")] public partial JsonElement? Action { get; }
+    [ConfigField("_iSkill")] public partial long Skill { get; }
 }

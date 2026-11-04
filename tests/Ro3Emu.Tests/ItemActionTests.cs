@@ -64,7 +64,7 @@ public sealed class ItemActionTests : IAsyncLifetime
     private async Task<BotClient> Relogin(BotClient bot, string name)
     {
         await bot.DisposeAsync();
-        await WaitUntil(() => !Sessions.All().Any(s => s.Account == name.ToLowerInvariant() && s.Role != null), name + " still online");
+        await WaitUntil(() => !Sessions.All().Any(s => string.Equals(s.Account, name, StringComparison.OrdinalIgnoreCase) && s.Role != null), name + " still online");
         return await InWorld(name, create: false);
     }
 
@@ -72,7 +72,7 @@ public sealed class ItemActionTests : IAsyncLifetime
     { var e = await b.Inbox.WaitAsync(e => e.IsGame(id) && (match == null || match(p.ParseFrom(e.Body))), Wait); return p.ParseFrom(e.Body); }
 
     private async Task Gm(string account, string command)
-    { using var h = new HttpClient(); (await h.PostAsync($"{_http}/ro3emu/gm?account={account}", new StringContent(command))).EnsureSuccessStatusCode(); }
+    { using var h = new HttpClient(); (await h.PostAsync($"{_http}/ro3emu/gm?account={account}", Operator.Command(command))).EnsureSuccessStatusCode(); }
 
     private SessionRegistry Sessions => _app.Services.GetRequiredService<SessionRegistry>();
     private RoleStore Roles => _app.Services.GetRequiredService<RoleStore>();
@@ -150,10 +150,13 @@ public sealed class ItemActionTests : IAsyncLifetime
     {
         await using var alice = await InWorld("Alice");
         await Gm("alice", "!item 1220003 2");
-        Assert.Equal(0, await Use(alice, 1220003));
+        // Login sent 5041 whole: a wire-only 0 in emojiInfo and the default Survivor wheel (both walked unguarded).
         var full = await Next(alice, EmojiService.EmoticonSync, DBEmojiInfoIncrement.Parser, m => m.SyncAllMark);
-        Assert.Equal(Enumerable.Range(50, 18).Select(i => (long)i), full.EmojiInfo.All.Value.Order()); // EmoticonTabConfig 2
-        Assert.True(full.DungeonEmojiInstalls.ContainsKey(0)); // the full handler walks it unguarded
+        Assert.Equal([0L], full.EmojiInfo.All.Value);
+        Assert.Equal([1001, 1002, 1003, 1004, 0, 0], full.DungeonEmojiInstalls[0].All.EmojiIds);
+        Assert.Equal(0, await Use(alice, 1220003));
+        var unlocked = await Next(alice, EmojiService.EmoticonSync, DBEmojiInfoIncrement.Parser, m => !m.SyncAllMark);
+        Assert.Equal(Enumerable.Range(50, 18).Select(i => (long)i), unlocked.EmojiInfo.All.Value.Order()); // EmoticonTabConfig 2
         Assert.Equal(1, Count(alice, 1220003));
         Assert.Equal(18, DBEmojiInfo.Parser.ParseFrom(Roles.LoadEmojiInfo(RoleId(alice))!).EmojiInfo.Count);
         Assert.Equal(EmojiService_ErrUnlocked, await Use(alice, 1220003));
@@ -259,6 +262,93 @@ public sealed class ItemActionTests : IAsyncLifetime
         var full = await Next(again, SocialOutfitService.Sync, DBSocialOutfitIncrement.Parser, m => m.SyncAllMark);
         Assert.Equal(3, full.SocialOutfitContainer[1].All.SocialOutfitInfos[100002].Status);
         Assert.False(full.SocialOutfitContainer[5].All.SocialOutfitInfos.ContainsKey(500015));
+    }
+
+    // ------------------------------------------------------------------ _iTimeBoundEnum 1 items
+
+    private static IEnumerable<ItemBaseInfo> Sent(DBItemsInfoIncrement sync, int entry) => sync.PackInfo.Values
+        .SelectMany(p => p.All != null ? p.All.Items.Values
+            : p.Inc != null ? p.Inc.Items.Values.Where(i => i.All != null).Select(i => i.All) : [])
+        .Where(i => i.ItemEntry == entry);
+
+    [ClientDataFact]
+    public async Task TimeBoundRewardItemCountsFromTheClaimAndTheClientGetsItsEnd()
+    {
+        await using var alice = await InWorld("Alice");
+        var mail = _app.Services.GetRequiredService<MailService>();
+        var database = _app.Services.GetRequiredService<AccountStore>().DatabasePath;
+        var catalog = Ro3Emu.Server.Economy.EconomyCatalog.Load(Path.Combine(ClientData.RepoRoot, "data"));
+        var opening = Ro3Emu.Server.Economy.EconomySnapshotReader.Read(database, catalog, "auto");
+        string id = await mail.SendRawAsync(RoleId(alice), "Fashion Rating", "You finished 1 in this event", [new(1950019, 1)]);
+
+        // Lying in the mailbox does not use it up: 1950019 _kTimeBoundPara [1440] minutes from the claim.
+        _clock.Advance(TimeSpan.FromHours(30));
+        long claimed = _clock.GetUtcNow().ToUnixTimeSeconds();
+        using var sync = alice.Inbox.Expect(e => e.IsGame(CharacterService.ItemsSync)
+            && Sent(DBItemsInfoIncrement.Parser.ParseFrom(e.Body), 1950019).Any());
+        var request = new ClaimMailReq();
+        request.MailUid.Add(id);
+        await alice.SendGameAsync(MailService.ClaimMail, request);
+        Assert.Equal(0, (await Next(alice, MailService.ClaimMail, ClaimMailRsp.Parser)).Result);
+        var sent = Sent(DBItemsInfoIncrement.Parser.ParseFrom((await sync.WaitAsync(Wait)).Body), 1950019).Single();
+        Assert.Equal(claimed + 86400, sent.ExpireTm);
+
+        // The stored end must keep the ledger whole: the claim realizes an abstract attachment.
+        var closing = Ro3Emu.Server.Economy.EconomySnapshotReader.Read(database, catalog, "auto");
+        var ledger = Ro3Emu.Server.Economy.EconomyLedgerReader.Read(database, catalog, "auto",
+            opening.Cut.CommitSequence!.Value, closing.Cut.CommitSequence!.Value);
+        Assert.True(ledger.CompleteHistory, string.Join("; ", ledger.Issues));
+
+        // A second one is a separate instance with its own end.
+        await Gm("alice", "!item 1950019 1");
+        await WaitUntil(() => Count(alice, 1950019) == 2, "second instance");
+        var items = _app.Services.GetRequiredService<ItemStore>().Load(RoleId(alice)).Where(i => i.Entry == 1950019).ToArray();
+        Assert.Equal(2, items.Length);
+        Assert.All(items, i => { Assert.Equal(1, i.Stack); Assert.Equal(0, i.BindType); Assert.Equal(claimed + 86400, i.BindExpire); });
+
+        // Used in time it activates the honor for its own 24 hours.
+        Assert.Equal(0, await Use(alice, 1950019));
+        var honor = (await Read("alice", s => s.SocialOutfit!)).SocialOutfitContainer[5].SocialOutfitInfos[500019];
+        Assert.Equal(2, honor.Status);
+        Assert.Equal(claimed + 86400, honor.ExpireTimestamp);
+
+        // Past its end the instance is refused and kept; the client shows it as expired.
+        _clock.Advance(TimeSpan.FromSeconds(86402));
+        Assert.Equal(ErrorCodes.ItemMissing, await Use(alice, 1950019));
+        Assert.Equal(1, Count(alice, 1950019));
+    }
+
+    [ClientDataFact]
+    public async Task TimeBoundItemsFromBeforeTheFixGetOneFullDurationAtLogin()
+    {
+        await using var alice = await InWorld("Alice");
+        await Gm("alice", "!item 1950015 1");
+        await Gm("alice", "!item 1910002 1"); // Not time-bound: stays without an end.
+        await WaitUntil(() => Count(alice, 1950015) == 1 && Count(alice, 1910002) == 1, "items");
+        long role = RoleId(alice);
+        await alice.DisposeAsync();
+        await WaitUntil(() => !Sessions.All().Any(s => s.Account == "alice" && s.Role != null), "alice still online");
+        FixtureSql.Execute(_app.Services.GetRequiredService<AccountStore>(), "UPDATE item SET bind_expire = 0 WHERE role_id = $r", ("$r", role));
+
+        var database = _app.Services.GetRequiredService<AccountStore>().DatabasePath;
+        var catalog = Ro3Emu.Server.Economy.EconomyCatalog.Load(Path.Combine(ClientData.RepoRoot, "data"));
+        var opening = Ro3Emu.Server.Economy.EconomySnapshotReader.Read(database, catalog, "auto");
+        _clock.Advance(TimeSpan.FromHours(1));
+        long login = _clock.GetUtcNow().ToUnixTimeSeconds();
+        await using var again = await InWorld("Alice", create: false);
+        var store = _app.Services.GetRequiredService<ItemStore>();
+        Assert.Equal(login + 86400, store.Load(role).Single(i => i.Entry == 1950015).BindExpire);
+        Assert.Equal(0, store.Load(role).Single(i => i.Entry == 1910002).BindExpire);
+        Assert.Equal(login + 86400, await Read("alice", s => s.Items.Single(i => i.Entry == 1950015).BindExpire));
+        var closing = Ro3Emu.Server.Economy.EconomySnapshotReader.Read(database, catalog, "auto");
+        var ledger = Ro3Emu.Server.Economy.EconomyLedgerReader.Read(database, catalog, "auto",
+            opening.Cut.CommitSequence!.Value, closing.Cut.CommitSequence!.Value);
+        Assert.True(ledger.CompleteHistory, string.Join("; ", ledger.Issues));
+
+        // Once: the next login keeps that end.
+        _clock.Advance(TimeSpan.FromHours(1));
+        await using var third = await Relogin(again, "Alice");
+        Assert.Equal(login + 86400, store.Load(role).Single(i => i.Entry == 1950015).BindExpire);
     }
 
     // ------------------------------------------------------------------ 603 hatchery EXP

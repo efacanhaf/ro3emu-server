@@ -45,12 +45,12 @@ public sealed class EconomyEnvelope
                 throw new ArgumentException(name + " is missing or too long.", name);
         OperationId = Required(operationId, 128, nameof(operationId));
         ActorAccount = Required(actorAccount, 512, nameof(actorAccount));
-        if (actorRoleId <= 0) throw new ArgumentOutOfRangeException(nameof(actorRoleId));
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(actorRoleId);
         ActorRoleId = actorRoleId;
         CommandKind = Required(commandKind, 128, nameof(commandKind));
         RequestFingerprint = Required(requestFingerprint, 1024, nameof(requestFingerprint));
         SourceKey = Required(sourceKey, 512, nameof(sourceKey));
-        if (effectiveUtcMs <= 0) throw new ArgumentOutOfRangeException(nameof(effectiveUtcMs));
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(effectiveUtcMs);
         EffectiveUtcMs = effectiveUtcMs;
         Effects = Array.AsReadOnly((effects ?? throw new ArgumentNullException(nameof(effects))).ToArray());
         _outcome = (byte[])(outcome ?? throw new ArgumentNullException(nameof(outcome))).Clone();
@@ -76,14 +76,7 @@ public sealed class EconomyEnvelope
                 pair[0].Delta != -pair[1].Delta || pair[0].Owner == pair[1].Owner && pair[0].Compartment == pair[1].Compartment)
                 throw new ArgumentException("Transfer edge must have opposite effects in distinct compartments.", nameof(effects));
         }
-        _intentPayload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new
-        {
-            OperationId, ActorAccount, ActorRoleId, CommandKind, RequestFingerprint, SourceKey, EffectiveUtcMs,
-            Effects = Effects.OrderBy(x => x.EdgeNumber).ThenBy(x => (int)x.Asset.Kind).ThenBy(x => x.Asset.Id)
-                .ThenBy(x => x.Owner.Id, StringComparer.Ordinal).ThenBy(x => (int)x.Compartment).ToArray(),
-            Outcome = Convert.ToBase64String(_outcome),
-            ChildIntent = childIntent is null ? null : Convert.ToBase64String(childIntent)
-        }));
+        _intentPayload = Canonical(legacy: false);
         if (_intentPayload.Length > 2 * 1024 * 1024) throw new ArgumentException("E05d canonical intent exceeds receipt limit.");
         IntentHash = Convert.ToHexString(SHA256.HashData(_intentPayload));
     }
@@ -91,4 +84,34 @@ public sealed class EconomyEnvelope
     internal EconomyEnvelope BindChildIntent(byte[] stagedChildIntent) => new(OperationId, ActorAccount,
         ActorRoleId, CommandKind, RequestFingerprint, SourceKey, EffectiveUtcMs, Effects, _outcome,
         stagedChildIntent ?? throw new ArgumentNullException(nameof(stagedChildIntent)));
+
+    /// <summary>
+    /// The canonical intent. v2 binds the outcome (already stored in the receipt's own column) by its SHA-256; v1
+    /// (<paramref name="legacy"/>, receipts written before 29.10.2026) embedded it in base64 and is rebuilt only to
+    /// recognise those receipts. The two shapes stay separate: this serializer writes null properties.
+    /// </summary>
+    private byte[] Canonical(bool legacy)
+    {
+        var effects = Effects.OrderBy(x => x.EdgeNumber).ThenBy(x => (int)x.Asset.Kind).ThenBy(x => x.Asset.Id)
+            .ThenBy(x => x.Owner.Id, StringComparer.Ordinal).ThenBy(x => (int)x.Compartment).ToArray();
+        string? child = childIntent is null ? null : Convert.ToBase64String(childIntent);
+        return Encoding.UTF8.GetBytes(legacy
+            ? JsonSerializer.Serialize(new
+            {
+                OperationId, ActorAccount, ActorRoleId, CommandKind, RequestFingerprint, SourceKey, EffectiveUtcMs,
+                Effects = effects, Outcome = Convert.ToBase64String(_outcome), ChildIntent = child
+            })
+            : JsonSerializer.Serialize(new
+            {
+                OperationId, ActorAccount, ActorRoleId, CommandKind, RequestFingerprint, SourceKey, EffectiveUtcMs,
+                Effects = effects, OutcomeHash = Convert.ToHexString(SHA256.HashData(_outcome)), ChildIntent = child
+            }));
+    }
+
+    /// <summary>The v1 intent and its hash, for a receipt committed before intent v2 (<see cref="Canonical"/>).</summary>
+    internal (string Hash, byte[] Payload) LegacyIntent()
+    {
+        byte[] payload = Canonical(legacy: true);
+        return (Convert.ToHexString(SHA256.HashData(payload)), payload);
+    }
 }

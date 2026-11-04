@@ -28,7 +28,7 @@ public sealed partial class CharacterService
     }
 
     /// <summary>Stage 31413's validated grid move for a Genre composite; caller persists all owners together.</summary>
-    internal int StageEquipmentPlan(DBEquipInfo state, List<InvItem> stagedItems, int index, bool replaceCurrent = false)
+    internal int StageEquipmentPlan(DBEquipInfo state, List<InvItem> stagedItems, int index, RoleProgress progress, bool replaceCurrent = false)
     {
         if (!state.EquipPlans.TryGetValue(index, out var target)) return ErrorCodes.Parameter;
         if (index == state.CurrentEquipPlan && !replaceCurrent) return 0;
@@ -39,11 +39,7 @@ public sealed partial class CharacterService
             if (item == null) return ErrorCodes.ItemMissing;
             if (!IsEquipment(item.Entry)) return ErrorCodes.NotEquipment;
             if (item.Grid < 0 || item.Pack != 2 || item.Stack != 1) return ErrorCodes.EquipNotInBag;
-            // The official server lists a two-handed weapon (part 1) in BOTH weapon grids, 1 and 2, of a saved plan
-            // (an imported official plan carries it that way). Here it occupies grid 1 only, so the repeat in grid 2 is
-            // the same weapon, not a second copy (Eduardo: switching to the DPS build answered "Incorrect equipment slot").
-            if (grid == 2 && PartOf(item.Entry) == 1 && incoming.TryGetValue(guid, out var seen) && seen.Grid == 1) continue;
-            if (!GridsFor(PartOf(item.Entry)).Contains(grid) || !incoming.TryAdd(guid, (item, grid))) return ErrorCodes.EquipSlot;
+            if (!GridsFor(item.Entry, progress).Contains(grid) || !incoming.TryAdd(guid, (item, grid))) return ErrorCodes.EquipSlot;
         }
         if (incoming.Values.Any(i => i.Grid == 1 && PartOf(i.Item.Entry) == 1) && incoming.Values.Any(i => i.Grid == 2))
             return ErrorCodes.EquipSlot;
@@ -98,6 +94,9 @@ public sealed partial class CharacterService
 
     internal Task SyncEquipmentAsync(GameSession session) => SyncAsync(session, EquipSync, BuildEquip(session));
 
+    /// <summary>Worn gear changed (equip, unequip, plan switch): sockets that depend on it, CardEffects.</summary>
+    public List<Func<GameSession, Task>> WornGearChanged { get; } = [];
+
     private async Task EquipmentAppearanceChangedAsync(GameSession session)
     {
         Refresh(session);
@@ -105,6 +104,7 @@ public sealed partial class CharacterService
         look.EquipInfo.Add(EquipInfo(session));
         await ToSelfAndViewersAsync(session, EntityBaseChange, look);
         await SendStatsAsync(session);
+        foreach (var handler in WornGearChanged) await handler(session);
     }
 
     /// <summary>
@@ -126,8 +126,7 @@ public sealed partial class CharacterService
                 if (item == null) { result = ErrorCodes.ItemMissing; break; }
                 if (!IsEquipment(item.Entry)) { result = ErrorCodes.NotEquipment; break; }
                 if (item.Grid < 0 || item.Pack != 2 || item.Stack != 1) { result = ErrorCodes.EquipNotInBag; break; }
-                if (grid == 2 && PartOf(item.Entry) == 1 && incoming.TryGetValue(guid, out var seen) && seen.Grid == 1) continue;   // the same two-hander
-                if (!GridsFor(PartOf(item.Entry)).Contains(grid) || !incoming.TryAdd(guid, (item, grid)))
+                if (!GridsFor(item.Entry, session.Progress!).Contains(grid) || !incoming.TryAdd(guid, (item, grid)))
                 { result = ErrorCodes.EquipSlot; break; }
             }
             if (incoming.Values.Any(i => i.Grid == 1 && PartOf(i.Item.Entry) == 1) && incoming.Values.Any(i => i.Grid == 2))

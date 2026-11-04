@@ -21,6 +21,9 @@ public sealed class GuildStore(AccountStore accounts)
         public long CreateTime { get; set; }
         public int Status { get; set; } = 2;
         public long HelperDeadlineMs { get; set; }
+        /// <summary>What the founder paid while the guild is being founded, refunded if it fails: a config change must not change it.</summary>
+        public int FoundingItem { get; set; }
+        public long FoundingCount { get; set; }
         public int Level { get; set; } = 1;
         public long Background { get; set; }
         public long Icon { get; set; }
@@ -35,36 +38,70 @@ public sealed class GuildStore(AccountStore accounts)
         public long LastChangeNameTime { get; set; }
         public long LastChangeNoticeTime { get; set; }
         public long LastRecruitMs { get; set; }
-        public List<string> HistoryNames { get; set; } = new();
-        public Dictionary<long, Member> Members { get; set; } = new();
-        public Dictionary<long, Application> Applications { get; set; } = new();
+        public List<string> HistoryNames { get; set; } = [];
+        public Dictionary<long, Member> Members { get; set; } = [];
+        public Dictionary<long, Application> Applications { get; set; } = [];
         /// <summary>Founding responses waiting for the founder's approval (ApplyTime in ms; GuildService.Responders).</summary>
-        public Dictionary<long, Application> HelperApplies { get; set; } = new();
-        public Dictionary<int, List<int>> Rights { get; set; } = new();
-        public Dictionary<long, long> Buildings { get; set; } = new();
-        public Dictionary<long, long> BuildingEndTimes { get; set; } = new();
+        public Dictionary<long, Application> HelperApplies { get; set; } = [];
+        public Dictionary<int, List<int>> Rights { get; set; } = [];
+        public Dictionary<long, long> Buildings { get; set; } = [];
+        public Dictionary<long, long> BuildingEndTimes { get; set; } = [];
         /// <summary>Guild Activity (item 106) earned this week and last week; ActivityWeek = the week's Monday 05:00 (unix s).</summary>
         public long CurActivity { get; set; }
         public long LastWeekActivity { get; set; }
         public long ActivityWeek { get; set; }
         /// <summary>Guild League elite roster (MG_Guild EliteGroup, label LeagueLabel): slot index -> role, and the version
         /// 32302 saves against (GuildService.LeagueElite).</summary>
-        public Dictionary<int, long> LeagueElites { get; set; } = new();
+        public Dictionary<int, long> LeagueElites { get; set; } = [];
         public int LeagueEliteVersion { get; set; }
         /// <summary>Badge frames and designs unlocked by 113 items: GuildIconConfig id to removetime (unix s, 0 permanent);
         /// DBGuildData unLockHeadIconData (GuildService.ItemActions).</summary>
-        public Dictionary<long, long> UnlockedHeadIcons { get; set; } = new();
+        public Dictionary<long, long> UnlockedHeadIcons { get; set; } = [];
         /// <summary>Guild Store (ShopConfig 2702) purchases of the week ShopCommodityWeek (Monday 05:00, unix s), guild-wide:
         /// commodity to count; DBGuildData shopCommodityData.</summary>
-        public Dictionary<int, int> ShopCommodityBuys { get; set; } = new();
+        public Dictionary<int, int> ShopCommodityBuys { get; set; } = [];
         public long ShopCommodityWeek { get; set; }
         /// <summary>Guild group mail (32241, GuildService.BroadEmail): when the next letter may go (unix ms), and how many
         /// went on the day BroadEmailDay (05:00, unix s).</summary>
         public long NextBroadEmailMs { get; set; }
         public int BroadEmailCount { get; set; }
         public long BroadEmailDay { get; set; }
+        /// <summary>The master's impeachment (32235/32236, GuildService.Impeach): its initiator (0 = none), deadline (unix
+        /// ms), responses needed, who responded (the initiator first), and when the next may start (unix ms).</summary>
+        public long ImpeachOwner { get; set; }
+        public long ImpeachEndMs { get; set; }
+        public int ImpeachNeed { get; set; }
+        public List<long> ImpeachResponders { get; set; } = [];
+        public long NextImpeachMs { get; set; }
+        /// <summary>Merging guilds (32314-32319, GuildService.Merge): invitations received, the partner of an accepted
+        /// merge and whether this guild absorbs it, when it runs (unix s, the next 05:00), the members the absorbed guild
+        /// brings, and the end of the cooldown after a merge (unix s).</summary>
+        public List<MergeInvite> MergeInvites { get; set; } = [];
+        public long PendingMergeGuildId { get; set; }
+        public bool MergeAbsorbs { get; set; }
+        public long MergeAtSec { get; set; }
+        public List<long> MergeMemberIds { get; set; } = [];
+        public long MergeCooldownSec { get; set; }
+        /// <summary>The war warehouse (DBGuildData guildWartimeInfo, GuildService.Wartime): machine item to count once
+        /// WartimeStocked; before that the guild holds PublicParamConfig SiegeInitItemList.</summary>
+        public Dictionary<int, int> WartimeItems { get; set; } = [];
+        public bool WartimeStocked { get; set; }
+        /// <summary>War machine operators (guildWartimeInfo itemRoleUseInfo): machine type (WartimeToolType) to slot
+        /// (1-based bag index) to role.</summary>
+        public Dictionary<int, Dictionary<int, long>> WartimeSlots { get; set; } = [];
+        /// <summary>Machines reserved for building (guildWartimeInfo prepayInfo): role to machine item, one each; they
+        /// already left <see cref="WartimeItems"/> and go back on cancel.</summary>
+        public Dictionary<long, int> WartimePrepay { get; set; } = [];
         /// <summary>32228 journal rows (GuildEventData bytes) to append with this state's next save; not part of the state.</summary>
-        internal List<byte[]> PendingEvents { get; } = new();
+        internal List<byte[]> PendingEvents { get; } = [];
+    }
+
+    /// <summary>A merge invitation from guild <see cref="From"/> (received at unix s, with its announcement).</summary>
+    public sealed class MergeInvite
+    {
+        public long From { get; set; }
+        public long RecvSec { get; set; }
+        public string Announce { get; set; } = "";
     }
 
     public sealed class Member
@@ -100,13 +137,13 @@ public sealed class GuildStore(AccountStore accounts)
         internal OwnerRevisionValue? CapturedRevision { get; set; }
         public long NextId { get; set; }
         public long RecentAvgPrice { get; set; } = 100;
-        public List<long> RecentPrices { get; set; } = new();
-        public List<MarketPrice> PriceHistory { get; set; } = new();
-        public List<MarketStall> Stalls { get; set; } = new();
+        public List<long> RecentPrices { get; set; } = [];
+        public List<MarketPrice> PriceHistory { get; set; } = [];
+        public List<MarketStall> Stalls { get; set; } = [];
         /// <summary>E03: no refund/burn policy is implied by guild deletion; keep orphan stock out of the public book.</summary>
-        public List<MarketStall> RecoveryStalls { get; set; } = new();
-        public List<MarketTrade> Trades { get; set; } = new();
-        public Dictionary<long, long> LastListedMs { get; set; } = new();
+        public List<MarketStall> RecoveryStalls { get; set; } = [];
+        public List<MarketTrade> Trades { get; set; } = [];
+        public Dictionary<long, long> LastListedMs { get; set; } = [];
     }
 
     public sealed class MarketPrice

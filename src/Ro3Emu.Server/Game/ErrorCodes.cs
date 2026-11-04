@@ -10,6 +10,7 @@ public static class ErrorCodes
 {
     // ErrorCodeConfig -> Localization_en, territory wars and the 84031 auction contract.
     public const int TerritoryGuild = 6001; // Guild doesn't exist.
+    public const int PlayerLevelLow = 156;     // "Player level too low"
     public const int DataNotFound = 23; // ErrorCodeConfig: Data not found in database.
     public const int TerritoryCampGuild = 6008;
     public const int TerritoryCampCooldown = 6009;
@@ -31,9 +32,11 @@ public static class ErrorCodes
     public const int TerritoryGuildMembers = 6129;
     public const int TerritoryMaxBidLow = 6130;
     public const int Unknown = 24;              // "Unknown error"
+    public const int NoRecommendedFriends = 31; // _iShow 1: LC_PbHelper.PopErrorCodeTip shows no tip for it
     public const int FeatureUnavailable = 28;   // unavailable feature
     public const int ActionInBattle = 47;      // NW_ProtobufDefine.ERR_PlayerActionNotAllowedInBattle
     public const int Parameter = 82;            // "Client Parameter error"
+    public const int TooManyRequests = 1108;    // "Too many requests. Please try again later."
 
     // Activities: ErrorCodeConfig + Localization_en. Selection for each RPC is inferred from these texts.
     public const int ActivityClosed = 3902;      // "Event Not Available"
@@ -48,6 +51,9 @@ public static class ErrorCodes
     public const int BattlePassGiftSelf = 8270, BattlePassGiftPending = 8271, BattlePassGiftItem = 8272;
     public const int BattlePassGiftMessage = 8273, BattlePassGiftCharacters = 8274, BattlePassGiftDay = 8275, BattlePassGiftFriend = 8276;
     public const int MonthCardNotOwned = 8300, MonthCardExpired = 8301, MonthCardClaimed = 8302;
+    // Top-up and products (2001 CREATE_ORDER): "Wrong top-up type.", "Invalid top-up option.", "Purchase limit reached",
+    // "Already purchased"; which refusal maps to which code is inferred from the texts.
+    public const int TopUpType = 1001, TopUpOption = 1002, TopUpLimit = 1003, AlreadyPurchased = 6019;
 
     // Auction (ErrorCodeConfig 2100-2119; exact operation mapping is inferred).
     public const int AuctionGuild = 2100;
@@ -95,6 +101,7 @@ public static class ErrorCodes
     public const int RiftPartyTooSmall = 6755;    // "The party does not meet the required number of players."
     public const int RiftNoParty = 6757;          // "You must be in a party to enter this mode." (ERR_EnterOnepieceNoTeam)
     public const int RiftMemberLocked = 6758;     // "A party Member does not meet the Hidden Vault Unlock Requirement"
+    public const int TreasurePointNotOnMap = 6502; // "Treasure-digging location is not on the map"
     public const int RiftMemberInVault = 6759;    // "A party Member is already in the Hidden Treasure Dungeon..."
 
     // Quests (texts carry the quest name as ${1})
@@ -115,6 +122,7 @@ public static class ErrorCodes
     public const int ItemLocked = 3357;         // "Contains locked items."
     public const int Cooldown = 161;            // "On cooldown. Please try again later."
     public const int UseWhileDead = 181;        // "Items cannot be used while the player is dead"
+    public const int ItemCannotBeUsed = 179;    // "Item cannot be used"
     public const int ItemUseForbidden = 180;    // "Item use is prohibited"
     public const int ItemUseAreaForbidden = 178; // "Items cannot be used in this area"
     public const int CurrencyShort = 192;       // "Insufficient Currency. Unable to purchase."
@@ -124,6 +132,10 @@ public static class ErrorCodes
     // Scenes
     public const int SceneMissing = 266;        // "The scene does not exist"
     public const int SwitchingScenes = 284;     // "Switching scenes"
+    public const int TeleportExpired = 292;     // "The instance teleport skill has expired."
+    public const int TeleportFull = 293;        // "The instance teleport skill is full."
+    public const int TeleportDead = 828;        // client-only text 61169 "Cannot teleport while dead." (LC_DAL_Dungeon)
+    public const int TeleportRiding = 5203;     // client-only text 61168 "Cannot teleport while riding a mount."
 
     // Skills
     public const int SkillPointsShort = 307;    // "Not enough skill points"
@@ -217,6 +229,9 @@ public static class ErrorCodes
     public const int AlreadyInGuild = 463, GuildMissing = 464, GuildPermission = 466, GuildNameTaken = 470;
     public const int GuildPositionFull = 471, GuildApplicationMissing = 482, GuildInviteInvalid = 481;
     public const int GuildApplicationLimit = 468, GuildApplicationListFull = 469;
+    // War machines: 530 "Cannot place this here." (enum_ErrorCode.ERR_GuildAttackCityBuildError, LC_GVGBuildCannon.Build),
+    // 535 "Not enough guild supplies" (an empty war warehouse, inferred).
+    public const int GuildCannonPlace = 530, GuildSupplies = 535;
     // Guild League (ErrorCodeConfig 516-524).
     public const int LeagueClosed = 516, LeagueTemporary = 517, LeagueElite = 518, LeagueMainFull = 523;
     // Elite roster (ErrorCodeConfig 10046-10048, 10059): not a member, the roster changed meanwhile, position too low,
@@ -230,19 +245,46 @@ public static class ErrorCodes
     public const int GuildIconLocked = 10003, GuildFrameLocked = 10004, GuildJoinLevel = 10008;
     public const int GuildTextLength = 10027;
     public const int GuildMailDaily = 10025, GuildMailContent = 10026; // group mail: today's letters used, empty text
+    // Impeaching the master: on cooldown, no grounds, requirements unmet, the master itself, cancel state, responded twice,
+    // in progress, not in progress.
+    public const int ImpeachCooldown = 472, ImpeachNoGrounds = 473, ImpeachRequirements = 474, ImpeachSelf = 475;
+    public const int ImpeachCancelState = 476, ImpeachRepeat = 477, ImpeachInProgress = 478, ImpeachNotInProgress = 479;
+    // Merging guilds (ErrorCodeConfig 10050-10078): expired, the other's received invitations full, ours sent full, too
+    // many members, invited already, bad announcement, no invitation, impeachment here / there, no merge possible,
+    // cooldown here / there.
+    public const int MergeExpired = 10050, MergeTheirInvitesFull = 10051, MergeOurInvitesFull = 10052, MergeTooMany = 10053;
+    public const int MergeRepeat = 10055, MergeAnnounce = 10056, MergeNoInvite = 10057, MergeOurImpeach = 10060;
+    public const int MergeImpossible = 10061, MergeOurCooldown = 10063, MergeTheirImpeach = 10075, MergeTheirCooldown = 10078;
     public const int GuildFundsShort = 484, GuildContributeShort = 10040, GuildBuildBusy = 485, GuildHallLow = 486, GuildBuildMax = 487;
     // Guild voice channels (ErrorCodeConfig 97001-97032, Localization_en): not in a guild, invalid channel, on the
     // channel's block list, already / not in the channel, not leader nor GuildVoice right, the leader cannot be kicked,
     // not blocked; Order mode: no mic in Free mode, managers need not apply, already may speak,
     // already / not applied, not Order mode, reason too long; already in another channel, the leader's mic stays,
-    // cannot kick yourself.
+    // cannot kick yourself. Invites: the target is not in the guild, its invite cooldown runs, it declines invites
+    // for now, it is offline, it already sits in a channel.
     public const int GuildVoiceNotInGuild = 97001, GuildVoiceBadChannel = 97002, GuildVoiceBlocked = 97003;
     public const int GuildVoiceAlreadyInChannel = 97004, GuildVoiceNotInChannel = 97005, GuildVoiceNoPermission = 97006;
     public const int GuildVoiceCannotKickLeader = 97007, GuildVoiceNotBlocked = 97008;
+    public const int GuildVoiceTargetNotInGuild = 97011, GuildVoiceInviteCooldown = 97025, GuildVoiceInviteDeclined = 97026;
+    public const int GuildVoiceTargetOffline = 97027, GuildVoiceTargetInChannel = 97028;
     public const int GuildVoiceFreeMode = 97016, GuildVoiceManagerNeedsNoApply = 97017, GuildVoiceAlreadyCanSpeak = 97018;
     public const int GuildVoiceAlreadyApplied = 97019, GuildVoiceNotApplied = 97020, GuildVoiceNotOrderMode = 97021;
     public const int GuildVoiceReasonTooLong = 97024, GuildVoiceInAnotherChannel = 97029, GuildVoiceLeaderCannotMute = 97030;
     public const int GuildVoiceCannotKickSelf = 97032;
+    // Tavern (ErrorCodeConfig 2551-2580, Localization_en 10630000750-779). Which refusal picks which code is (inferred)
+    // from the texts: room gone / not found, on the Blocks list, no permission, recipient left, data error, transfer to
+    // a blocked player, the player is muted, mic queue full, already / must be in the queue, the owner keeps the mic,
+    // recipient offline, other server, not blocked, no request needed, already / not applied, not muted, already in
+    // the room, room full, too quick, gift to yourself, transfer cooldown, name too long / invalid, not in a room,
+    // invalid topic / language.
+    public const int TavernCleared = 2551, TavernNotFound = 2552, TavernBlocked = 2553, TavernNoPermission = 2554;
+    public const int TavernRecipientLeft = 2555, TavernDataError = 2556, TavernTransferBlocked = 2557, TavernMuted = 2558;
+    public const int TavernMicFull = 2559, TavernAlreadyOnMic = 2560, TavernOwnerKeepsMic = 2561, TavernNotOnMic = 2562;
+    public const int TavernRecipientOffline = 2563, TavernOtherServer = 2564, TavernNotBlocked = 2566;
+    public const int TavernNoApplyNeeded = 2567, TavernAlreadyApplied = 2568, TavernNotApplied = 2569, TavernNotMuted = 2570;
+    public const int TavernAlreadyIn = 2571, TavernFull = 2572, TavernTooQuick = 2573, TavernGiftSelf = 2574;
+    public const int TavernTransferCooldown = 2575, TavernNameTooLong = 2576, TavernNameInvalid = 2577;
+    public const int TavernNotInRoom = 2578, TavernBadType = 2579, TavernBadLanguage = 2580;
     // Guild Caravan: ErrorCodeConfig 489-504; exact RPC-to-code selection is (inferred).
     public const int CaravanLoaded = 489, CaravanExpired = 490, CaravanOrderExpired = 491;
     public const int CaravanNotAsking = 492, CaravanCannotAsk = 493, CaravanRequestMissing = 494;
@@ -306,11 +348,16 @@ public static class ErrorCodes
     public const int NotForSale = 2303;         // "Item is not currently available for purchase"
     public const int PurchaseLimit = 2304;      // "Item purchase limit reached"
     public const int PurchaseRequirements = 2311; // "Purchase requirements not met"
+    public const int ShopGiftFriendsOnly = 2312;   // "Gifts can only be sent to friends"
+    public const int ShopGiftOrderMissing = 2314;  // "Order does not exist"
     public const int ShopAppearanceMissing = 2315; // "Appearance does not exist"
     public const int ShopAppearanceOwned = 2316;   // "Appearance already unlocked"
     public const int ShopGiftNotAllowed = 2317;    // "This shop does not allow gifts"
+    public const int ShopGiftDuplicate = 2318;     // "You already have an unclaimed gift containing the same appearance"
     public const int ShopMissing = 2323;        // "Shop Configuration not found."
     public const int ShopRewardMissing = 2324;  // "Reward Configuration not found."
+    public const int ShopGiftSelf = 2325;          // "You cannot send gifts to yourself"
+    public const int ShopGiftMessageLength = 2327;  // "Invalid gift message length"
 
     // Soul Echo (the client's name for emblems; exact operation mapping inferred).
     public const int FunctionLocked = 2057;       // "Function locked"
@@ -351,4 +398,14 @@ public static class ErrorCodes
     public const int LifeRecipe = 6610, LifeVigor = 6611, LifeWrongJob = 6613, LifeCollectionLocked = 6614;
     public const int LifeRequirements = 6618, LifeAlreadyLearned = 6619, LifeCollectionLearned = 6623;
     public const int LifeInvalidJob = 6624, LifeVigorOverflow = 6627;
+
+    // HTTP POST /gift-card/use/v2 (GiftCodeEndpoints). LC_RedemptionCodeManager's enum_GiftCardErrCode holds only the two
+    // success codes; any other `code` is a refusal and the client shows the response's `message` verbatim. The refusal
+    // values below are (inferred): the original server's codes are not in the client.
+    public const int GiftCardUseSuccess = 1959;     // enum_GiftCardErrCode.GiftCardUseSuccess
+    public const int GiftCardUseSuccessLeft = 1960; // enum_GiftCardErrCode.GiftCardUseSuccessLeft (never sent)
+    public const int GiftCardBadRequest = 1961, GiftCardBadCredentials = 1962, GiftCardRoleNotOwned = 1963;
+    public const int GiftCardUnknown = 1964, GiftCardDisabled = 1965, GiftCardNotStarted = 1966, GiftCardExpired = 1967;
+    public const int GiftCardExhausted = 1968, GiftCardAlreadyRedeemed = 1969, GiftCardInvalidItems = 1970;
+    public const int GiftCardRateLimited = 1971, GiftCardFailed = 1972;
 }

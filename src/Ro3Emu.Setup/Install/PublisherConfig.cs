@@ -74,7 +74,7 @@ public sealed record PublisherConfig
         return new PublisherConfig
         {
             Origins = custom.Origins.Length > 0 ? custom.Origins : Genesis.Origins,
-            AllowedOrigins = custom.AllowedOrigins.Length > 0 ? custom.AllowedOrigins : Genesis.AllowedOrigins.Concat(custom.Origins).ToArray(),
+            AllowedOrigins = custom.AllowedOrigins.Length > 0 ? custom.AllowedOrigins : [.. Genesis.AllowedOrigins, .. custom.Origins],
             FullManifest = custom.FullManifest.Length > 0 ? custom.FullManifest : Genesis.FullManifest,
             FullSignature = custom.FullSignature.Length > 0 ? custom.FullSignature : Genesis.FullSignature,
             DeltaManifest = custom.DeltaManifest ?? Genesis.DeltaManifest,
@@ -105,7 +105,7 @@ public sealed record PublisherConfig
     public List<string> PackageUrls(string immutableUrl)
     {
         var allowed = AllowedOrigins.Concat(Origins).FirstOrDefault(o => immutableUrl.StartsWith(o, StringComparison.OrdinalIgnoreCase))
-            ?? throw new InstallException($"The publisher's manifest points outside its own servers ({immutableUrl}).",
+            ?? throw new InstallException($"Genesis' manifest points outside its own servers ({immutableUrl}).",
                 "Update RO3Emu, or add the new address to RO3Emu.download.json.");
         var rest = immutableUrl[allowed.Length..];
         var urls = Origins.Select(o => o + rest).ToList();

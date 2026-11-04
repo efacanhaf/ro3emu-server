@@ -130,7 +130,7 @@ public sealed partial class SeasonTalentService
                         attributes.Add(reference);
                     else if (op is [SkillParameterOp, var weapon, 0, var group, var type, var operation, var value, ..] && group > 0)
                         modifiers.Add((weapon, 0, new SkillParameterRules.Modifier((int)group, (int)type, (int)operation, value,
-                            op.Length > 7 ? (int)op[7] : 0)));
+                            op.Length > 7 ? (int)op[7] : 0, Column: op.Length > 8 ? (int)op[8] : 0)));
                     else if (op is [ProfessionBuffOp, var professionBuff])
                     {
                         // A profession's permanent buff selects the skill's enhanced MODE (BuffConfig type 15) and the like.

@@ -64,7 +64,7 @@ public sealed class CharacterTests : IAsyncLifetime
     private async Task Gm(string account, string line)
     {
         using var http = new HttpClient();
-        var resp = await http.PostAsync($"{_http}/ro3emu/gm?account={account}", new StringContent(line));
+        var resp = await http.PostAsync($"{_http}/ro3emu/gm?account={account}", Operator.Command(line));
         resp.EnsureSuccessStatusCode();
     }
 
@@ -93,7 +93,7 @@ public sealed class CharacterTests : IAsyncLifetime
         Assert.NotNull(potion.ItemBindInfo);
         Assert.Contains(potion.ItemGuid, consumables.SortedIndex.Keys);
         var gear = bag.PackInfo[2].All.Items.Values;
-        Assert.Equal(new[] { Dagger, Shirt }, gear.Select(i => i.ItemEntry).Order());
+        Assert.Equal([Dagger, Shirt], gear.Select(i => i.ItemEntry).Order());
         Assert.All(gear, i => Assert.Equal(1, i.ItemInfos[3].LongVal)); // appraised
         Assert.Equal(1000, bag.Currency[1].All);
 
@@ -148,6 +148,62 @@ public sealed class CharacterTests : IAsyncLifetime
     }
 
     [ClientDataFact]
+    public async Task OnlyACareerWithTheDoubleHandFormWieldsAOneHandedWeaponInEachHand()
+    {
+        await using var alice = await InWorld("Alice");
+        var bag = await Next(alice, CharacterService.ItemsSync, DBItemsInfoIncrement.Parser);
+        long mainHand = bag.PackInfo[2].All.Items.Values.Single(i => i.ItemEntry == Dagger).ItemGuid;
+        await Gm("alice", $"!item {Dagger}");
+        var added = await Next(alice, CharacterService.ItemsSync, DBItemsInfoIncrement.Parser, m => m.GuidToNew.Count > 0);
+        long offHand = added.PackInfo[2].Inc.Items.Values.Single().All.ItemGuid;
+        async Task Equip(long guid, int grid)
+        {
+            await alice.SendGameAsync(CharacterService.EquipItemOpr, new EquipItemOprReq { Opr = 0, Pos = (EquipGridType)grid, ItemGUID = guid });
+            await Next(alice, CharacterService.EquipSync, DBEquipInfoIncrement.Parser, m => !m.SyncAllMark);
+            Assert.Equal(0, (await Next(alice, CharacterService.EquipItemOpr, EquipItemOprResp.Parser)).Result);
+        }
+        Task<(int Main, int Off)> Grids() => _app.Services.GetRequiredService<GameLoop>().InvokeAsync(() =>
+        {
+            var s = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Account == "alice");
+            return Task.FromResult((s.Items.Single(i => i.Guid == mainHand).Grid, s.Items.Single(i => i.Guid == offHand).Grid));
+        });
+
+        // A career whose JobConfig _kWeaponForm has SingleHand (1): the second dagger takes grid 1 and swaps the first out.
+        await Equip(mainHand, 1);
+        await Equip(offHand, 2);
+        Assert.Equal((0, 1), await Grids());
+
+        // Assassin 5200, _kWeaponForm [2,3] (TwoHand, DoubleHand): the client's TwoHandAndDoubleHand puts it in the off hand.
+        await Gm("alice", "!job 5200");
+        await Next(alice, CharacterService.RoleBaseInfoSync, RoleBaseInfoIncrement.Parser, m => m.Career == 5200);
+        await Equip(mainHand, 1);
+        await alice.SendGameAsync(CharacterService.EquipItemOpr, new EquipItemOprReq { Opr = 0, Pos = (EquipGridType)2, ItemGUID = offHand });
+        var equipped = await Next(alice, CharacterService.EquipSync, DBEquipInfoIncrement.Parser, m => !m.SyncAllMark);
+        Assert.Equal(offHand, equipped.EquipPlans[0].Inc.ItemsEquipGrid[2].All);
+        Assert.Equal(0, (await Next(alice, CharacterService.EquipItemOpr, EquipItemOprResp.Parser)).Result);
+        Assert.Equal((1, 2), await Grids());
+    }
+
+    // AttributeConfig 115/116 _kTips: "Every 1 excess ASPD is converted to 0.1% Physical ATK (Max: 20%)", the excess
+    // over FinalAtkSpdThdAndCastSpdThd [500, 400] (OverflowAtkSpd2PhysDmgR, OverflowCastSpd2MagicDmgR).
+    [ClientDataFact]
+    public void SpeedPastItsCapTurnsIntoAttack()
+    {
+        var character = _app.Services.GetRequiredService<CharacterService>();
+        var data = _app.Services.GetRequiredService<Ro3Emu.Server.Data.GameData>();
+        StatSheet With(double aspd, double cast)
+        {
+            var raw = new Dictionary<int, double> { [103] = 1000, [104] = 1000, [115] = aspd, [116] = cast };
+            return character.ApplySpeedOverflow(raw, StatCalculator.Compute(raw, data));
+        }
+        var under = With(500, 400);
+        Assert.Equal((1000L, 1000L), (under[103], under[104]));
+        var over = With(600, 450); // 100 excess ASPD: +10% PATK; 50 excess cast speed: +5% MATK
+        Assert.Equal((1100L, 1050L, 600L), (over[103], over[104], over[115]));
+        Assert.Equal(1200, With(900, 400)[103]); // 400 excess would be 40%: capped at 20%
+    }
+
+    [ClientDataFact]
     public async Task EquipmentAndLevelSurviveRelog()
     {
         long dagger;
@@ -183,7 +239,7 @@ public sealed class CharacterTests : IAsyncLifetime
         var points = await Next(alice, CharacterService.BaseAttrSync, BaseAttrInfoIncrement.Parser, m => !m.SyncAllMark);
         Assert.Equal(48 + 8 * 2 + 4, points.AllPlanBaseProperty[0].Inc.AttrPoints); // BaseLvConfig: lv2-9 +2, lv10 +4
 
-        // STR 1 -> 5 costs 4 x 2 (BasePointConfig); a value lower than now is refused.
+        // STR 1 -> 5 costs 4 x 2 (BasePointConfig); the panel can then lower it again.
         var req = new AllocateAttrPointReq { PlanIndex = 0 };
         foreach (var (stat, value) in new[] { (1, 5), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1) }) req.Points[stat] = value;
         await alice.SendGameAsync(CharacterService.AllocateAttrPoints, req);
@@ -197,7 +253,19 @@ public sealed class CharacterTests : IAsyncLifetime
 
         req.Points[1] = 2;
         await alice.SendGameAsync(CharacterService.AllocateAttrPoints, req);
-        Assert.NotEqual(0, (await Next(alice, CharacterService.AllocateAttrPoints, AllocateAttrPointRsp.Parser)).Result);
+        var lowered = await Next(alice, CharacterService.AllocateAttrPoints, AllocateAttrPointRsp.Parser);
+        Assert.Equal(0, lowered.Result);
+        Assert.Equal(2, lowered.PlanBaseProperty.BaseProperty[1]);
+        Assert.Equal(2, lowered.PlanBaseProperty.UsedAttrPoints);
+        Assert.Equal(68 - 2, lowered.PlanBaseProperty.AttrPoints);
+
+        await alice.SendGameAsync(CharacterService.ResetAttrPoints, new ResetAttrPointReq { PlanIndex = 0 });
+        Assert.Equal(0, (await Next(alice, CharacterService.ResetAttrPoints, ResetAttrPointResp.Parser)).Result);
+        var reset = await Next(alice, CharacterService.OnePropertyChange, OnePropertyChange.Parser,
+            m => m.Property.Propertys.Any(p => p.PropertyId == 1 && p.Data == 1)
+                && m.AttrModTypes.Contains((int)EAttrModType.Base));
+        Assert.Single(reset.AttrModTypes);
+        Assert.Equal((int)EAttrModType.Base, reset.AttrModTypes[0]);
     }
 
     [ClientDataFact]
@@ -205,7 +273,7 @@ public sealed class CharacterTests : IAsyncLifetime
     {
         await using var alice = await InWorld("Alice");
         await Next(alice, CharacterService.RoleBaseInfoSync, RoleBaseInfoIncrement.Parser);
-        await Gm("alice", "!exp 15 2"); // BaseLvConfig lv1 needs 5, lv2 8 -> lv3 with 2; JobLvConfig 101/102 need 1 each -> job 3
+        await Gm("alice", "!exp 15"); // BaseLvConfig lv1 needs 5, lv2 8 -> lv3 with 2; its 3 Job EXP: JobLvConfig 101/102 need 1 each -> job 3
         var info = await Next(alice, CharacterService.RoleBaseInfoSync, RoleBaseInfoIncrement.Parser, m => !m.SyncAllMark);
         Assert.Equal(3, info.Level);
         Assert.Equal(2, info.Exp);
@@ -325,9 +393,9 @@ public sealed class CharacterTests : IAsyncLifetime
         Assert.True(removed.StoragePack.Inc.CardInfo[1].Del);
         Assert.Equal(0, (await Next(alice, CardService.SlotRemove, EquipmentCardRemoveResp.Parser)).Result);
 
-        await alice.SendGameAsync(CardService.LibraryCardUnlock, new LibraryCardUnlockReq { CardId = Lunatic });
-        var unlocked = await Next(alice, CardService.LibrarySync, DBLibraryInfoIncrement.Parser, m => !m.SyncAllMark);
-        Assert.True(unlocked.Cards[Lunatic].Inc.Unlock);
+        // Obtaining it collected it: the client has no request for that (CardService.QueueCollection).
+        await Next(alice, CardService.LibrarySync, DBLibraryInfoIncrement.Parser,
+            m => m.Cards.TryGetValue(Lunatic, out var card) && (card.All?.Unlock == true || card.Inc?.Unlock == true));
     }
 
     [ClientDataFact]
@@ -520,12 +588,12 @@ public sealed class CharacterTests : IAsyncLifetime
             plan.ManualLoadSkill.Add(new SkillData { SkillId = 10000, SkillLevel = 1 });
             return Task.CompletedTask;
         });
-        await Gm("alice", "!job 3100");
+        await Gm("alice", "!job 1100");
         await alice.SendGameAsync(1023, new PlayerAssetReq { AssetType = { 5 } });
-        var skills = await Next(alice, SkillService.SkillDataSync, DBSkillDataIncrement.Parser, m => m.SyncAllMark && m.CurrentAtkSkillId == 1300001);
-        Assert.Equal(1300001, skills.SkillWheel.All.AtkSkillId); // JobConfig 3100 _kSkillNormalID
+        var skills = await Next(alice, SkillService.SkillDataSync, DBSkillDataIncrement.Parser, m => m.SyncAllMark && m.CurrentAtkSkillId == 1001001);
+        Assert.Equal(1001001, skills.SkillWheel.All.AtkSkillId); // JobAttackConfig for job 1100
         Assert.DoesNotContain(skills.SkillWheel.All.WhellSkills.Values, slot => slot.SkillConfigId == 1000001);
-        Assert.Equal(1300001, skills.SkillWheel.All.WhellSkills[1].SkillConfigId);
+        Assert.Equal(1001001, skills.SkillWheel.All.WhellSkills[1].SkillConfigId);
     }
 
     [ClientDataFact]
@@ -540,10 +608,8 @@ public sealed class CharacterTests : IAsyncLifetime
         Assert.Equal(5, skills.SkillAssignPlans.All.Value.Count);
         Assert.Equal(0, skills.CurrentPlanIndex);
         var plan = skills.SkillAssignPlans.All.Value[skills.CurrentPlanIndex];
-        // Only what the role has a level in at this point: the novice's normal attack. Smite (10002) and Basic Skill
-        // (10003) activate at base level 5, so they are not listed yet (the official plan lists only levels above zero).
-        Assert.Equal(new[] { 10000 }, plan.SkillAssigns.Keys.Order());
-        Assert.DoesNotContain(10002, plan.SkillAssigns.Keys); // Smite activates at base level 5
+        Assert.Equal([10000, 10002, 10003], plan.SkillAssigns.Keys.Order());
+        Assert.Equal(0, plan.SkillAssigns[10002].SkillLevel); // Smite activates at base level 5
 
         // Keep the master's learned-Smite wheel assertion after the configured activation level.
         await Gm("alice", "!lvl 5");
@@ -555,7 +621,7 @@ public sealed class CharacterTests : IAsyncLifetime
 
         await Gm("alice", "!job 1100");
         var swordman = await Next(alice, SkillService.SkillDataSync, DBSkillDataIncrement.Parser, m => !m.SyncAllMark && m.HasCurrentAtkSkillId);
-        Assert.Equal(1100001, swordman.CurrentAtkSkillId); // JobConfig._kSkillNormalID
+        Assert.Equal(1001001, swordman.CurrentAtkSkillId); // JobAttackConfig for job 1100
 
         // Job 15 of rank 2 = 15 points (JobLvConfig 201..215); learn Bash level 3.
         var req = new SkillGrowthSkillPlanUpdateReq { Plan = 0 };

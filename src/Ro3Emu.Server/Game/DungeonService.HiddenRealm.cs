@@ -19,7 +19,7 @@ namespace Ro3Emu.Server.Game;
 public sealed partial class DungeonService
 {
     public const uint RandomDungeon = 82591;
-    private readonly HashSet<GameSession> _rolling = new();
+    private readonly HashSet<GameSession> _rolling = [];
 
     private static bool IsRandom(DungeonCatalog.Plan plan) => plan.Origin == null && plan.Multi is { } multi
         && GameData.Int(multi, "_iIsRandomDungeon") == 1;
@@ -68,7 +68,7 @@ public sealed partial class DungeonService
         {
             foreach (var member in members) _rolling.Remove(member);
             // A member who went offline, died or entered elsewhere during the card's countdown stays behind (inferred).
-            var going = members.Where(s => _sessions.All().Contains(s) && Admission(s, drawn, continuation: true) == 0).ToArray();
+            var going = members.Where(s => _sessions.Contains(s) && Admission(s, drawn, continuation: true) == 0).ToArray();
             if (going.Length == 0) return;
             await BeginAsync(drawn, going, going.Any(s => s.Role!.Id == leader) ? leader : going[0].Role!.Id, team, matched);
         });

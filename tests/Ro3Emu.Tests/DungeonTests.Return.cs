@@ -149,6 +149,37 @@ public sealed partial class DungeonTests
     }
 
     [ClientDataFact]
+    public async Task PaidReviveDetachedDuringPublicationDoesNotFault()
+    {
+        await using var alice = await InWorld("Alice");
+        ChangeRow("MapConfig", RoleStore.SpawnSceneEntry.ToString(System.Globalization.CultureInfo.InvariantCulture), row => row["_kItemRevive"] = new JsonArray(1112001, 1));
+        await Gm(alice, "!item 1112001 2");
+        var session = Session(alice);
+        var role = session.Role;
+        long before = Items(alice, 1112001);
+        await OnLoop(async () =>
+        {
+            await Service<CharacterService>().SetHpSpAsync(session, 0, 0);
+            session.Dead = true;
+        });
+        var combat = Service<CombatService>();
+        // RoleHandover.cs:100 clears Role while PublishReviveAsync is still awaiting its packets.
+        combat.ReviveBroadcastedForTest = s => { s.Role = null; return Task.CompletedTask; };
+        try { await OnLoop(() => Service<WorldCoreService>().ItemReviveAsync(session)); }
+        finally
+        {
+            await OnLoop(() =>
+            {
+                combat.ReviveBroadcastedForTest = null;
+                session.Role = role;
+                return Task.CompletedTask;
+            });
+        }
+        Assert.False(session.Dead);
+        Assert.Equal(before - 1, Items(alice, 1112001));
+    }
+
+    [ClientDataFact]
     public async Task FailedSecondMemberReturnPointAbortsWholeBarrierBeforeRoomEntry()
     {
         await using var alice = await InWorld("Alice");
@@ -345,6 +376,7 @@ public sealed partial class DungeonTests
         {
             await OnLoop(async () =>
             {
+                session.NoRegenUntilMs = long.MaxValue; // a recovery tick would lift this 1 HP out of one lethal hit
                 await Service<CharacterService>().SetHpSpAsync(session, 1, 1);
                 await Service<SceneService>().TeleportInMapAsync(session,
                     new MapPoint(monster.X + 1, monster.Y, monster.Z, monster.Face));
@@ -422,6 +454,7 @@ public sealed partial class DungeonTests
             foreach (var monster in session.DungeonAttempt!.Room.Monsters) monster.Dead = true;
             session.LastCombatMs = MonsterService.NowMs;
             session.StatusBits |= 1L << 15;
+            session.NoRegenUntilMs = long.MaxValue; // fighting no longer pauses regeneration
             await Service<CharacterService>().SetHpSpAsync(session, hp, sp);
         });
         var self = await ReturnFromDungeon(alice, RoleStore.SpawnSceneEntry);
