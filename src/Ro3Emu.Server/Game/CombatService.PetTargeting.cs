@@ -31,10 +31,6 @@ public sealed partial class CombatService
         var (forward, side) = FacingOffset(point.X - center.X, point.Z - center.Z, face);
         if (row.TryGetProperty("_ro3GuardianForwardRectangle", out _))
             return Math.Abs(side) <= radius / 2 && forward >= 0 && forward <= range.ElementAtOrDefault(1) / 100;
-        // Rect360 (Heavy Cannon Shot: the indicator is a 5 m x 15 m arrow, _kRange [1600, 500]): the lane runs FROM the caster
-        // along the aim for range[0] and is range[1] wide - every enemy in it is hit at launch, not a block centred on the caster.
-        if (release == SkillRelease.Rect360 && range.Length > 1)
-            return forward >= 0 && forward <= range[0] / 100 && Math.Abs(side) <= range[1] / 200;
         if (release is SkillRelease.FixRect or SkillRelease.Arrow or SkillRelease.Rect360 or SkillRelease.DragRect)
         {
             double width = range.Length > 1 && range[1] > 0 ? range[1] / 100 : 3;

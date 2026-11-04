@@ -45,12 +45,7 @@ public sealed partial class CombatService
         int group = (int)GameData.Int(requested, "_iSkillID"), level = (int)GameData.Int(requested, "_iLevel");
         int mode = SkillParameterRules.Mode(group, SkillParameterRules.CategoriesOf(_data, requested), SkillParameterRules.Active(session, _data));
         int requestedMode = (int)GameData.Int(requested, "_iMode");
-        // The enhanced variants (_iMode 1/2/5 with _kMultiverseArray 101: the season's rows) are the player's choice kept in
-        // the saved wheel, and the official character casts them although no config buff selects them (measured: the
-        // official wheel holds 1160720 / 1162815 / 1160455 with modes 1 / 1 / 5 and the 31103 casts of those rows succeed).
-        // Only a row the wheel actually holds in that mode is accepted, never a bare row id (inferred gate).
-        if (requestedMode != 0 && requestedMode != mode)
-            return WheelHolds(session, requestedRowId, requestedMode) ? SkillParameterRules.Effective(session, _data, requested) : null;
+        if (requestedMode != 0 && requestedMode != mode) return null;
         if (mode != 0 && ConfiguredModeRows.TryGetValue((group, level, mode), out int selectedId)
             && _data.Row("SkillConfig", selectedId) is { } selected)
             return SkillParameterRules.Effective(session, _data, selected);
@@ -58,8 +53,6 @@ public sealed partial class CombatService
         return SkillParameterRules.Effective(session, _data, requested);
     }
 
-    private static bool WheelHolds(GameSession session, int rowId, int mode) =>
-        session.SkillPlans?.SkillWheel?.WhellSkills.Values.Any(w => w.SkillConfigId == rowId && w.Mode == mode) == true;
     /// <summary>A group's configured row of a level in the mode the session's type 15 tuples select, or its mode 0 row when
     /// that mode has none. The tuples' other fields are not applied: <see cref="CastExtraAsync"/> applies them.</summary>
     internal JsonElement? ModeRow(GameSession session, int group, int level)
