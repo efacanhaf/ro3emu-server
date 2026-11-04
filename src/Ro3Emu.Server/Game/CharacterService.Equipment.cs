@@ -54,13 +54,19 @@ public sealed partial class CharacterService
 
     private readonly Dictionary<string, (JsonElement Row, long Grids, long Level)[]> _resonanceRows = new();
 
+    /// <summary>
+    /// The reached resonance row. Only grids that wear an item count: the refine/strengthen level stays on an empty
+    /// grid, but the official server reports refineEffectLv 0 (and no resonance attributes) for a character with
+    /// every grid empty and refine 9,7,7,7,7,6,6 kept on them (measured 2026-11-04, Kaori naked vs geared).
+    /// </summary>
     private JsonElement? ResonanceRow(GameSession session, string table)
     {
         var levels = table.StartsWith("Strengthen") ? session.EquipLevels.Strength : session.EquipLevels.Refine;
+        var worn = Equipped(session).Where(i => i.Grid >= 1 && i.Grid <= EquipInfoSlots).Select(i => i.Grid).ToHashSet();
         JsonElement? best = null;
         foreach (var (row, grids, level) in ResonanceRows(table))
         {
-            if (Enumerable.Range(1, EquipInfoSlots).Count(g => levels.GetValueOrDefault(g) >= level) >= grids) best = row;
+            if (worn.Count(g => levels.GetValueOrDefault(g) >= level) >= grids) best = row;
         }
         return best;
     }
