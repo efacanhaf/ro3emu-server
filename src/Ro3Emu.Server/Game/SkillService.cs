@@ -509,20 +509,11 @@ public sealed partial class SkillService
         var selected = state.SkillAssignPlans[state.CurrentPlanIndex];
         if (selected.ManualLoadSkill.Any(skill => skill.SkillId > 0))
         {
-            // The saved wheel carries each slot's MODE (the enhanced variant the client chose: SkillConfig rows 1/5 next
-            // to mode 0, which hit harder); rebuilding the slot from the bar must keep it, or every login downgrades it.
-            var savedWheel = session.SkillPlans?.SkillWheel?.WhellSkills;
             state.SkillWheel.WhellSkills.Clear();
             for (int slot = 1; slot <= Math.Min(BarSlots, selected.ManualLoadSkill.Count); slot++)
-                if (selected.ManualLoadSkill[slot - 1] is { SkillId: > 0 } skill && BarGroup(session.Progress!, skill.SkillId) is var group and > 0)
-                {
-                    int level = group == skill.SkillId ? skill.SkillLevel : Level(session.Progress!, group);
-                    int mode = savedWheel != null && savedWheel.TryGetValue(slot, out var saved) && saved.SkillConfigId / 100 == group
-                        ? saved.Mode : 0;
-                    int id = RealId(group, level, mode);
-                    if (id <= 0 && mode != 0) { mode = 0; id = RealId(group, level, 0); }
-                    if (id > 0) state.SkillWheel.WhellSkills[slot] = new SkillWheelSlot { SkillConfigId = id, Enable = true, Mode = mode };
-                }
+                if (selected.ManualLoadSkill[slot - 1] is { SkillId: > 0 } skill && BarGroup(session.Progress!, skill.SkillId) is var group and > 0
+                    && RealId(group, group == skill.SkillId ? skill.SkillLevel : Level(session.Progress!, group)) is var id and > 0)
+                    state.SkillWheel.WhellSkills[slot] = new SkillWheelSlot { SkillConfigId = id, Enable = true };
         }
         if (selected.SkillQueue.Values.Any(skill => skill.SkillId > 0) && QueueGroup(session.Progress!.Career) is > 0 and var lineup
             && RealId(lineup, 1) is var lineupId and > 0)
