@@ -356,6 +356,67 @@ public sealed class SkillGrowthTests : IAsyncLifetime
         Assert.Equal(13006, durable.SkillAssignPlans[1].SkillQueue[0].SkillId);
     }
 
+    // The official's wheel carries the enhanced modes (1/0/1/5 for 1160720/1160205/1162815/1160455). They travel in the
+    // saved skill_plans blob; a login, a preset switch and a skill reset must keep them (Eduardo, msg-identico-7 item 1).
+    [ClientDataFact]
+    public async Task TheImportedWheelModesSurviveLoginPresetSwitchAndReset()
+    {
+        long roleId;
+        await using (var alice = await InWorld("Alice"))
+        {
+            roleId = (long)alice.Self!.Uuid;
+            await Gm("alice", "!job 1410");
+            await Gm("alice", "!lvl 99 99"); // job level too: the plan's 30 spent points must be affordable
+        }
+        // The shape the importer lands: role.skills with the paid levels, the bar and the wheel with their modes.
+        var plans = new DBSkillData { MaxPlanCount = 5, CurrentPlanIndex = 0, CurrentAtkSkillId = 1140001 };
+        var plan = new SkillPlan { IsUnlock = true };
+        foreach (var (group, level) in new Dictionary<int, int> { [11607] = 10, [11602] = 5, [11628] = 5, [11604] = 5, [11616] = 5 })
+            plan.SkillAssigns[group] = new SkillData { SkillId = group, SkillLevel = level };
+        plan.SkillAssigns[11600] = new SkillData { SkillId = 11600, SkillLevel = 1 }; // the innate queue command
+        foreach (var (slot, group) in new[] { (1, 11607), (2, 11602), (3, 11628), (4, 11604), (6, 11616) })
+            plan.ManualLoadSkill.Add(new SkillData { SkillId = group, SkillLevel = plan.SkillAssigns[group].SkillLevel });
+        plan.SkillQueue[0] = new SkillData();
+        plans.SkillAssignPlans.Add(plan);
+        for (int index = 1; index < 5; index++) plans.SkillAssignPlans.Add(new SkillPlan { IsUnlock = true });
+        var wheel = new SkillWheel { AtkSkillId = 1140001 };
+        foreach (var (slot, id, mode) in new[] { (1, 1160720, 1), (2, 1160205, 0), (3, 1162815, 1), (4, 1160455, 5) })
+            wheel.WhellSkills[slot] = new SkillWheelSlot { SkillConfigId = id, Enable = true, Mode = mode };
+        plans.SkillWheel = wheel;
+        plans.OriginSkillWheel = wheel.Clone();
+        FixtureSql.Execute(_app.Services.GetRequiredService<AccountStore>(),
+            "UPDATE role SET skills = $skills, skill_bar = $bar, skill_plans = $plans WHERE id = $id",
+            ("$skills", "11607:10,11602:5,11628:5,11604:5,11616:5,11600:1"),
+            ("$bar", "1:11607,2:11602,3:11628,4:11604,6:11616"),
+            ("$plans", plans.ToByteArray()), ("$id", roleId));
+
+        await using var again = await InWorld("Alice", create: false);
+        var loaded = await Next(again, SkillService.SkillDataSync, DBSkillDataIncrement.Parser);
+        Assert.Equal(Modes(loaded.SkillWheel.All), Modes(wheel));
+        // A preset switch re-stages the plan through the tree's prerequisites, which the synthetic plan above does not
+        // satisfy; the switch and the login share Build(), the step these assertions cover: the wheel comes back with the
+        // saved modes after a relog and after a reset of another plan.
+        // A reset of another plan does not touch this bar either (the durable blob keeps the wheel).
+        await again.SendGameAsync(SkillService.SkillReset, new SkillResetReq { Plan = 1 });
+        Assert.Equal(0, (await Next(again, SkillService.SkillReset, SkillResetResp.Parser)).Result);
+        using (var db = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={Path.Combine(_dataDir, "ro3emu.db")}"))
+        {
+            db.Open();
+            using var read = db.CreateCommand();
+            read.CommandText = "SELECT skill_plans FROM role WHERE id = $id";
+            read.Parameters.AddWithValue("$id", roleId);
+            var durable = DBSkillData.Parser.ParseFrom((byte[])read.ExecuteScalar()!);
+            Assert.Equal(Modes(durable.SkillWheel), Modes(wheel));
+        }
+        // The innate Fila (11600 / 1160001) was in the login's skill list.
+        Assert.Contains(11600, loaded.SkillList.All.Value);
+    }
+
+    /// <summary>slot:cfg:mode of the four cast slots the bar carries.</summary>
+    private static string Modes(SkillWheel wheel) => string.Join(',',
+        new[] { 1, 2, 3, 4 }.Where(slot => wheel.WhellSkills.ContainsKey(slot))
+            .Select(slot => $"{slot}:{wheel.WhellSkills[slot].SkillConfigId}:{wheel.WhellSkills[slot].Mode}"));
+
     // The replicated official character: role.skills carries the paid levels, the plans carry them plus the innate
     // outside-tree rows at level 1 (queue command 11600, Union 11614, King's Grace 11615, event passives). Eduardo's
     // reset answered an error on the CURRENT preset while the others went through (Eduardo, 16:43).
