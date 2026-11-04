@@ -210,6 +210,16 @@ Both are projections of data the role owns; no combat rule changes. Verified liv
 replica: the "Fila" tab appears, its queue shows Bloqueio Nv.5 / Escudo Reflexo Nv.1 / Canto Santo Nv.10
 (the official screenshot), and `skillWheel.whellSkills[7].skillConfigId = 1160001` like the official.
 
+**Wheel modes (the enhanced skill variants).** `SkillConfig` holds the same skill in several `_iMode`
+rows: mode 0 is the base (1160710, damage 21000) and modes 1/5 are the enhanced variants the client puts
+on a bar slot (1160720 damage 27000, 1160455 damage 8850 against 5500). The mode belongs to the slot
+(`SkillWheelSlot.mode`), so it travels in the saved `skill_plans` blob — and a rebuild from the bar used
+to reset every slot to mode 0, i.e. every login downgraded the rotation's damage. `SkillService.Build`
+now keeps the saved slot's mode when the slot still holds the same group, and looks the row up with
+`RealId(group, level, mode)`. Verified: the replica's wheel is now
+`1=1160720(m1) 2=1160205(m0) 3=1162815(m1) 4=1160455(m5) 6=1161605(m0) 7=1160001(m0) 11=2334103`, the
+official's list exactly.
+
 ## Naming a residual: the `!attrsrc` diagnostic
 
 `CharacterService.AttributeProbe` (null in normal play) lets the GM command `!attrsrc [attrId]` watch the

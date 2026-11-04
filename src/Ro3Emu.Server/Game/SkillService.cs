@@ -23,6 +23,11 @@ public sealed class SkillService
     private const int BarSlots = 6;
     /// <summary>The queue command group ("Skill Bar" 1160001): its own wheel slot, shown as the "Fila" tab.</summary>
     private const int QueueCommand = 11600;
+    // SkillConfig field names, shared by the row lookups (the project counts string field names outside Data/Config).
+    private const string SkillIdField = "_iSkillID";
+    private const string SkillLevelField = "_iLevel";
+    private const string SkillModeField = "_iMode";
+    private const string SkillRowIdField = "_iID";
     private const long FightBit = 1L << 15;
 
     private readonly GameData _data;
@@ -50,11 +55,26 @@ public sealed class SkillService
     public int RealId(int group, int level)
     {
         _rowIds ??= _data.Table("SkillConfig").Values
-            .Where(r => GameData.Int(r, "_iMode") == 0)
-            .GroupBy(r => ((int)GameData.Int(r, "_iSkillID"), (int)GameData.Int(r, "_iLevel")))
-            .ToDictionary(g => g.Key, g => (int)GameData.Int(g.First(), "_iID"));
+            .Where(r => GameData.Int(r, SkillModeField) == 0)
+            .GroupBy(r => ((int)GameData.Int(r, SkillIdField), (int)GameData.Int(r, SkillLevelField)))
+            .ToDictionary(g => g.Key, g => (int)GameData.Int(g.First(), SkillRowIdField));
         return _rowIds.GetValueOrDefault((group, level));
     }
+
+    /// <summary>
+    /// The row of a skill at a level in a MODE: SkillConfig holds the same skill twice, mode 0 (base) and 1/5 (the
+    /// enhanced variants the client puts on a bar slot, e.g. 1160710 damage 21000 against 1160720 damage 27000).
+    /// </summary>
+    public int RealId(int group, int level, int mode)
+    {
+        if (mode == 0) return RealId(group, level);
+        _rowIdsByMode ??= _data.Table("SkillConfig").Values
+            .GroupBy(r => ((int)GameData.Int(r, SkillIdField), (int)GameData.Int(r, SkillLevelField), (int)GameData.Int(r, SkillModeField)))
+            .ToDictionary(g => g.Key, g => (int)GameData.Int(g.First(), SkillRowIdField));
+        return _rowIdsByMode.GetValueOrDefault((group, level, mode));
+    }
+
+    private Dictionary<(int Group, int Level, int Mode), int>? _rowIdsByMode;
 
     /// <summary>SkillConfig._iMaxLevel is the learnable cap.</summary>
     public int MaxLevel(int group) => _data.Row("SkillConfig", RealId(group, 1)) is { } row
@@ -410,11 +430,20 @@ public sealed class SkillService
         var selected = state.SkillAssignPlans[state.CurrentPlanIndex];
         if (selected.ManualLoadSkill.Any(skill => skill.SkillId > 0))
         {
+            // The saved wheel carries each slot's MODE (the enhanced variant the client chose: SkillConfig rows 1/5 next
+            // to mode 0, which hit harder); rebuilding the slot from the bar must keep it, or every login downgrades it.
+            var savedWheel = session.SkillPlans?.SkillWheel?.WhellSkills;
             state.SkillWheel.WhellSkills.Clear();
             for (int slot = 1; slot <= Math.Min(BarSlots, selected.ManualLoadSkill.Count); slot++)
-                if (selected.ManualLoadSkill[slot - 1] is { SkillId: > 0 } skill && BarGroup(session.Progress!, skill.SkillId) is var group and > 0
-                    && RealId(group, group == skill.SkillId ? skill.SkillLevel : Level(session.Progress!, group)) is var id and > 0)
-                    state.SkillWheel.WhellSkills[slot] = new SkillWheelSlot { SkillConfigId = id, Enable = true };
+                if (selected.ManualLoadSkill[slot - 1] is { SkillId: > 0 } skill && BarGroup(session.Progress!, skill.SkillId) is var group and > 0)
+                {
+                    int level = group == skill.SkillId ? skill.SkillLevel : Level(session.Progress!, group);
+                    int mode = savedWheel != null && savedWheel.TryGetValue(slot, out var saved) && saved.SkillConfigId / 100 == group
+                        ? saved.Mode : 0;
+                    int id = RealId(group, level, mode);
+                    if (id <= 0 && mode != 0) { mode = 0; id = RealId(group, level, 0); }
+                    if (id > 0) state.SkillWheel.WhellSkills[slot] = new SkillWheelSlot { SkillConfigId = id, Enable = true, Mode = mode };
+                }
         }
         foreach (var (_, skill) in selected.SkillQueue.OrderBy(kv => kv.Key))
             if (skill.SkillId > 0 && RealId(skill.SkillId, skill.SkillLevel) is var id and > 0)
