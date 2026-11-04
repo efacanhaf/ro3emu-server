@@ -19,12 +19,16 @@ public sealed partial class CharacterService
         if (!state.EquipPlans.TryGetValue(index, out var target)) return ErrorCodes.Parameter;
         if (index == state.CurrentEquipPlan && !replaceCurrent) return 0;
         var incoming = new Dictionary<long, (InvItem Item, int Grid)>();
-        foreach (var (grid, guid) in target.ItemsEquipGrid)
+        foreach (var (grid, guid) in target.ItemsEquipGrid.OrderBy(g => g.Key))   // grid 1 before its two-handed repeat in 2
         {
             var item = stagedItems.FirstOrDefault(i => i.Guid == guid);
             if (item == null) return ErrorCodes.ItemMissing;
             if (!IsEquipment(item.Entry)) return ErrorCodes.NotEquipment;
             if (item.Grid < 0 || item.Pack != 2 || item.Stack != 1) return ErrorCodes.EquipNotInBag;
+            // The official server lists a two-handed weapon (part 1) in BOTH weapon grids, 1 and 2, of a saved plan
+            // (an imported official plan carries it that way). Here it occupies grid 1 only, so the repeat in grid 2 is
+            // the same weapon, not a second copy (Eduardo: switching to the DPS build answered "Incorrect equipment slot").
+            if (grid == 2 && PartOf(item.Entry) == 1 && incoming.TryGetValue(guid, out var seen) && seen.Grid == 1) continue;
             if (!GridsFor(PartOf(item.Entry)).Contains(grid) || !incoming.TryAdd(guid, (item, grid))) return ErrorCodes.EquipSlot;
         }
         if (incoming.Values.Any(i => i.Grid == 1 && PartOf(i.Item.Entry) == 1) && incoming.Values.Any(i => i.Grid == 2))
