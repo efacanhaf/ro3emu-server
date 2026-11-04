@@ -47,6 +47,15 @@ public sealed class CharacterPlan
 
     public Dictionary<string, object?> Columns { get; } = new(StringComparer.Ordinal);
     public Dictionary<string, byte[]> Blobs { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Columns written as NULL instead of a snapshot value. `settings` (DBSettingInfo) is the client's own
+    /// preferences: its values are binary inside the text dump, and the old copy's "auto assign points"
+    /// preference spent 2 of the 8 free stat points on every login. Cleared, the client starts from its defaults
+    /// (verified: 65,67 stays 65,67 after a login).
+    /// </summary>
+    public HashSet<string> ClearedBlobs { get; } = new(StringComparer.Ordinal) { "settings" };
+
     public List<InvItem> Items { get; } = new();
     public IReadOnlyDictionary<long, long> GuidMap => _guids;
     public IReadOnlyList<string> Notes => _notes;

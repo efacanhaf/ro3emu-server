@@ -177,7 +177,7 @@ instead of 48 extra free points.
 | daily/activities/lottery/shop/pass/month card | time-boxed account state, not a combat input |
 | mail, auction, trade, stalls, market | other players' and the official economy's data; a replica starts with an empty mailbox and market |
 | guild, friends, team, recent team | social identity of the official account; the local guild tables belong to the local realm |
-| `settings` | the client's keybinds/UI options, tied to the official account and machine |
+| `settings` | the client's keybinds/UI options, tied to the official account and machine; the column is CLEARED on import (its values are binary and the old copy's "auto assign points" preference spent 2 of the 8 free stat points on every login — with the column NULL the client starts from its defaults and the points stay) |
 | `personal` (profile card), `emoji_play`, `emoji_info`, `popularity`, `personal_upvote`, `adventure_group`, other adventure datasets, bar room, `clim_tower`, `wild_afk`, `dungeons`, `territory_*`, `area_concur`, `mvp`, `first_heart`, `training`, `timed_*`, `new_activities`, `activity_runtime` | per-realm event/instance progress; none of them changes the numbers the character fights with |
 | `auto_decompose` | bag automation preference; the local default is kept |
 | item instances the official client does not list | the export contains what the client holds; anything already gone (sold, consumed, mailed) cannot be recovered |
@@ -233,6 +233,20 @@ With the journal imported these gates are met wherever the official character me
 stay closed are listed by the compare script with their condition (on the reference replica only the
 functions the local realm opens through `OpenContent` differ — the official ones are all open).
 
+## Running it over a previous copy
+
+The tool is meant to be re-run (Eduardo: "talvez tenhamos que fazer mais vezes"). Two things make a
+second import behave like the first:
+
+- the role's **economy receipts** are forgotten. A natural source key (`task/<role>/<task>/<count>/...`,
+  `newactivity/<role>/...`) that committed once is refused the second time, and replacing the journal
+  makes the server deliver the same awards again on the next login — without this the login dies with
+  `EconomyOperationConflictException: Natural source already committed`. The import deletes the
+  role-scoped `operation_source`/`operation_receipt` rows and their `economy_entry` legs, in the same
+  transaction, so the ledger keeps matching the balances it writes;
+- `settings` is written NULL (see the table above), so the client's own auto-assign preference from the
+  previous copy cannot spend the imported free points.
+
 ## Verification
 
 1. Unit tests: `dotnet test tests/Ro3Emu.Tests --filter "FullyQualifiedName~RoleImportTests"` — exact
@@ -264,10 +278,20 @@ functions the local realm opens through `OpenContent` differ — the official on
   official dump by construction even when the inputs are identical.
 - One instance occupies one equipment grid: the official client can list the same two-handed weapon in
   grids 1 and 2 of a plan, the server writes it in grid 1 and rebuilds the active plan on login.
-- The derived numbers the client shows are the SERVER's model: on the reference replica the stored data
-  is equal but the local server's HP/SP/ATK/MATK/DEF/ASPD come out lower than the official server's
-  (power is within 0.4%). The local realm exported its game data from an older client installation than
-  the one the official server runs, so those tables — not the imported rows — drive the difference.
+- **Derived numbers: still unexplained after the client update.** The local client was mirrored from the
+  official installation (`robocopy /MIR`), patched and re-exported into `data/` — the 517 config tables came
+  out byte-identical to the previous export, and the new client shows the same numbers, so neither the
+  client build nor the data version is the cause. What was ruled out with evidence: the stored character
+  data (items, cards, echo, talents, skills, stat plans — all equal), the client's own attribute formula
+  (`StatCalculator`, recomputed from the same tables: base row + job row + worn gear + cards + echo +
+  conversions), buffs (the official's buffs give +10 ATK/DEF/MDEF and a speed aura, and its HP moves
+  ~6% with them), passives (clearing every learned skill changed HP/SP not at all and ATK by 10) and the
+  equipment (the official now wears 5 pieces where the snapshot had 6, and its HP did not drop). The
+  attributes that depend only on the base level row and the gear (recovery, evade, speed) match exactly,
+  while `maxhp`, `maxsp`, `atk`, `matk`, `def`, `mdef`, `aspd` and cast speed are 1.6-5.6x higher on the
+  official server, so the missing part is a source the client's exported tables do not carry (server-side
+  values). Naming it needs one diagnostic dump of the server's raw attribute map, which is a code change
+  outside this tool's licence.
 - The local client installation may be older than the official launcher's (`C:\Games\ROO_PC` vs
   `C:\Program Files\Genesis Launcher\ROO_PC`). A dataset the local client does not know travels as an
   unknown field and is ignored by the client, not by the server.

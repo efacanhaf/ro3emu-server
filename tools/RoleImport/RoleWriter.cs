@@ -41,7 +41,9 @@ public static class RoleWriter
         }
 
         UpdateProgress(connection, transaction, plan, role);
+        ForgetRoleLedger(connection, transaction, role);
         foreach (var (column, bytes) in plan.Blobs) WriteBlob(connection, transaction, role, column, bytes);
+        foreach (string column in plan.ClearedBlobs) WriteBlob(connection, transaction, role, column, null);
         ReplaceItems(connection, transaction, role, plan.Items);
         var parts = plan.Blobs.Keys.Concat(new[] { "progress", "inventory" }).ToArray();
         foreach (string part in parts) BumpRevision(connection, transaction, role, part);
@@ -110,10 +112,29 @@ public static class RoleWriter
             ("$pexp", plan.Columns.GetValueOrDefault("paragon_exp", 0L)));
     }
 
-    private static void WriteBlob(SqliteConnection db, SqliteTransaction tx, long role, string column, byte[] value)
+    private static void WriteBlob(SqliteConnection db, SqliteTransaction tx, long role, string column, byte[]? value)
     {
         // The column name comes from CharacterPlan only; an unknown one fails loudly in SQLite.
         Execute(db, tx, $"UPDATE role SET {column}=$value WHERE id=$id", ("$id", role), ("$value", value));
+    }
+
+    /// <summary>
+    /// The role's economy receipts are role state too: a natural source key (task/&lt;role&gt;/&lt;task&gt;/...) that was
+    /// committed once is refused on the next attempt, and replacing the journal makes the server deliver the same
+    /// awards again on the next login. Importing over the previous copy would therefore fail the login with
+    /// "Natural source already committed"; forgetting the role-scoped receipts lets the replaced state commit again.
+    /// The legs of those operations go with them, so the ledger keeps matching the balances the import writes.
+    /// </summary>
+    private static void ForgetRoleLedger(SqliteConnection db, SqliteTransaction tx, long role)
+    {
+        string needle = "%/" + role.ToString(CultureInfo.InvariantCulture) + "/%";
+        Execute(db, tx, "CREATE TEMP TABLE IF NOT EXISTS replaced_operation(op TEXT PRIMARY KEY)");
+        Execute(db, tx, "DELETE FROM replaced_operation");
+        Execute(db, tx, "INSERT OR IGNORE INTO replaced_operation SELECT operation_id FROM operation_source WHERE source_key LIKE $needle",
+            ("$needle", needle));
+        foreach (string table in new[] { "economy_entry", "operation_source", "operation_receipt" })
+            Execute(db, tx, $"DELETE FROM {table} WHERE operation_id IN (SELECT op FROM replaced_operation)");
+        Execute(db, tx, "DROP TABLE replaced_operation");
     }
 
     /// <summary>The item table is the whole inventory: replace the role's rows, keeping the guids the plan allocated.</summary>
