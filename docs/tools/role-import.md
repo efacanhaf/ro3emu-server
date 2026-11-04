@@ -6,7 +6,9 @@ combat: level, job level, EXP, career, appearance, the six base attributes of th
 the skill bar, Astral Level, equipment with its revealed/rolled attributes and enchantments, equipment
 tier (craft), refine/strengthen/luck per grid, cards socketed in the gear, Soul Echo ("eco de alma")
 plans, talents, season page/refine, genre, growth class, paragon, title, career special, Valhalla statue,
-totems, pets, mounts, wardrobe, social outfit, life jobs (+ restrict), library, bag state and currencies.
+totems, pets, mounts, wardrobe, social outfit, life jobs (+ restrict), library, bag state and currencies —
+plus the quest journal and the finished guides, because the client's windows (Skills, Attributes,
+Talents, auto-battle, ...) open by completed quests and not by a flag.
 
 It is a tool, not gameplay: it writes the same rows and blobs the server itself would have written after
 the same play, in one SQLite transaction, and it never changes server code or opens a connection while
@@ -108,6 +110,8 @@ Blobs (column → protobuf message in `src/Ro3Emu.Server/Protos/romsg`):
 | `lifejob` | `DBLifeJobInfo` | `DBLIFEJOBINFO` |
 | `life_restrict` | `DBRestrictInfo` | `DBRESTRICTINFO` |
 | `library` | `DBLibraryInfo` | `DBLIBRARYINFO` |
+| `tasks` | `DBTaskInfo` (the quest journal: delivered counters and running quests) | `DBTASKINFO` |
+| `guides` | `DBGuideInfo` (finished tutorials) | `DBGUIDEINFO` |
 
 JSON blobs (the server's own shapes, used through its own classes so the field names cannot drift):
 
@@ -116,6 +120,12 @@ JSON blobs (the server's own shapes, used through its own classes so the field n
 | `equip_levels` | `Game.EquipLevels {Strength, Refine, Luck}` per grid 1..7 | `DBEQUIPINFO.itemsStrength` / `itemsRefine` / `refineLuckyAdd` |
 | `emblems` | `EmblemService.EmblemState` (Soul Echo plans, current plan, published power) | `DBEMBLEMINFO` + `ROLEBASEINFO.curPower`/`historyMaxPower` |
 | `mounts` | `MountService.SavedState` carrying `DBMountsInfo` | `DBMOUNTSINFO` |
+| `task_runtime` | `Game.TaskRuntimeState {CompletedGuides, InCutScene}` | rebuilt from `DBGUIDEINFO.finishedGuideIds` |
+| `task_followup` | the server's pending-award debt (JSON string set) | always `[]`: the old local story's debt is dropped |
+
+`task_runtime` carries the guides the quest objectives (`TGuide`) read, so it is built from the same
+`DBGUIDEINFO` the client gets: no step of the previous local story survives, and no guide the official
+client already finished fires again.
 
 `heroic_spirit` is `DBOdinStatue`, which reaches the client inside `DBHEROICSPIRITINFO.odinStatue`
 (that is the sync message feeding `role.heroic_spirit`; the column stores the statue alone).
@@ -163,7 +173,7 @@ instead of 48 extra free points.
 
 | family | why |
 |---|---|
-| tasks, quests, story, guides, achievements | progression of the official account; the local realm runs its own (and the client rebuilds the UI from the server) |
+| achievements, guides' per-step records (`DBGuideInfo.guideFinishRecord`) | UI/account milestones; the finished-guide set IS copied (below) |
 | daily/activities/lottery/shop/pass/month card | time-boxed account state, not a combat input |
 | mail, auction, trade, stalls, market | other players' and the official economy's data; a replica starts with an empty mailbox and market |
 | guild, friends, team, recent team | social identity of the official account; the local guild tables belong to the local realm |
@@ -176,6 +186,37 @@ The import also never invents an item the account did not own: a reference to an
 does not carry (a shortcut-bar slot of a consumed item, a Soul Echo slot of a missing echo) is reported
 in the tool's output and dropped rather than pointed at a dangling guid.
 
+## Quests, guides and the functions they open
+
+Quest progress IS copied: `DBTASKINFO` goes into `role.tasks` and `DBGUIDEINFO` into `role.guides`. This
+is what makes the character's windows work, because a function opens by a condition, not by a flag:
+
+- `FunctionService.IsOpen` reads `FunctionConfig._kOpenCondition` -> `LC_ConditionList` sub-conditions
+  (`1010`/`4004` quest delivered, `1002` base level, `1019` job rank, `1100` parent function open,
+  `1014` tower floor, `1020` item count, `11001` life level, ...). `4004` is `TaskService.IsDelivered`
+  (`completeTaskNum[id] > 0` or status 4), so the imported journal is what opens Skills, Attributes,
+  Talents and the rest. Nothing is forced: the same table decides, and `FUNCTIONOPENINFO` is rebuilt
+  from it on every sync.
+- Constructor special cases stay intact: function `1003` (Season Talents) still needs the talent tables
+  to exist, function `10` open and tasks `10101170` + `10103160` delivered — all of which the imported
+  journal satisfies for a character that had them.
+- `task_followup` is written empty: it is the previous local story's pending-award debt, and keeping it
+  would block card/task settlement of the imported journal.
+- `task_runtime.CompletedGuides` is rebuilt from the imported `DBGUIDEINFO`, so a finished tutorial does
+  not fire again and the `TGuide` objectives count the same guides the official server counts.
+
+On a replica of the reference character (279 functions open officially) every one of them is open
+locally; the compare script lists any that is not, with its open condition
+(`comparar-personagem.py --dados <data dir>`).
+
+Two things follow from importing the journal, both by design:
+
+- quests the official character had RUNNING are now running here, and a level/target already met makes
+  the local server deliver them (and accept the next ones), so a replica can gain a few delivered
+  tasks and their awards the official character had not claimed yet;
+- quests the local `TaskConfig` no longer has are dropped at login (`TaskService.LoginAsync`), which is
+  the same rule the client follows.
+
 ## After the import: the realm's own unlocks
 
 The snapshot carries the character's DATA. A few systems are gated by the local realm's own
@@ -184,31 +225,36 @@ the feature is closed:
 
 | system | gate (code) |
 |---|---|
-| Season talents | `SeasonTalentService.Available`: tasks `10101170` and `10103160` delivered, functions `10` (Skills) and `1003` (Talent) open |
+| Season talents | `SeasonTalentService.Available`: tasks `10101170` and `10103160` delivered (imported), functions `10` (Skills) and `1003` (Talent) open (derived) |
 | Pets (deploy/incubate) | `PetService.Gate`: function `PetFunction` (and `3301`/`3302` for incubation) |
 | Auto-battle, auto-potion, learn skills, auto-assign | `FunctionConfig._kOpenCondition` (level + tasks), see `docs/guide/open-content.md` |
 
-Those gates are quest/level state, which is deliberately NOT copied (see the table above). On a test
-realm a GM opens them once (`!quest accept/finish/done <id>`; `ro3/bot/ferramentas/preparar-personagem.ps1
--Desbloquear` in kaori-game-assist walks the known chain), and then a relogin applies the effects.
-Verified on a replica: delivering `10101170` and `10103160` moved ATK 2156 → 2165 and DEF 754 → 755
-(the talent points the snapshot carried), which is what the feature's attributes are worth at these
-levels; nothing else in the character changed.
+With the journal imported these gates are met wherever the official character met them; the ones that
+stay closed are listed by the compare script with their condition (on the reference replica only the
+functions the local realm opens through `OpenContent` differ — the official ones are all open).
 
 ## Verification
 
 1. Unit tests: `dotnet test tests/Ro3Emu.Tests --filter "FullyQualifiedName~RoleImportTests"` — exact
    int64 parsing, guid allocation/remapping, the `attrs`/`str_attrs`/`enchantments` split, `EquipLevels`,
-   the role columns, and a full round trip through the server's own parsers using
-   `tests/Ro3Emu.Tests/Fixtures/snapshot-kaori.json` (a real export, anonymised and trimmed).
+   the role columns, the quest journal + guides + rebuilt task runtime, and a full round trip through the
+   server's own parsers using `tests/Ro3Emu.Tests/Fixtures/snapshot-kaori.json` (a real export,
+   anonymised and trimmed).
 2. Live: open a client against the local server (`ro3_multi`/autologin), inject the probe, run
    `exportar-personagem.ps1` on it, and compare with `comparar-personagem.py`. Every difference must be
    fixed or explained; the tool prints a note per derived value (for example `bonus_points`).
-3. Derived numbers: the compare script also diffs `m_kHeadInfoData` (HP max, SP max, ATK, MATK, DEF,
+3. Functions: the compare script has a `FUNCTIONOPENINFO` section — every function open on the
+   reference must be open here, and each one that is not is listed with its open condition
+   (`--dados <data dir>` reads `FunctionConfig` + `LC_ConditionList`). On the reference replica: 279 of
+   279 official functions open, plus 7 the local `OpenContent` opens by policy.
+4. Derived numbers: the compare script also diffs `m_kHeadInfoData` (HP max, SP max, ATK, MATK, DEF,
    MDEF, ASPD, cast speed), dumped read-only with `lua <player>.m_kHeadInfoData 1 400`.
 
 ## Known limits
 
+- Tasks the local `TaskConfig` no longer has are dropped at login, and a quest the official character had
+  RUNNING continues here: the local server delivers it when its target is met and accepts the follow-ups,
+  so a replica can end up with a few more delivered tasks (and their awards) than the official one.
 - **Per-instance `playBook` and `season` are not persisted.** `RoleItemPlans.ItemValue` (and so the
   `item` table) has no column for them, and `CharacterService.ItemInfo` does not send them: a replica
   shows 0 where the official client shows 1. Nothing in the server reads them for stats (they tag the

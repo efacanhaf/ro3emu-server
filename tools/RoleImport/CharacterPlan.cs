@@ -219,6 +219,9 @@ public sealed class CharacterPlan
         Blob("lifejob", "DBLIFEJOBINFO", DBLifeJobInfo.Descriptor);
         Blob("life_restrict", "DBRESTRICTINFO", DBRestrictInfo.Descriptor);
         Blob("library", "DBLIBRARYINFO", DBLibraryInfo.Descriptor);
+        Blob("tasks", "DBTASKINFO", DBTaskInfo.Descriptor);
+        Blob("guides", "DBGUIDEINFO", DBGuideInfo.Descriptor);
+        BuildTaskRuntime();
         BuildEquipPlans();
         BuildEquipLevels();
         BuildEmblems();
@@ -325,12 +328,32 @@ public sealed class CharacterPlan
         Blobs["mounts"] = JsonSerializer.SerializeToUtf8Bytes(new MountService.SavedState { Info = info.ToByteArray() });
     }
 
-    /// <summary>DBHeroicSpiritInfo carries the Valhalla statue; the server stores that message alone (DBOdinStatue).</summary>
+    /// <summary>
+    /// DBHeroicSpiritInfo carries the Valhalla statue; the server stores that message alone (DBOdinStatue).
+    /// </summary>
     private void BuildHeroicSpirit()
     {
         if (!_snapshot.TryMessage("DBHEROICSPIRITINFO", out var json)) { _notes.Add("heroic_spirit: no DBHEROICSPIRITINFO in the snapshot"); return; }
         var full = (DBHeroicSpiritInfo)ProtoJson.Parse(DBHeroicSpiritInfo.Descriptor, json);
         Blobs["heroic_spirit"] = full.OdinStatue.ToByteArray();
+    }
+
+    /// <summary>
+    /// The server's own quest side state (Game.TaskRuntimeState): which guides the tasks' TGuide objectives count as
+    /// done. It is rebuilt from the imported DBGuideInfo so no step of the old local story survives, and the pending
+    /// award debt of that story is dropped (task_followup empty).
+    /// </summary>
+    private void BuildTaskRuntime()
+    {
+        var runtime = new TaskRuntimeState();
+        if (_snapshot.TryMessage("DBGUIDEINFO", out var json))
+        {
+            var guides = (DBGuideInfo)ProtoJson.Parse(DBGuideInfo.Descriptor, json);
+            foreach (var id in guides.FinishedGuideIds) runtime.CompletedGuides.Add(id);
+        }
+        else _notes.Add("task_runtime: no DBGUIDEINFO in the snapshot");
+        Blobs["task_runtime"] = JsonSerializer.SerializeToUtf8Bytes(runtime);
+        Blobs["task_followup"] = "[]"u8.ToArray();
     }
 
     /// <summary>

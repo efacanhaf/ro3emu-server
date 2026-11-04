@@ -172,6 +172,24 @@ public sealed class RoleImportTests
     }
 
     [Fact]
+    public void QuestStateAndGuidesComeAlongSoFunctionsOpen()
+    {
+        using var snapshot = Fixture();
+        var plan = Build(snapshot);
+        var tasks = DBTaskInfo.Parser.ParseFrom(plan.Blobs["tasks"]);
+        Assert.Contains(10101170, tasks.CompleteTaskNum.Keys);
+        Assert.Contains(10103160, tasks.CompleteTaskNum.Keys);
+        Assert.True(tasks.CompleteTaskNum.Count > 300);
+        Assert.NotEmpty(tasks.Infos);
+        var guides = DBGuideInfo.Parser.ParseFrom(plan.Blobs["guides"]);
+        Assert.NotEmpty(guides.FinishedGuideIds);
+        // The runtime carries the guides the TGuide objectives read, and the old story's award debt is gone.
+        var runtime = JsonSerializer.Deserialize<TaskRuntimeState>(plan.Blobs["task_runtime"])!;
+        Assert.Equal(guides.FinishedGuideIds.ToHashSet(), runtime.CompletedGuides);
+        Assert.Equal("[]", System.Text.Encoding.UTF8.GetString(plan.Blobs["task_followup"]));
+    }
+
+    [Fact]
     public void MissingMessagesAreReportedNotInvented()
     {
         using var snapshot = SnapshotDocument.Load(Path.Combine(AppContext.BaseDirectory, "Fixtures", "snapshot-kaori.json"));
