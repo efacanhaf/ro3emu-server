@@ -39,8 +39,15 @@ public sealed partial class CardService
         5 => [5],
         6 => [6, 7],
         7 => [8],
-        _ => [], // 8 / 9 "Sketch Card" (MVP): target not established
+        // The "Sketch Card" (MVP) parts: the official card plans hold a part 9 card on grid 10 (Eduardo's Kaori,
+        // 1440909 on grid 10 socket 1) and a part 7 card on grid 8; the EquipGridConfig has no condition for them
+        8 => [9],
+        9 => [10],
+        _ => [],
     };
+
+    /// <summary>Grids 8-10 (the MVP/Sketch card sockets) open without a condition: the official plans use them.</summary>
+    private static bool OpenSketchGrid(int grid) => grid is >= 8 and <= 10;
 
     private readonly GameData _data;
     private readonly CharacterService _character;
@@ -262,8 +269,8 @@ public sealed partial class CardService
     private InvItem? Socketed(GameSession session, int grid, int socket) =>
         session.Items.FirstOrDefault(i => i.Grid == CharacterService.CardGrid(grid, socket));
 
-    private bool ValidSocket(int grid, int socket) => socket is >= 1 and <= 4 && _data.Table("EquipGridConfig").Values
-        .Any(r => GameData.Int(r, "_iEquipGridType") == grid && GameData.Int(r, "_iGridCategory") is 1 or 3);
+    private bool ValidSocket(int grid, int socket) => socket is >= 1 and <= 4 && (grid == 10 || _data.Table("EquipGridConfig").Values
+        .Any(r => GameData.Int(r, "_iEquipGridType") == grid && GameData.Int(r, "_iGridCategory") is 1 or 3));
 
     private int AddressError(int grid, int socket) => socket is < 1 or > 4 ? ErrorCodes.SlotIndex
         : ValidSocket(grid, socket) ? 0 : ErrorCodes.EquipSlot; // (inferred) invalid grid.
@@ -272,6 +279,7 @@ public sealed partial class CardService
     private int SocketError(GameSession session, int grid, int socket)
     {
         if (AddressError(grid, socket) is var address and not 0) return address;
+        if (OpenSketchGrid(grid)) return 0;   // no worn-item or condition rule for the MVP/Sketch card sockets
         var row = _data.Table("EquipGridConfig").Values.FirstOrDefault(r => GameData.Int(r, "_iEquipGridType") == grid && GameData.Int(r, "_iGridCategory") is 1 or 3);
         if (row.ValueKind != JsonValueKind.Object) return ErrorCodes.EquipSlot; // (inferred) bad grid.
         if (!row.TryGetProperty($"_kSocketOpen{socket}", out var cond) || GameData.Number(cond) is not { } id || id <= 0) return ErrorCodes.SlotSealed;

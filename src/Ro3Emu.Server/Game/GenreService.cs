@@ -208,6 +208,9 @@ public sealed partial class GenreService(
                 }
             }
             reply.Result = code;
+            log.LogInformation("{Name} Build {Op} preset {Target} (selected {Selected}, child {Child}): result {Code}", s.Role!.Name,
+                req.IsApply ? "applies" : "edits", req.TargetPlan, string.Join(",", selected.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}:{kv.Value}")),
+                string.Join(",", req.ChildSystem.Select(kv => $"{kv.Key}:{kv.Value}")), code);
             await s.SendGameAsync(82806, reply);
             if (code == 0)
             {
