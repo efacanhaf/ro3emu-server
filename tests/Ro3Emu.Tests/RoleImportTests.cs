@@ -139,7 +139,7 @@ public sealed class RoleImportTests
         Assert.Equal(-48L, plan.Columns["bonus_points"]);
         Assert.Equal(72000006L, plan.Columns["hair"]);
         var skills = ((string)plan.Columns["skills"]!).Split(',');
-        Assert.Equal(50, skills.Length); // the union of the five plans' assignments (the learned set)
+        Assert.Equal(38, skills.Length); // the active plan's assignments (the learned set the stats use)
         Assert.Contains("11401:10", skills);
         Assert.Contains("11600:1", skills);
         Assert.Equal("1:11607,2:11602,3:11628,4:11604,6:11616,7:11600", plan.Columns["skill_bar"]);
@@ -192,44 +192,41 @@ public sealed class RoleImportTests
     }
 
     [Fact]
-    public void SeasonTalentBoughtLevelsReachThePlans()
+    public void SeasonTalentImportsTheOfficialBlobUntouched()
     {
         using var snapshot = Fixture();
         var plan = Build(snapshot);
         var official = (DBSeasonTalent)ProtoJson.Parse(DBSeasonTalent.Descriptor, snapshot.Message("DBSEASONTALENT"));
         var imported = DBSeasonTalent.Parser.ParseFrom(plan.Blobs["season_talent"]);
-        // The server reads the grade from the ACTIVE PLAN (SeasonTalentService.TalentLevel), the client keeps the
-        // bought level in the global map: every plan must carry the bought level, or the login rebuild lands one tree.
-        foreach (var (id, bought) in official.TalentNodes)
-            foreach (var (index, season) in imported.Plan)
-                Assert.True(season.TalentNodes[id].CurrentLevel >= bought.CurrentLevel,
-                    $"plan {index} lost node {id}: {season.TalentNodes[id].CurrentLevel} < {bought.CurrentLevel}");
-        // Its own selection survives where the global map has nothing.
-        foreach (var (id, selected) in official.Plan[official.CurPlanId].TalentNodes)
-            Assert.True(imported.Plan[official.CurPlanId].TalentNodes[id].CurrentLevel >= selected.CurrentLevel);
-        // The grade the plan now carries is the official global sum (the client's own total).
-        long grade = imported.Plan[official.CurPlanId].TalentNodes.Values.Sum(node => (long)node.CurrentLevel);
-        long global = official.TalentNodes.Values.Sum(node => (long)node.CurrentLevel);
-        Assert.True(grade >= global, $"grade {grade} < global {global}");
+        // The official client's own save is the model SeasonTalentService rebuilds: bought levels (and the oath) in
+        // the global map, the profession choices in the plans. Nothing is translated on the way in.
+        Assert.Equal(official, imported);
+        Assert.All(imported.Plan, season => Assert.All(season.Value.TalentNodes.Keys,
+            id => Assert.True(id is not 10101001 and not 10100000, $"plan carries the bought node {id}")));
+        Assert.Contains(10101001L, imported.TalentNodes.Keys);
+        Assert.Contains(10100000L, imported.TalentNodes.Keys);
+        Assert.Contains(10102003L, imported.Plan[official.CurPlanId].TalentNodes.Keys); // a SkillPoint gate
     }
 
     [Fact]
-    public void LearnedSkillsAreThePlansUnionNotEveryListedSkill()
+    public void LearnedSkillsAreTheActivePlansAssignments()
     {
         using var snapshot = Fixture();
         var plan = Build(snapshot);
         var skills = ((string)plan.Columns["skills"]!).Split(',')
             .Select(pair => pair.Split(':'))
             .ToDictionary(pair => int.Parse(pair[0], CultureInfo.InvariantCulture), pair => int.Parse(pair[1], CultureInfo.InvariantCulture));
-        // The learned set is the union of the five plans' assignments (50 groups in the fixture): the client only paints
-        // a group it has a level in, and the plans are loadouts of the same learned set.
-        Assert.Equal(50, skills.Count);
-        Assert.Equal(5, skills[11616]);      // only the Tank plan assigns it
-        Assert.Equal(10, skills[11502]);
+        var data = (DBSkillData)ProtoJson.Parse(DBSkillData.Descriptor, snapshot.Message("DBSKILLDATA"));
+        var active = data.SkillAssignPlans[data.CurrentPlanIndex].SkillAssigns;
+        // The levels are the active plan's (the client's skill window and the passive stats both read that plan).
+        foreach (var (group, assignment) in active)
+            Assert.Equal(assignment.SkillLevel, skills[group]);
+        Assert.True(skills.Count >= active.Count(x => x.Value.SkillLevel > 0));
+
         // The queue command is granted like the server grants a system skill, and keeps the "Fila" tab alive.
         Assert.Contains(11600, skills.Keys);
         Assert.Equal(1, skills[11600]);
-        // A group `skillList` lists but no plan assigns is NOT learned (the official paints it "Não aprendida").
+        // A group `skillList` lists but the active plan does not assign is NOT learned ("Não aprendida").
         Assert.DoesNotContain(11003, skills.Keys);
         Assert.DoesNotContain(11403, skills.Keys);
         Assert.Contains("7:11600", ((string)plan.Columns["skill_bar"]!).Split(','));

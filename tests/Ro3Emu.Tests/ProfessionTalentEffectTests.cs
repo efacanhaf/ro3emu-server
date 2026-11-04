@@ -138,7 +138,7 @@ public sealed class ProfessionTalentEffectTests : IAsyncDisposable
             Session.Tasks ??= new DBTaskInfo();
             Session.Tasks.CompleteTaskNum[10101170] = 1;
             Session.Tasks.CompleteTaskNum[10103160] = 1;
-            Session.SeasonTalent!.Plan[0].TalentNodes[1].CurrentLevel = 1;
+            Session.SeasonTalent!.TalentNodes[1].CurrentLevel = 1;
             await _host.Service<SeasonTalentService>().SyncAsync(Session);
             return 0;
         });

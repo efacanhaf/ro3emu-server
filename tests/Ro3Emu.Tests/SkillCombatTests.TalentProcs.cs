@@ -22,13 +22,15 @@ public sealed partial class SkillCombatTests
         await Loop.InvokeAsync(async () =>
         {
             var s = Session(name);
-            var plan = s.SeasonTalent!.Plan[s.SeasonTalent.CurPlanId];
+            var state = s.SeasonTalent!;
             foreach (var row in data.Table("SeasonTalentConfig").Values)
             {
                 long tree = GameData.Int(row, "_iTalentTreeID");
+                long id = GameData.Int(row, "_iId");
+                // Ordinary nodes are bought in the global map (the official save's shape); the plans hold the choices.
                 if ((tree == 10101 || tree >= 10102 && tree <= optionTree && GameData.Int(row, "_iType") == 1)
-                    && plan.TalentNodes.TryGetValue(GameData.Int(row, "_iId"), out var node))
-                    node.CurrentLevel = (int)GameData.Int(row, "_iMaxLevel");
+                    && state.TalentNodes.TryGetValue(id, out var bought))
+                    bought.CurrentLevel = (int)GameData.Int(row, "_iMaxLevel");
             }
             await _app.Services.GetRequiredService<SeasonTalentService>().SyncAsync(s);
         });

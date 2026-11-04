@@ -202,6 +202,13 @@ public sealed partial class PetService
 
     private static PetData NewPet(int id) => new() { PetId = id, Level = 1, Star = 1 };
     private JsonElement? StarRow(PetData p) => _stars.TryGetValue((p.PetId, p.Star, p.StarProgress), out var row) ? row : null;
+
+    /// <summary>
+    /// The star's base row (_iStage 0): the collect set and the fight/assist attribute sets (and the configured skills)
+    /// are written only there, while a star-progress row carries the higher strength/cost numbers. (official evidence) a
+    /// pet at star progress 2 still brings its star's collect attributes, so the attribute readers take this row.
+    /// </summary>
+    private JsonElement? StarBaseRow(PetData p) => _stars.TryGetValue((p.PetId, p.Star, 0), out var row) ? row : StarRow(p);
     private JsonElement? LevelRow(PetData p) => _data.Row("PetBaseConfig", p.PetId) is { } b
         && _levels.TryGetValue(((int)GameData.Int(b, "_iQuality"), p.Level), out var r) ? r : null;
     private static long[] Flat(JsonElement row, string key) => row.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Array
@@ -477,7 +484,7 @@ public sealed partial class PetService
     }
 
     /// <summary>Config-resolved skills, not learned state (LC_PetHelper.GetPetAllSkill; no authoritative pet combat AI).</summary>
-    public (long Protect, long Passive, long[] Active, long[] Stage) ConfiguredSkills(PetData pet) => StarRow(pet) is { } row
+    public (long Protect, long Passive, long[] Active, long[] Stage) ConfiguredSkills(PetData pet) => StarBaseRow(pet) is { } row
         ? (GameData.Int(row, "_iProtectSkill"), GameData.Int(row, "_iPassiveMain"), Flat(row, "_kActiveSkill"), Flat(row, "_kStageSkill"))
         : (0, 0, [], []);
 
@@ -489,13 +496,13 @@ public sealed partial class PetService
     {
         if (s.Pets == null || !_functions.IsOpen(s, PetFunction)) yield break;
         foreach (var pet in s.Pets.ListPet.Values.Where(p => p.IsActiveCollect))
-            if (StarRow(pet) is { } row)
+            if (StarBaseRow(pet) is { } row)
                 foreach (var attr in GameData.Pairs(row, "_kCollectAttr")) yield return attr;
         if (s.Pets.SetupPlans.GetValueOrDefault(s.Pets.CurrentPlan) is not { } plan) yield break;
         foreach (var source in new[] { 1, 2 })
             foreach (var (slot, id) in Slots(plan, source))
                 if (SlotOpen(s, source, slot) && s.Pets.ListPet.TryGetValue(id, out var pet)
-                    && StarRow(pet) is { } row && _data.Row("PetSetLimitConfig", slot) is { } limit)
+                    && StarBaseRow(pet) is { } row && _data.Row("PetSetLimitConfig", slot) is { } limit)
                     foreach (var (attr, value) in GameData.Pairs(row, source == 1 ? "_kFightSkill" : "_kAssistSkill"))
                         yield return (attr, value * GameData.Int(limit, source == 1 ? "_iFightAttrAddition" : "_iAssistAttrAddition") / 10000.0);
     }

@@ -211,7 +211,7 @@ public sealed class SeasonTalentTests
         var first = await Next(alice, SeasonTalentService.TalentSync, DBSeasonTalentIncrement.Parser);
         Assert.True(first.SyncAllMark);
         Assert.Equal(5, first.Plan.Count);
-        Assert.Equal(232, first.TalentNodes.Count);
+        Assert.Equal(167, first.TalentNodes.Count); // the ordinary nodes + the oath; choices live in the plans
         Assert.Equal(232, first.UnlockedNode.Count);
         Assert.Equal(11, first.UnlockedTrees.Count);
         Assert.False(first.UnlockedTrees[10101].All);
@@ -254,7 +254,7 @@ public sealed class SeasonTalentTests
         {
             int before = alice.Inbox.Snapshot().Count;
             Assert.Equal(0, await Upgrade(alice, Root));
-            Assert.Equal(level, fixture.Session.SeasonTalent!.Plan[0].TalentNodes[Root].CurrentLevel);
+            Assert.Equal(level, fixture.Session.SeasonTalent!.TalentNodes[Root].CurrentLevel); // bought levels are shared
             Assert.Equal(50 - 10 * level, fixture.Character.CountOf(fixture.Session, Remnant));
             Assert.Equal(500 - 100 * level, fixture.Character.CountOf(fixture.Session, MintedCoin));
             Assert.InRange(fixture.Character.Stats(fixture.Session)[101] - hp0, 100L * level, 100L * level + 3);
@@ -272,7 +272,6 @@ public sealed class SeasonTalentTests
             Assert.Equal(50 - 10 * level, bagChange.PackInfo[1].Inc.Items.Values
                 .Single(v => v.Inc?.Stack == 50 - 10 * level).Inc.Stack);
             var talentChange = DBSeasonTalentIncrement.Parser.ParseFrom(packets.Single(e => e.IsGame(SeasonTalentService.TalentSync)).Body);
-            Assert.Equal(level, talentChange.Plan[0].Inc.TalentNodes[Root].Inc.CurrentLevel);
             Assert.Equal(level, talentChange.TalentNodes[Root].Inc.CurrentLevel);
             var changedStats = OnePropertyChange.Parser.ParseFrom(packets.Single(e => e.IsGame(CharacterService.OnePropertyChange)).Body);
             Assert.Equal(fixture.Character.Stats(fixture.Session)[101],
@@ -284,9 +283,11 @@ public sealed class SeasonTalentTests
 
         await alice.SendGameAsync(SeasonTalentService.SetPlan, new SeasonTalentSetCurPlanReq { PlanId = 1 });
         Assert.Equal(0, (await Next(alice, SeasonTalentService.SetPlan, SeasonTalentSetCurPlanResp.Parser)).Result);
-        Assert.Equal(0, fixture.Session.SeasonTalent!.Plan[1].TalentNodes[Root].CurrentLevel);
-        Assert.Equal(hp0, fixture.Character.Stats(fixture.Session)[101]);
-        Assert.Equal(ErrorCodes.TalentLocked, await Upgrade(alice, Child));
+        // Bought levels are shared by every plan (the official save keeps them in the global map): switching only
+        // changes the profession choices, so the character's totals stay put.
+        Assert.Equal(3, fixture.Session.SeasonTalent!.TalentNodes[Root].CurrentLevel);
+        Assert.Equal(hp3, fixture.Character.Stats(fixture.Session)[101]);
+        Assert.Equal(1, fixture.Session.SeasonTalent.CurPlanId);
         await alice.SendGameAsync(SeasonTalentService.SetPlan, new SeasonTalentSetCurPlanReq { PlanId = 0 });
         Assert.Equal(ErrorCodes.Cooldown, (await Next(alice, SeasonTalentService.SetPlan, SeasonTalentSetCurPlanResp.Parser)).Result);
         await alice.SendGameAsync(SeasonTalentService.RenamePlan, new SeasonTalentSetPlanNameReq { PlanId = 1, PlanName = "Second" });
@@ -300,8 +301,7 @@ public sealed class SeasonTalentTests
         await using var again = await fixture.InWorld("Alice", create: false);
         var saved = await Next(again, SeasonTalentService.TalentSync, DBSeasonTalentIncrement.Parser);
         Assert.True(saved.SyncAllMark);
-        Assert.Equal(3, saved.Plan[0].All.TalentNodes[Root].CurrentLevel);
-        Assert.Equal(0, saved.Plan[1].All.TalentNodes[Root].CurrentLevel);
+        Assert.Equal(3, saved.TalentNodes[Root].All.CurrentLevel);
         Assert.Equal("Second", saved.Plan[1].All.PlanName);
         Assert.Equal(hp3, fixture.Character.Stats(fixture.Session)[101]);
     }
@@ -363,7 +363,7 @@ public sealed class SeasonTalentTests
             .Any(m => m.Property.Propertys.Any(p => p.PropertyId == 1330 && p.Data == 0));
         for (int i = 0; i < 250 && !Cleared(); i++) await Task.Delay(20);
         Assert.True(Cleared());
-        Assert.Equal(1, fixture.Session.SeasonTalent!.Plan[0].TalentNodes[Root].CurrentLevel); // durable during gate loss
+        Assert.Equal(1, fixture.Session.SeasonTalent!.TalentNodes[Root].CurrentLevel); // durable during gate loss
         await fixture.Gm("alice", "!job 1100");
         Assert.Equal(10, fixture.Character.Stats(fixture.Session)[1330]);
     }
@@ -384,8 +384,8 @@ public sealed class SeasonTalentTests
         long generic = fixture.Character.Stats(fixture.Session)[101];
         await alice.SendGameAsync(SeasonTalentService.SetPlan, new SeasonTalentSetCurPlanReq { PlanId = 1 });
         Assert.Equal(0, (await Next(alice, SeasonTalentService.SetPlan, SeasonTalentSetCurPlanResp.Parser)).Result);
-        long empty = fixture.Character.Stats(fixture.Session)[101];
-        Assert.InRange(generic - empty, 100, 103);
+        // Bought levels live in the shared map (the official save's shape), so a plan switch keeps them.
+        Assert.Equal(generic, fixture.Character.Stats(fixture.Session)[101]);
     }
 
     [ClientDataFact]
@@ -404,12 +404,10 @@ public sealed class SeasonTalentTests
         Assert.Equal(0, fixture.Character.CountOf(fixture.Session, 1250901));
         Assert.Equal(1, fixture.Session.SeasonTalent.BattleOathLevel);
         Assert.Equal(1, fixture.Session.SeasonTalent.TalentNodes[10100000].CurrentLevel);
-        Assert.All(fixture.Session.SeasonTalent.Plan.Values, p => Assert.Equal(1, p.TalentNodes[10100000].CurrentLevel));
         Assert.Equal(10, fixture.Character.Stats(fixture.Session)[1330]);
         Assert.Equal(10, fixture.Character.Stats(fixture.Session)[1331]);
         await alice.SendGameAsync(SeasonTalentService.SetPlan, new SeasonTalentSetCurPlanReq { PlanId = 1 });
         Assert.Equal(0, (await Next(alice, SeasonTalentService.SetPlan, SeasonTalentSetCurPlanResp.Parser)).Result);
-        Assert.Equal(1, fixture.Session.SeasonTalent.Plan[1].TalentNodes[10100000].CurrentLevel);
         Assert.Equal(10, fixture.Character.Stats(fixture.Session)[1330]);
         await alice.DisposeAsync();
 
@@ -417,7 +415,6 @@ public sealed class SeasonTalentTests
         var full = await Next(again, SeasonTalentService.TalentSync, DBSeasonTalentIncrement.Parser);
         Assert.Equal(1, full.BattleOathLevel);
         Assert.Equal(1, full.TalentNodes[10100000].All.CurrentLevel);
-        Assert.All(full.Plan.Values, p => Assert.Equal(1, p.All.TalentNodes[10100000].CurrentLevel));
         Assert.Equal(1, full.CurPlanId);
     }
 
@@ -450,7 +447,7 @@ public sealed class SeasonTalentTests
                 BEGIN SELECT RAISE(ABORT, 'deliberate talent write failure'); END;
                 """);
         Assert.Equal(ErrorCodes.Unknown, await Upgrade(alice, Root));
-        Assert.Equal(0, fixture.Session.SeasonTalent!.Plan[0].TalentNodes[Root].CurrentLevel);
+        Assert.Equal(0, fixture.Session.SeasonTalent!.TalentNodes[Root].CurrentLevel);
         Assert.Equal(50, fixture.Character.CountOf(fixture.Session, Remnant));
         Assert.Equal(500, fixture.Character.CountOf(fixture.Session, MintedCoin));
         await alice.SendGameAsync(SeasonTalentService.SetPlan, new SeasonTalentSetCurPlanReq { PlanId = 1 });
@@ -505,7 +502,7 @@ public sealed class SeasonTalentTests
             leg.Asset.Id == Remnant && leg.Delta == -10);
         Assert.Contains(window.Legs, leg => leg.Kind == EconomyLegKind.Sink &&
             leg.Asset.Id == MintedCoin && leg.Delta == -100);
-        Assert.Equal(1, fixture.Session.SeasonTalent!.Plan[0].TalentNodes[Root].CurrentLevel);
+        Assert.Equal(1, fixture.Session.SeasonTalent!.TalentNodes[Root].CurrentLevel);
         Assert.Equal(40, fixture.Character.CountOf(fixture.Session, Remnant));
         Assert.Equal(400, fixture.Character.CountOf(fixture.Session, MintedCoin));
     }

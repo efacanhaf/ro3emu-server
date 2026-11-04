@@ -184,7 +184,9 @@ public sealed partial class CharacterService
         foreach (var (id, value) in TalentAttributes?.Invoke(session) ?? []) Give(id, value);
         foreach (var provider in ExtraAttributes)
         {
-            _attributeSource = "extra:" + (provider.Method.DeclaringType?.Name ?? "?");
+            // The declaring type names the owner; the method keeps two providers of one service apart (passives vs a
+            // resonance, food vs a mount) so the diagnostic table can name the exact source.
+            _attributeSource = "extra:" + (provider.Method.DeclaringType?.Name ?? "?") + "." + provider.Method.Name;
             foreach (var (id, value) in provider(session)) Give(id, value);
         }
         _attributeSource = "pontos";
@@ -202,7 +204,11 @@ public sealed partial class CharacterService
         for (int stat = 1; stat <= 6; stat++)
         {
             if (data.Row("AttributeConversionConfig", stat) is not { } conversion) continue;
-            foreach (var (id, perPoint) in GameData.Pairs(conversion, ranged ? "_kAttribute2" : "_kAttribute1")) Add(id, perPoint * baseStats[stat - 1]);
+            // (official evidence) each conversion instance contributes its whole part only: the naked official's HIT 1
+            // (DEX 1 -> [[109,1]] + [[109,0.5]]), FLEE 1 and RESP 135 (INT 1 -> [[108,0.2]]) show the fraction dropped per
+            // row, while the level line, gear and talents keep theirs.
+            foreach (var (id, perPoint) in GameData.Pairs(conversion, ranged ? "_kAttribute2" : "_kAttribute1"))
+                Add(id, Math.Floor(perPoint * baseStats[stat - 1]));
         }
         _attributeSource = "outros";
     }

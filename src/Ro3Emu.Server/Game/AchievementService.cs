@@ -55,7 +55,7 @@ public sealed class AchievementService : IGameTicker
 
     private const long StarAttr = 502;               // card stars (CardService.StarUpAsync)
     private const int StuntKey = EquipmentAffixes.SpecialKey, StuntSlots = EquipmentAffixes.SpecialSlots;
-    private const long TalentOathNode = 10100000;    // battle oath, not a plan talent (SeasonTalentService)
+    private const long TalentOathNode = 10100000;    // battle oath, not a plan talent (SeasonTalentService.TotalLevel excludes it)
     /// <summary>Hook-marked roles are probed every 250 ms; every role is also probed once per 20 ticks (5 s).</summary>
     private static readonly TimeSpan ProbeEvery = TimeSpan.FromMilliseconds(250);
     private const int SweepSlices = 20;
@@ -344,7 +344,7 @@ public sealed class AchievementService : IGameTicker
                 return s.Items.Any(i => IsCard(i.Entry) && (i.Attrs?.GetValueOrDefault((int)StarAttr) ?? 0) >= t[2]) ? r : 0;
             case CTalentLevel: // total level of the active talent plan, battle oath excluded
                 if (s.SeasonTalent is not { } talent || !talent.Plan.TryGetValue(talent.CurPlanId, out var plan)) return null;
-                return plan.TalentNodes.Where(kv => kv.Key != TalentOathNode).Sum(kv => Math.Max(0, kv.Value.CurrentLevel));
+                return SeasonTalentService.TotalLevel(talent, plan, _data, includeOath: false);
             case CEmblemQuality: // [quality, n]: Soul Echoes of quality >= p1 in the active plan
                 if (!s.Emblems.Plans.TryGetValue(s.Emblems.CurrentPlan, out var emblems)) return 0;
                 return emblems.Slots.Values.Count(guid => s.Items.FirstOrDefault(i => i.Guid == guid) is { } item && Quality(item.Entry) >= t[1]);

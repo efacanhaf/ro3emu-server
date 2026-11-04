@@ -64,7 +64,7 @@ public sealed class ProfessionTalentChoiceTests
             Session.Tasks ??= new DBTaskInfo();
             Session.Tasks.CompleteTaskNum[10101170] = 1;
             Session.Tasks.CompleteTaskNum[10103160] = 1;
-            Session.SeasonTalent!.Plan[0].TalentNodes[1].CurrentLevel = parentPurchased ? 1 : 0;
+            Session.SeasonTalent!.TalentNodes[1].CurrentLevel = parentPurchased ? 1 : 0;
             await Talents.SyncAsync(Session);
         });
 
@@ -94,7 +94,8 @@ public sealed class ProfessionTalentChoiceTests
         await f.Start();
         await using var bot = await f.Host.InWorldAsync("Choice");
         await f.Unlock();
-        Assert.False(f.Session.SeasonTalent!.UnlockedNode[4]); // the old handler refused here
+        Assert.True(f.Session.SeasonTalent!.UnlockedNode[4]); // the bought gate opens its branch and every option
+        Assert.True(f.Session.SeasonTalent.UnlockedNode[7]); // (official evidence) siblings are offered, not only the pick
         Assert.False(f.Session.SeasonTalent.UnlockedTrees[20]); // node 1 alone: total Talent Lv 1 of 2
         Assert.Equal(0, await Choose(bot, 11)); // an unrelated choice must survive replacements
         Assert.Equal(0, await Choose(bot, 4));

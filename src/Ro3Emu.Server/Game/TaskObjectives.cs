@@ -283,7 +283,7 @@ public sealed partial class TaskService
                 : s.EquipLevels.Refine.GetValueOrDefault((int)t[1]),
             // The active plan's purchased talent levels (the Battle Oath is its own track).
             TTalentLevels => s.SeasonTalent is { } talent && talent.Plan.TryGetValue(talent.CurPlanId, out var plan)
-                ? plan.TalentNodes.Values.Sum(n => n.CurrentLevel) : 0,
+                ? SeasonTalentService.TotalLevel(talent, plan, _data, includeOath: false) : 0,
             TPetsDeployed => s.Pets?.SetupPlans.GetValueOrDefault(s.Pets.CurrentPlan)?.SetUpPets.Values.LongCount(id => id != 0) ?? 0,
             TTowerFloor or TTowerFloorReached => s.Tower is { LayerConfID: > 0 } tower && _data.Table("PetFloorConfig").Values
                 .FirstOrDefault(r => GameData.Int(r, "_iID") == tower.LayerConfID) is { ValueKind: JsonValueKind.Object } floor

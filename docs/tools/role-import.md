@@ -81,7 +81,7 @@ Role row (`role` table):
 | `hair` | `DBPERSONALINFO` current plan's `kAppearances[7]` |
 | `stats` | `BASEATTRINFO.allPlanBaseProperty[curPlanIndex].baseProperty[1..6]`, the order STR/AGI/VIT/INT/DEX/LUK |
 | `bonus_points` | see "stat points" below |
-| `skills` | the LEARNED set: `DBSKILLDATA.skillList`, each group at its highest level in any plan (1 for a learned command skill) |
+| `skills` | the LEARNED set: `DBSKILLDATA.skillAssignPlans[currentPlanIndex]`, each group at that plan's level (1 for a command skill the plan lacks) |
 | `skill_bar` | that plan's `manualLoadSkill`, `slot:group`, empty slots omitted |
 | `paragon_level`, `paragon_exp` | `DBPARAGONLEVEL.lv` / `.exp` |
 | `currency` | `DBITEMSINFO.currency`, `id:amount` |
@@ -188,13 +188,13 @@ in the tool's output and dropped rather than pointed at a dangling guid.
 
 ## Learned skills, the "Fila" tab and the skill bar
 
-`role.skills` is the character's LEARNED set: the **union of the five plans' assignments**, each group at
-its highest level (Escudada is 5 because the Tank plan assigns it, even when the DPS plan does not). The
-plans are loadouts of the same learned set, so a group no plan assigns is NOT learned — even though
-`DBSkillData.skillList` lists it (that list holds every skill that EXISTS for the character: the
-reference one lists 56 groups, of which 6 have no points anywhere in the plans and the client paints them
-"Não aprendida": 11003, 11403, 11404, 11414, 11415, 11501). Only the system/command groups the client
-shows without points are granted, at their `SkillConfig._iInitialLevel` (`_iSystemType` 6, the queue
+`role.skills` is the character's LEARNED set: the **active skill plan's assignments** (`currentPlanIndex`
+is positional, so index 2 is the third plan). The client's skill window and the passives' stats both read
+that plan, and the official evidence for it is direct: the naked reference character's holy resistance (317)
+is 20, which is skill 11417 at level 1 — the level the third plan assigns while another plan has 6 and the
+rest none; the union of the plans gave 120. `DBSkillData.skillList` is not the learned set (it lists every
+skill that EXISTS for the character: 53 groups here, most with no points). Only the system/command groups
+the client shows without points are added, at their `SkillConfig._iInitialLevel` (`_iSystemType` 6, the queue
 command 11600 «Skill Bar»).
 
 That was a real copy gap with a visible symptom: `lc_skillgrowthhelper:GetHasSkillQueue` shows the
@@ -211,11 +211,8 @@ sends it the way it already sends a card-granted skill:
 
 Both are projections of data the role owns; no combat rule changes. Verified live on the reference
 replica: the "Fila" tab appears, its queue shows Bloqueio Nv.5 / Escudo Reflexo Nv.1 / Canto Santo Nv.10
-(the official screenshot), Providência and Escudo Luz read "Não aprendida", the skill window keeps the
-tree levels the other plans gave (Escudada 5/5), and `skillWheel.whellSkills[7].skillConfigId = 1160001`
-like the official. One entry stays off by one state: Encolher shows Nv.1 because some plan assigns it at
-level 1 while the official client paints it unlearned — the character's own skill-point ledger is not in
-the export, so it cannot be derived from the snapshot.
+(the official screenshot), the skills the active plan does not assign read "Não aprendida" (Providência,
+Escudo Luz, Escudada...), and `skillWheel.whellSkills[7].skillConfigId = 1160001` like the official.
 
 **Wheel modes (the enhanced skill variants).** `SkillConfig` holds the same skill in several `_iMode`
 rows: mode 0 is the base (1160710, damage 21000) and modes 1/5 are the enhanced variants the client puts
@@ -250,37 +247,41 @@ emulator does not implement (no table in the client's export carries it).
 
 ## Season talents: the two projections
 
-`DBSEASONTALENT` stores the same progression twice and the client and the server read opposite copies:
+`DBSEASONTALENT` stores two disjoint halves, and the client's map is their union:
 
-- the **global** `talentNodes` map is the BOUGHT level of every node (up to its max — 3-4 and 10 in the
-  reference character, 69 nonzero nodes, sum 598);
-- the five `plan`s only SELECT nodes (level 1, 15 in the DPS/Tank plans);
-- `unlockedTrees` (6), `unlockedNode` (134), `battleOathMaxLevel` (20) and each node's `isActivated` are
-  projections the client shows.
+- the **global** `talentNodes` map is the BOUGHT level of every ordinary node (`_iType` 1/2) and of the
+  battle oath (4) — 167 nodes, 69 nonzero, sum 601 in the reference character;
+- each of the five `plan`s holds only the profession choices (`_iType` 5 SkillPoint gate, 6 Profession_L,
+  7 Profession_M) — 65 nodes per plan, at level 1 when that plan picked them; the reference character's
+  plans 0/1 have 15 picked, the active plan (2) none;
+- `unlockedTrees` (6), `unlockedNode` (134), `battleOathMaxLevel` (20) and `isActivated` are projections the
+  server sends and the client shows as-is (`LC_DAL_SeasonTalent._processAllHandler` overlays the active plan
+  on the global map; `UI_Sys_Skill_SeasonTalentPanelCtrl._refreshGrade` sums that map except the SkillPoint
+  gates).
 
-`SeasonTalentService.TalentLevel` sums the **active plan** and compares that grade with every tree's and
-node's `_iNeedLevel`, then rebuilds the trees, the unlocked set, the global map (max across plans) and the
-oath cap on every login. Importing both projections untouched therefore landed a grade of 15, ONE unlocked
-tree and an inert node set — the talents existed but gave nothing (`Replica` lesson: the HP difference
-Eduardo noticed was mostly this).
+`SeasonTalentService` keeps that split: purchases go to the global map, choices to the active plan, `Seed`
+moves anything an older save put in the other map, and the grade is the effective map's sum. Activation
+walks the graph in tiers: an ordinary node (and a gate) opens with a maxed parent — the highest level of
+that parent in ANY map counts, because the choice belongs to the character — a Profession_L opens with its
+gate active and a Profession_M with its branch active; the oath opens with its cap. `ParentMaxed`-only
+activation missed the 60 branch/option nodes of the opened gates, and a union-of-plans grade gave the wrong
+total; both are gone.
 
-`CharacterPlan.BuildSeasonTalent` copies the bought level into every plan node (keeping a plan's own
-selection where the global map has none). The login recompute then reproduces the official state:
-six trees, the battle oath 4/20, the global map at the bought levels (max 10) and the activated set.
-Verified live on the reference replica:
+`CharacterPlan.BuildSeasonTalent` now writes the official blob **untouched**. The login recompute
+reproduces it exactly (measured on the reference replica, `DBSEASONTALENT` dumped from the client):
 
 | point | official | local |
 |---|---|---|
 | unlocked trees | 6 (10101-10106) | 6 (10101-10106) |
 | battle oath (level / cap) | 4 / 20 | 4 / 20 |
-| global map (nodes / sum / max) | 167 / 598 / 10 | 232 / 619 / 10 |
-| activated nodes | 134 | 104 |
+| global map (nodes / nonzero / sum) | 167 / 69 / 601 | 167 / 69 / 601 |
+| per-node levels | — | identical |
+| activated nodes | 134 | 134 (same set) |
+| plan levels | — | identical |
 
-The 232 vs 167 and 619 vs 598 come from the server's own normalisation: it seeds every configured node
-and adds the plan selections (15 nodes at level 1) on top of the bought map. The 30 nodes that stay
-inactive are all `_iType` 7 and have **no attribute rows**: they change the tree's look, not the stats.
-The derived numbers moved accordingly: HP 70 820 -> 113 691, ATK 2 320 -> 2 703, DEF 754 -> 891,
-MDEF 803 -> 940, MATK 1 375 -> 1 636, and ASPD/ASPD base/cast speed/res-crit now match the official.
+The talent part of the sheet is therefore identical too: `!attrsrc` attributes 13 000 HP, 260 ATK/MATK,
+130 DEF/MDEF, 300 res-crit, 150 ASPD/cast and 3 770 per_maxhp to the talents, and the naked sheet matches
+the official on every attribute (see "Derived numbers" below).
 
 ## Quests, guides and the functions they open
 Quest progress IS copied: `DBTASKINFO` goes into `role.tasks` and `DBGUIDEINFO` into `role.guides`. This
@@ -373,14 +374,18 @@ second import behave like the first:
   official dump by construction even when the inputs are identical.
 - One instance occupies one equipment grid: the official client can list the same two-handed weapon in
   grids 1 and 2 of a plan, the server writes it in grid 1 and rebuilds the active plan on login.
-- **Derived numbers: the talents were the big part; the rest is a rule gap.** After the client mirror, the
-  data re-export and the talent fix the stored data is equal and the talent effects land: HP 113 691 against
-  151 379, SP 1 359 against 7 579, ATK 2 703 / 3 652, MATK 1 636 / 2 373, DEF 891 / 1 335, MDEF 940 / 1 383,
-  while ASPD, ASPD base, cast speed and res-crit match exactly. `!attrsrc` (above) attributes every local
-  number to its source and each source equals its own configuration, so the residual is not a missing row:
-  the client's exported tables carry no source for it (no talent, skill, card, echo, pet, mount, entry,
-  enchantment, conversion or buff row gives it; the mount's riding buffs 1131601/1163901 have no attribute
-  changes). Naming the rule needs the official server's side, not another import.
+- **Derived numbers: the naked reference character now matches.** Re-imported from a snapshot taken with the
+  official character UNEQUIPPED (no gear, cards or Soul Echoes), the sheet is equal on every attribute —
+  HP 31 491, SP 1 359, MATK 463, HIT/FLEE 1/1, RESP 135, per_maxhp 4 045, CRIT 21, res-crit 300, ASPD/ASPD
+  base/cast 222/322/202, PVP dmg/be-dmg 705/475, per_treat/per_dmg/per_res_dmg 0, ele_reduce 0, holy resist
+  20. Three rows stay exactly the official minus one buff: the snapshot was taken with `1162701` active
+  (+10 ATK, +10 DEF, +10 MDEF, `_iTime` 0), a buff no exported table produces and no message carries, so the
+  import cannot bring it. The commands that got there, all from official evidence rather than inference:
+  pets read the star's base row (`PetStarConfig._iStage 0`, which is where `_kCollectAttr`/`_kFightSkill`
+  live — reading the star-progress row silently dropped +380 HP, +19 ATK/MATK and +190 PVP each way),
+  passives use the ACTIVE skill plan's levels (no union), and each conversion row contributes its whole part
+  (`Math.Floor`: the official HIT 1 / FLEE 1 / RESP 135 against 2 / 2 / 136).
+
 - The local client installation may be older than the official launcher's (`C:\Games\ROO_PC` vs
   `C:\Program Files\Genesis Launcher\ROO_PC`). A dataset the local client does not know travels as an
   unknown field and is ignored by the client, not by the server.

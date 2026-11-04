@@ -9,13 +9,17 @@ namespace Ro3Emu.Server.Game;
 
 /// <summary>
 /// Season talents: 5050 is the durable global/plan view; 83550 pays the next
-/// SeasonTalentEffectConfig level, 83552 selects a plan, 83553 renames one. The original server's path and
-/// plan policies are not captured: active-plan max-parent activation, five zero-based plans, and active-plan
-/// total levels for tree thresholds are inferred from the client graph and PublicParamConfig.SchemeNum=5.
+/// SeasonTalentEffectConfig level, 83552 selects a plan, 83553 renames one. The official client's own save
+/// (DBSEASONTALENT exported from the live game) shows the split this service keeps: the bought levels of the
+/// ordinary nodes (types 1/2) and the battle oath (4) live in the top-level <c>talentNodes</c> map, and the five
+/// plans hold only the profession-choice members (SkillPoint 5, Profession_L 6, Profession_M 7). The maps are
+/// disjoint, so the client's "current plan over the global map" overlay (LC_DAL_SeasonTalent._processAllHandler)
+/// is simply their union. Five zero-based plans come from PublicParamConfig.SchemeNum=5.
 /// </summary>
 public sealed partial class SeasonTalentService
 {
     public const uint TalentSync = 5050, Upgrade = 83550, SetPlan = 83552, RenamePlan = 83553;
+    internal const long OathNode = 10100000;
     private const long TalentFunction = 1003, ParentFunction = 10, TalentTask = 10103160, ParentTask = 10101170;
     // (inferred) server-side limits: five zero-based plans, eight Unicode scalars, three-second switch cooldown.
     private const int PlanCount = 5, NameMaxRunes = 8, SwitchCooldownSeconds = 3;
@@ -105,15 +109,43 @@ public sealed partial class SeasonTalentService
         && books.EnumerateArray().Any(v => GameData.Number(v) == _seasons.PlayBook);
     private bool Applies(TalentTree tree) => tree.Books.Any(book => book == _seasons.PlayBook);
 
+    /// <summary>
+    /// The official split (see the class comment): every configured node is seeded into the map that owns it —
+    /// choice members into each plan, ordinary nodes and the battle oath into the global map — and entries that
+    /// an older save put in the other map are dropped, so a login normalises to the shape the client exports.
+    /// </summary>
     private void Seed(DBSeasonTalent state)
     {
         // (inferred) plan keys 0..4, default 0: the client labels a key by key+1 (LC_DAL_SeasonTalent.GetPlanNameByPlan).
         if (state.CurPlanId is < 0 or >= PlanCount) state.CurPlanId = 0;
         for (int planId = 0; planId < PlanCount; planId++)
+            if (!state.Plan.TryGetValue(planId, out _))
+                state.Plan[planId] = new SeasonTalentPlan();
+        var nodes = Nodes();
+        foreach (var node in nodes)
         {
-            if (!state.Plan.TryGetValue(planId, out var plan)) state.Plan[planId] = plan = new SeasonTalentPlan();
-            foreach (var node in Nodes())
-                if (!plan.TalentNodes.ContainsKey(node.Id)) plan.TalentNodes[node.Id] = new DBSeasonTalentNode { TalentId = node.Id };
+            if (IsChoice(node.Type))
+            {
+                // Choice members belong to the plans; a global entry would be a stale duplicate of a plan's level.
+                state.TalentNodes.Remove(node.Id);
+            }
+            else if (!state.TalentNodes.ContainsKey(node.Id))
+                state.TalentNodes[node.Id] = new DBSeasonTalentNode { TalentId = node.Id };
+            foreach (var plan in state.Plan.Values)
+            {
+                if (IsChoice(node.Type))
+                {
+                    if (!plan.TalentNodes.ContainsKey(node.Id))
+                        plan.TalentNodes[node.Id] = new DBSeasonTalentNode { TalentId = node.Id };
+                }
+                else if (plan.TalentNodes.TryGetValue(node.Id, out var moved))
+                {
+                    // A save written before the official shape kept bought levels in the plans: move them across.
+                    if (moved.CurrentLevel > state.TalentNodes[node.Id].CurrentLevel)
+                        state.TalentNodes[node.Id].CurrentLevel = moved.CurrentLevel;
+                    plan.TalentNodes.Remove(node.Id);
+                }
+            }
         }
     }
 
@@ -122,8 +154,7 @@ public sealed partial class SeasonTalentService
         var state = candidate ?? s.SeasonTalent!;
         s.TalentEffectsEnabled = Available(s);
         Seed(state);
-        var active = state.Plan[state.CurPlanId];
-        long total = TalentLevel(state, active);
+        long total = TalentLevel(state);
         state.UnlockedTrees.Clear();
         long? oathMax = null;
         foreach (var tree in Trees())
@@ -140,27 +171,52 @@ public sealed partial class SeasonTalentService
         // rebuild both maps several times: ~22% of the loop's allocations in a login storm); entries of nodes the
         // table no longer has are dropped as the old clear did.
         var nodes = Nodes();
+        // Activation follows the graph in tiers: an ordinary node opens from a maxed parent (a choice recorded by any
+        // plan counts), a SkillPoint gate from its own maxed parent, and the branch/option members from the tier that
+        // owns them. (official evidence) the client's own save has all 134 nodes reachable that way active — every
+        // branch and option of an opened gate, not only the picked one — while the nodes below an unmaxed parent stay
+        // closed, so the tiers are what decides.
+        var activated = new HashSet<long>();
+        for (bool changed = true; changed;)
+        {
+            changed = false;
+            foreach (var node in nodes)
+            {
+                if (activated.Contains(node.Id) || !state.UnlockedTrees.GetValueOrDefault(node.Tree)) continue;
+                bool opens = node.Type == PvpNodeType ? state.BattleOathMaxLevel > 0
+                    : node.Start || TierOpen(state, node, activated);
+                if (opens && activated.Add(node.Id)) changed = true;
+            }
+        }
         var plans = state.Plan.Values.ToArray(); // once, not two map views and enumerators per node
         foreach (var node in nodes)
         {
-            long id = node.Id, tree = node.Tree;
+            long id = node.Id;
             bool pvp = node.Type == PvpNodeType;
-            bool activated = state.UnlockedTrees.GetValueOrDefault(tree) && (pvp
-                ? state.BattleOathMaxLevel > 0 : total >= node.NeedLevel
-                    && (node.Start || ParentMaxed(active, id, tree)));
-            state.UnlockedNode[id] = activated;
-            // (inferred) the global node view exposes highest paid level across plans; selected-plan levels remain separate.
-            long level = 0;
-            if (pvp) level = state.BattleOathLevel;
-            else foreach (var p in plans) if (p.TalentNodes.TryGetValue(id, out var n) && n.CurrentLevel > level) level = n.CurrentLevel;
-            if (state.TalentNodes.TryGetValue(id, out var global)) { global.TalentId = id; global.CurrentLevel = level; global.IsActivated = activated; }
-            else state.TalentNodes[id] = new DBSeasonTalentNode { TalentId = id, CurrentLevel = level, IsActivated = activated };
-            foreach (var plan in plans)
+            bool open = activated.Contains(id);
+            state.UnlockedNode[id] = open;
+            if (pvp && state.TalentNodes.TryGetValue(id, out var oath))
             {
-                plan.TalentNodes[id].IsActivated = activated;
-                // The DAL overlays selected plan nodes after global nodes, including the shared oath node.
-                if (pvp) plan.TalentNodes[id].CurrentLevel = state.BattleOathLevel;
+                oath.TalentId = id;
+                oath.CurrentLevel = state.BattleOathLevel; // the oath level is its own shared track
+                oath.IsActivated = open;
             }
+            else if (state.TalentNodes.TryGetValue(id, out var global))
+            {
+                global.TalentId = id;
+                global.IsActivated = open;
+                if (pvp) global.CurrentLevel = state.BattleOathLevel;
+            }
+            else if (!IsChoice(node.Type))
+                state.TalentNodes[id] = new DBSeasonTalentNode { TalentId = id, CurrentLevel = pvp ? state.BattleOathLevel : 0, IsActivated = open };
+            foreach (var plan in plans)
+                if (plan.TalentNodes.TryGetValue(id, out var selected))
+                {
+                    selected.TalentId = id;
+                    selected.IsActivated = open;
+                    // The DAL overlays selected plan nodes after global nodes, including the shared oath node.
+                    if (pvp) selected.CurrentLevel = state.BattleOathLevel;
+                }
         }
         if (state.UnlockedNode.Count != _nodeIds!.Count)
             foreach (long stale in state.UnlockedNode.Keys.Where(k => !_nodeIds.Contains(k)).ToArray()) state.UnlockedNode.Remove(stale);
@@ -168,7 +224,25 @@ public sealed partial class SeasonTalentService
             foreach (long stale in state.TalentNodes.Keys.Where(k => !_nodeIds.Contains(k)).ToArray()) state.TalentNodes.Remove(stale);
     }
 
-    private sealed record TalentNode(long Id, long Tree, long Type, long NeedLevel, bool Start);
+    private static bool IsChoice(long type) => type is ChoiceNodeType or ProfessionBranchType or ProfessionOptionType;
+
+    /// <summary>A node's level where the plan-owner keeps it: choices in the active plan, everything else globally.</summary>
+    private long LevelOf(DBSeasonTalent state, SeasonTalentPlan plan, TalentNode node) => node.Type == PvpNodeType
+        ? state.BattleOathLevel
+        : IsChoice(node.Type)
+            ? plan.TalentNodes.TryGetValue(node.Id, out var selected) ? Math.Max(0, selected.CurrentLevel) : 0
+            : Math.Max(0, state.TalentNodes.TryGetValue(node.Id, out var global) ? global.CurrentLevel : 0);
+
+    /// <summary>The highest level a node holds in any map: the global purchases plus every plan's choice.</summary>
+    private long HighestLevel(DBSeasonTalent state, long id)
+    {
+        long level = state.TalentNodes.TryGetValue(id, out var global) ? global.CurrentLevel : 0;
+        foreach (var plan in state.Plan.Values)
+            if (plan.TalentNodes.TryGetValue(id, out var choice) && choice.CurrentLevel > level) level = choice.CurrentLevel;
+        return level;
+    }
+
+    private sealed record TalentNode(long Id, long Tree, long Type, long NeedLevel, bool Start, long LevelGroup);
     private sealed record TalentTree(long Id, double?[] Books, long Condition, long NeedLevel, long PvpLimit);
 
     /// <summary>SeasonTalentTreeConfig's rows (table order), read once: a login rebuilt the unlocks several times,
@@ -181,7 +255,7 @@ public sealed partial class SeasonTalentService
     private TalentTree[]? _trees;
 
     /// <summary>SeasonTalentConfig's nodes (id &gt; 0, table order) and each node's same-tree parents with their caps,
-    /// indexed once: ParentMaxed scanned all 232 rows for every node of every rebuild.</summary>
+    /// indexed once: the activation pass scanned all 232 rows for every node of every rebuild.</summary>
     private IReadOnlyList<TalentNode> Nodes()
     {
         if (_nodes != null) return _nodes;
@@ -201,32 +275,63 @@ public sealed partial class SeasonTalentService
         }
         _parents = parents.ToDictionary(kv => kv.Key, kv => kv.Value.ToArray());
         var nodes = rows.Select(r => new TalentNode(GameData.Int(r, "_iId"), GameData.Int(r, "_iTalentTreeID"), GameData.Int(r, "_iType"),
-            GameData.Int(r, "_iNeedLevel"), GameData.Int(r, "_iIsStartPoint") == 1)).Where(n => n.Id > 0).ToArray();
+            GameData.Int(r, "_iNeedLevel"), GameData.Int(r, "_iIsStartPoint") == 1, GameData.Int(r, "_iLevelGroupId"))).Where(n => n.Id > 0).ToArray();
         _nodeIds = nodes.Select(n => n.Id).ToHashSet();
+        _nodeById = nodes.ToDictionary(n => n.Id);
         return _nodes = nodes;
     }
 
     private TalentNode[]? _nodes;
     private HashSet<long>? _nodeIds;
+    private Dictionary<long, TalentNode>? _nodeById;
     private Dictionary<(long Node, long Tree), (long Parent, long Max)[]>? _parents;
 
-    private bool ParentMaxed(SeasonTalentPlan active, long nodeId, long tree)
+    /// <summary>
+    /// Whether an activated parent opens a node: an ordinary node (and a SkillPoint gate) needs a maxed parent, a
+    /// Profession_L branch needs its gate open and a Profession_M option needs its branch open. (official evidence) the
+    /// client's own save activates every branch and option under an opened gate, not only the picked one.
+    /// </summary>
+    private bool TierOpen(DBSeasonTalent state, TalentNode node, IReadOnlySet<long> activated)
     {
         Nodes();
-        if (_parents!.TryGetValue((nodeId, tree), out var parents))
-            foreach (var (parent, max) in parents)
-                if (max > 0 && active.TalentNodes.TryGetValue(parent, out var n) && n.CurrentLevel >= max) return true;
-        return false; // (inferred) one maxed incoming parent opens a branch, never an unearned child.
+        var parents = _parents!.GetValueOrDefault((node.Id, node.Tree), []);
+        if (node.Type is ProfessionBranchType or ProfessionOptionType)
+        {
+            long wanted = node.Type == ProfessionBranchType ? ChoiceNodeType : ProfessionBranchType;
+            return parents.Any(p => activated.Contains(p.Parent) && _nodeById!.GetValueOrDefault(p.Parent)?.Type == wanted);
+        }
+        return parents.Any(p => p.Max > 0 && HighestLevel(state, p.Parent) >= p.Max);
     }
 
     /// <summary>The "total Talent Lv" a tree's or node's _iNeedLevel names: the grade the talent panel shows
-    /// (UI_Sys_Skill_SeasonTalentPanelCtrl._buildGradeNodeIDs/_refreshGrade), the sum of every node's level except the
-    /// SkillPoint nodes. The chosen Profession_L/Profession_M count, and the battle oath at its shared level. A changed
-    /// choice zeroes the old path before it sets the new one, so switching never raises the total. (inferred) The server
-    /// checks the total the client shows.</summary>
-    private long TalentLevel(DBSeasonTalent state, SeasonTalentPlan plan) => plan.TalentNodes.Sum(kv =>
-        _data.Row("SeasonTalentConfig", kv.Key) is not { } row || GameData.Int(row, "_iType") == ChoiceNodeType ? 0
-            : Math.Max(0, GameData.Int(row, "_iType") == PvpNodeType ? state.BattleOathLevel : kv.Value.CurrentLevel));
+    /// (UI_Sys_Skill_SeasonTalentPanelCtrl._buildGradeNodeIDs/_refreshGrade), the sum of the active plan's effective
+    /// map — the bought levels plus this plan's chosen Profession_L/Profession_M members — except the SkillPoint gates.
+    /// The battle oath counts at its shared level. A changed choice zeroes the old path before it sets the new one, so
+    /// switching never raises the total. (inferred) The server checks the total the client shows.</summary>
+    private long TalentLevel(DBSeasonTalent state) => state.Plan.TryGetValue(state.CurPlanId, out var plan)
+        ? TotalLevel(state, plan, _data, includeOath: true) : 0;
+
+    /// <summary>The same total for callers that only hold the durable state (achievements and task counters).</summary>
+    internal static long TotalLevel(DBSeasonTalent state, SeasonTalentPlan plan, GameData data, bool includeOath)
+    {
+        long total = 0;
+        foreach (var (id, node) in state.TalentNodes)
+        {
+            if (!includeOath && id == OathNode) continue;
+            if (data.Row("SeasonTalentConfig", id) is not { } row || GameData.Int(row, "_iType") == ChoiceNodeType) continue;
+            total += Math.Max(0, node.CurrentLevel);
+        }
+        foreach (var (id, node) in plan.TalentNodes)
+        {
+            if (id == OathNode) continue;
+            if (data.Row("SeasonTalentConfig", id) is not { } row) continue;
+            long type = GameData.Int(row, "_iType");
+            if (type == ChoiceNodeType || type == PvpNodeType) continue;
+            if (state.TalentNodes.ContainsKey(id)) continue; // the plan only overrides its own members
+            total += Math.Max(0, node.CurrentLevel);
+        }
+        return total;
+    }
 
     private JsonElement? Effect(long group, long level, int career)
     {
@@ -277,18 +382,18 @@ public sealed partial class SeasonTalentService
             if (result == 0)
             {
                 var next = s.SeasonTalent!.Clone();
+                long type = GameData.Int(_data.Row("SeasonTalentConfig", node)!.Value, "_iType");
                 if (isOath) next.BattleOathLevel++;
-                else next.Plan[next.CurPlanId].TalentNodes[node].CurrentLevel++; // (inferred) ordinary purchases belong to one plan
+                else if (IsChoice(type)) next.Plan[next.CurPlanId].TalentNodes[node].CurrentLevel++; // choice members are per plan
+                else next.TalentNodes[node].CurrentLevel++; // (official evidence) bought levels are global
                 BuildUnlocks(s, next);
+                long level = isOath ? next.BattleOathLevel
+                    : IsChoice(type) ? next.Plan[next.CurPlanId].TalentNodes[node].CurrentLevel : next.TalentNodes[node].CurrentLevel;
                 List<InvItem>? paid = null;
                 try
                 {
                     var economy = _character.ProgressionEconomy(s, "cd13c/season-talent-upgrade", cost!, [],
-                        new
-                        {
-                            Node = node, Oath = isOath, Level = isOath ? next.BattleOathLevel
-                            : next.Plan[next.CurPlanId].TalentNodes[node].CurrentLevel, Plan = next.CurPlanId
-                        });
+                        new { Node = node, Oath = isOath, Level = level, Plan = next.CurPlanId });
                     paid = await _character.ExchangeLockedAsync(s, cost!, [], popup: false, sync: false,
                         persist: tx => { tx.RoleBlob(s.Role!.Id, "season_talent", next.ToByteArray()); tx.WithEconomy(economy); },
                         committed: () => s.SeasonTalent = next, asyncCommit: true);
@@ -321,7 +426,10 @@ public sealed partial class SeasonTalentService
         var state = s.SeasonTalent;
         if (!state.UnlockedNode.GetValueOrDefault(id)) return ErrorCodes.TalentLocked;
         oath = GameData.Int(row, "_iType") == PvpNodeType;
-        long current = oath ? state.BattleOathLevel : state.Plan[state.CurPlanId].TalentNodes[id].CurrentLevel;
+        bool choice = IsChoice(GameData.Int(row, "_iType"));
+        long current = oath ? state.BattleOathLevel
+            : choice ? state.Plan[state.CurPlanId].TalentNodes[id].CurrentLevel
+            : state.TalentNodes.TryGetValue(id, out var bought) ? bought.CurrentLevel : 0;
         long cap = oath ? state.BattleOathMaxLevel : GameData.Int(row, "_iMaxLevel");
         if (cap <= 0 || current >= cap) return ErrorCodes.SkillMaxLevel;
         long group = GameData.Int(row, "_iLevelGroupId");
@@ -412,30 +520,26 @@ public sealed partial class SeasonTalentService
         }
     }
 
-    /// <summary>The active plan's SeasonTalentEffectConfig rows at their bought levels, and the oath's at its level.</summary>
+    /// <summary>
+    /// The active plan's effective map at their bought levels — the global purchases and the plan's chosen
+    /// Profession_L/Profession_M members, exactly the levels the client's overlay shows (LC_DAL_SeasonTalent) — plus
+    /// the oath's row at its shared level. Only nodes the client draws as activated contribute.
+    /// </summary>
     private IEnumerable<JsonElement> ActiveEffects(GameSession s)
     {
         if (!Available(s) || s.SeasonTalent is not { } state || s.Progress == null
             || !state.Plan.TryGetValue(state.CurPlanId, out var plan)) yield break;
-        long total = TalentLevel(state, plan);
-        foreach (var (id, saved) in plan.TalentNodes)
+        foreach (var node in Nodes())
         {
-            if (id == 10100000 || saved.CurrentLevel <= 0 || _data.Row("SeasonTalentConfig", id) is not { } node) continue;
-            if (!TreeEligible(s, GameData.Int(node, "_iTalentTreeID"), total)
-                || total < GameData.Int(node, "_iNeedLevel")
-                || (GameData.Int(node, "_iIsStartPoint") != 1
-                    && !ParentMaxed(plan, id, GameData.Int(node, "_iTalentTreeID")))) continue;
-            if (Effect(GameData.Int(node, "_iLevelGroupId"), saved.CurrentLevel, s.Progress.Career) is { } row) yield return row;
+            if (node.Id == OathNode || !state.UnlockedNode.GetValueOrDefault(node.Id)) continue;
+            long level = LevelOf(state, plan, node);
+            if (level <= 0 || node.LevelGroup <= 0) continue;
+            if (Effect(node.LevelGroup, level, s.Progress.Career) is { } row) yield return row;
         }
-        if (state.BattleOathLevel > 0 && _data.Row("SeasonTalentConfig", 10100000) is { } oath
-            && TreeEligible(s, GameData.Int(oath, "_iTalentTreeID"), total)
+        if (state.BattleOathLevel > 0 && state.UnlockedNode.GetValueOrDefault(OathNode)
+            && _data.Row("SeasonTalentConfig", OathNode) is { } oath
             && Effect(GameData.Int(oath, "_iLevelGroupId"), state.BattleOathLevel, s.Progress.Career) is { } oathRow)
             yield return oathRow;
     }
-
-    private bool TreeEligible(GameSession s, long treeId, long total) =>
-        _data.Row("SeasonTalentTreeConfig", treeId) is { } tree && Applies(tree)
-        && _functions.ConditionMet(s, GameData.Int(tree, "_iTreeCondition"))
-        && total >= GameData.Int(tree, "_iNeedLevel");
 
 }

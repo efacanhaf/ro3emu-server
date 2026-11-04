@@ -272,38 +272,19 @@ public sealed class CharacterPlan
     }
 
     /// <summary>
-    /// The talent levels are stored in two projections and the server reads the other one.
-    ///
-    /// Official: `talentNodes` (the top-level map) carries the BOUGHT level of every node (up to its max, 3-4 and 10
-    /// in the reference data) and the five `plan`s only SELECT nodes (level 1). The server's
-    /// `SeasonTalentService.TalentLevel` sums the ACTIVE PLAN's levels and compares that total with each tree's and
-    /// node's `_iNeedLevel` (the grade the panel shows), then it rebuilds `unlockedTrees`, `unlockedNode`, the global
-    /// map and `battleOathMaxLevel` from it on every login — so importing the two projections untouched landed a
-    /// grade of 15, one unlocked tree and an inert node set.
-    ///
-    /// This copies the bought level into every plan node (keeping a plan's own selection when the global map has
-    /// none), which is what makes the login recompute reproduce the official state: grade ≈ the official global sum,
-    /// six trees, the battle oath cap and the activated nodes.
+    /// The official client's own DBSEASONTALENT is imported as-is. Its shape is the rule SeasonTalentService keeps:
+    /// <c>talentNodes</c> (the top-level map) carries the bought level of every ordinary node (types 1/2) and the battle
+    /// oath, while each of the five <c>plan</c>s holds only the profession-choice members (SkillPoint, Profession_L,
+    /// Profession_M). The server derives that split again on every login (Seed moves anything an older save put in the
+    /// other map), so the imported blob lands untouched.
     /// </summary>
     private void BuildSeasonTalent()
     {
         if (!_snapshot.TryMessage("DBSEASONTALENT", out var json)) { _notes.Add("season_talent: no DBSEASONTALENT in the snapshot"); return; }
         var full = (DBSeasonTalent)ProtoJson.Parse(DBSeasonTalent.Descriptor, json);
-        long grade = 0;
-        foreach (var plan in full.Plan.Values)
-        {
-            foreach (var (id, bought) in full.TalentNodes)
-                plan.TalentNodes[id] = new DBSeasonTalentNode
-                {
-                    TalentId = id,
-                    CurrentLevel = Math.Max(plan.TalentNodes.GetValueOrDefault(id)?.CurrentLevel ?? 0, bought.CurrentLevel),
-                    IsActivated = bought.IsActivated,
-                };
-            grade = Math.Max(grade, plan.TalentNodes.Values.Sum(node => (long)node.CurrentLevel));
-        }
         Blobs["season_talent"] = full.ToByteArray();
-        _notes.Add($"season_talent: bought levels copied into the plans (grade {grade}, {full.UnlockedTrees.Count} trees, " +
-            $"oath {full.BattleOathLevel}/{full.BattleOathMaxLevel} in the snapshot)");
+        _notes.Add($"season_talent: imported as-is ({full.TalentNodes.Count} global nodes, {full.Plan.Count} plans, " +
+            $"{full.UnlockedTrees.Count} trees, oath {full.BattleOathLevel}/{full.BattleOathMaxLevel})");
     }
 
     /// <summary>
@@ -496,12 +477,13 @@ public sealed class CharacterPlan
     }
 
     /// <summary>
-    /// The LEARNED set is the level each group has in the official ACTIVE plan's assignments: a group without a level
-    /// there is NOT learned (the client paints it "Não aprendida", e.g. Providência, Escudo Luz, Encolher), even when it
-    /// appears in `DBSkillData.skillList` — that list also holds skills the character has no points in. The only
-    /// exceptions are the system/command groups the client shows without points (the queue command 11600 «Skill Bar»,
-    /// `SkillConfig._iSystemType` 6 with an initial level), which are granted at that initial level like the server does
-    /// for a fresh role. The bar still comes from the active plan's load list.
+    /// The role's learned levels are the official ACTIVE plan's assignments: the client's skill window, the passives'
+    /// stats and the wheel the official server computes all read that plan (positional index, so index 2 is the third
+    /// plan). (official evidence) the naked character's holy resistance 20 is 11417 at level 1 — the level the third plan
+    /// assigns — while the other plans hold 6 and none; the union of the five plans would give 120. The only additions
+    /// are the system/command groups the client shows without points (the queue command 11600 «Skill Bar»,
+    /// `SkillConfig._iSystemType` 6 with an initial level), granted like the server grants them for a fresh role. The bar
+    /// still comes from the active plan's load list.
     /// </summary>
     private void BuildSkills()
     {
@@ -512,12 +494,8 @@ public sealed class CharacterPlan
             throw new InvalidDataException($"DBSKILLDATA has no active plan {current}.");
         var plan = data.SkillAssignPlans[current];
         var learned = new SortedDictionary<int, int>();
-        // The learned level of a group is the highest level ANY of the five plans assigns: the plans are loadouts of the
-        // same learned set (Escudada is 5 because the Tank plan assigns it, even when the DPS plan does not). A group no
-        // plan assigns is NOT learned (the client paints it "Não aprendida", e.g. Providência, Escudo Luz, Encolher),
-        // even though `DBSkillData.skillList` also lists skills the character has no points in.
-        foreach (var (group, assignment) in data.SkillAssignPlans.SelectMany(entry => entry.SkillAssigns))
-            if (assignment.SkillLevel > learned.GetValueOrDefault(group)) learned[group] = assignment.SkillLevel;
+        foreach (var (group, assignment) in plan.SkillAssigns)
+            if (assignment.SkillLevel > 0) learned[group] = assignment.SkillLevel;
         foreach (int group in data.SkillList)
             if (_commandSkills.Contains(group) && learned.GetValueOrDefault(group) <= 0) learned[group] = 1;
         Columns["skills"] = string.Join(',', learned.Select(pair => $"{pair.Key}:{pair.Value}"));
