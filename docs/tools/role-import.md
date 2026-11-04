@@ -186,6 +186,27 @@ The import also never invents an item the account did not own: a reference to an
 does not carry (a shortcut-bar slot of a consumed item, a Soul Echo slot of a missing echo) is reported
 in the tool's output and dropped rather than pointed at a dangling guid.
 
+## Naming a residual: the `!attrsrc` diagnostic
+
+`CharacterService.AttributeProbe` (null in normal play) lets the GM command `!attrsrc [attrId]` watch the
+same property pipeline the login publishes and log, per attribute, the final value, the pre-percentage
+base and every source that fed it:
+
+```
+attrsrc 100001 101 (maxhp) final 113691 base 75005 raw 75005 <- extra:CombatService 2600, extra:PetService 1460,
+   talentos 13000, conversao 560, equipe 21596, refino 9430, cartas 3398, nivel 5661, eco 17300
+attrsrc 100001 102 (maxsp) final 1359 base 1345 raw 1345 <- conversao 5, nivel 1340
+```
+
+Read-only: it computes the sheet, prints it to the server log and replies a one-line summary. It is how
+the reference replica's gap was measured source by source — and it shows the local pipeline is complete
+against the exported tables (every source below matches its own config when recomputed): gear and rolled
+affixes 21 596 HP, refine 9 430, echo 17 300, talents 13 000 (exactly the configuration's value for the
+imported levels), cards 3 398, level row 5 661, passives 2 600, pet 1 460, conversions 560, enchantment
++2 STR; and for the percentages per_maxhp 5 139 (talents 3 740 + resonance 600 + conversion 280 + cards
+264 + pet 255). Nothing is left to import: the residual is a rule of the official server that this
+emulator does not implement (no table in the client's export carries it).
+
 ## Season talents: the two projections
 
 `DBSEASONTALENT` stores the same progression twice and the client and the server read opposite copies:
@@ -311,17 +332,14 @@ second import behave like the first:
   official dump by construction even when the inputs are identical.
 - One instance occupies one equipment grid: the official client can list the same two-handed weapon in
   grids 1 and 2 of a plan, the server writes it in grid 1 and rebuilds the active plan on login.
-- **Derived numbers: the talents were the big part, a residual remains.** After the client mirror, the data
-  re-export and the talent fix the stored data is equal and the talent effects land (see the table above):
-  HP 113 691 against 151 379, SP 1 359 against 7 579, ATK 2 703 against 3 652, MATK 1 636 / 2 373,
-  DEF 891 / 1 335, MDEF 940 / 1 383, while ASPD, ASPD base, cast speed and res-crit match. What was ruled
-  out with evidence: the client build and the data version (the mirrored client is byte-identical to the
-  official install and shows the same numbers), the stored character data (items, cards, echo, plans), the
-  client's own formula (recomputed from the same tables), buffs (the official's buffs give +10 ATK/DEF/MDEF),
-  passives (clearing every skill changed HP/SP not at all) and the 30 inactive echo-less talent nodes (no
-  attribute rows). The residual (about 25% of the HP, all of the SP, ~950 ATK) is a source the client's
-  exported tables do not carry; naming it needs one diagnostic dump of the server's raw attribute map,
-  which is a code change outside this tool's licence.
+- **Derived numbers: the talents were the big part; the rest is a rule gap.** After the client mirror, the
+  data re-export and the talent fix the stored data is equal and the talent effects land: HP 113 691 against
+  151 379, SP 1 359 against 7 579, ATK 2 703 / 3 652, MATK 1 636 / 2 373, DEF 891 / 1 335, MDEF 940 / 1 383,
+  while ASPD, ASPD base, cast speed and res-crit match exactly. `!attrsrc` (above) attributes every local
+  number to its source and each source equals its own configuration, so the residual is not a missing row:
+  the client's exported tables carry no source for it (no talent, skill, card, echo, pet, mount, entry,
+  enchantment, conversion or buff row gives it; the mount's riding buffs 1131601/1163901 have no attribute
+  changes). Naming the rule needs the official server's side, not another import.
 - The local client installation may be older than the official launcher's (`C:\Games\ROO_PC` vs
   `C:\Program Files\Genesis Launcher\ROO_PC`). A dataset the local client does not know travels as an
   unknown field and is ignored by the client, not by the server.

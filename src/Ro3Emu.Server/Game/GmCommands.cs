@@ -205,6 +205,27 @@ public sealed class GmCommands(IOptions<ServerOptions> options, GameData data, S
     {
         ["help"] = ("", (s, _) => ReplyAsync(s, "Commands: " + string.Join("  ", Commands().Select(c => $"!{c.Key} {c.Value.Usage}".Trim())))),
         ["where"] = ("", Where),
+        ["attrsrc"] = ("[attrId] (diagnostic: this role's attribute contributions per source, in the server log)", async (s, a) =>
+        {
+            // READ ONLY: it computes the same property sheet the login publishes, with an observer that records which
+            // source produced each raw contribution, and writes the table to the log. No rule, no state change.
+            var collected = new List<(string Source, long Id, double Value)>();
+            character.AttributeProbe = (source, id, value) => collected.Add((source, id, value));
+            StatSheet sheet;
+            try { sheet = character.Stats(s); }
+            finally { character.AttributeProbe = null; }
+            var only = a.Length > 0 && long.TryParse(a[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out long filter)
+                ? filter : 0;
+            foreach (var group in collected.Where(c => only == 0 || c.Id == only).GroupBy(c => c.Id).OrderBy(g => g.Key))
+            {
+                string sources = string.Join(", ", group.GroupBy(c => c.Source).Select(g => $"{g.Key} {g.Sum(c => c.Value):0.##}"));
+                log.LogInformation("attrsrc {Role} {Attr} final {Final} base {Base} raw {Raw} <- {Sources}",
+                    s.Role!.Id, group.Key, sheet[(int)group.Key], sheet.Base.GetValueOrDefault((int)group.Key), group.Sum(c => c.Value), sources);
+            }
+            await ReplyAsync(s, $"attrsrc: {collected.Select(c => c.Id).Distinct().Count()} attributes, {(collected.Count == 0 ? "no raw sources" : "table in the server log")}"
+                + $"; HP {sheet[101]} SP {sheet[102]} ATK {sheet[103]} MATK {sheet[104]} DEF {sheet[105]} MDEF {sheet[106]}");
+        }
+        ),
         ["dungeonsolo"] = ("on|off (test aid, this role session only)", async (s, a) =>
         {
             if (a.Length != 1 || a[0].ToLowerInvariant() is not ("on" or "off")) throw new ArgumentException("on|off");

@@ -61,6 +61,15 @@ public sealed partial class CharacterService
     }
 
     /// <summary>
+    /// Read-only diagnostic (`!attrsrc`): receives every raw contribution with the source that produced it, before it
+    /// is summed. Null in normal play, so the pipeline behaves exactly as before.
+    /// </summary>
+    public Action<string, long, double>? AttributeProbe { get; set; }
+
+    /// <summary>The source label the probe reports; only meaningful while <see cref="AttributeProbe"/> runs (GM aid).</summary>
+    private string _attributeSource = "outros";
+
+    /// <summary>
     /// Every number of the character window, the client's way (StatCalculator): raw contributions
     /// from AttriBaseLvConfig[career*1000+level], JobConfig._kAttri, worn gear (EquipConfig._kBasicAttribute) and
     /// AttributeConversionConfig per point of STR..LUK (_kAttribute2 for ranged jobs), grouped and rounded up.
@@ -70,7 +79,11 @@ public sealed partial class CharacterService
     {
         var p = session.Progress!;
         var raw = new Dictionary<int, double>();
-        void Add(long id, double v) => raw[(int)id] = raw.GetValueOrDefault((int)id) + v;
+        void Add(long id, double v)
+        {
+            AttributeProbe?.Invoke(_attributeSource, id, v);
+            raw[(int)id] = raw.GetValueOrDefault((int)id) + v;
+        }
 
         var matchAttributes = MatchAttributes?.Invoke(session);
         if (matchAttributes != null)
@@ -107,92 +120,91 @@ public sealed partial class CharacterService
     {
         var baseStats = new double[6];
         for (int i = 0; i < 6; i++) baseStats[i] = p.Stats[i];
+        // Base-stat contributions also feed the conversions below; the probe wants them like any other source.
+        void Give(long id, double v)
+        {
+            if (id is >= 1 and <= 6) { AttributeProbe?.Invoke(_attributeSource, id, v); baseStats[id - 1] += v; }
+            else Add(id, v);
+        }
+
+        _attributeSource = "equipe";
         foreach (var item in Equipped(session))
         {
             if (EquipRow(item.Entry) is not { } equip) continue;
-            foreach (var (id, v) in BaseAttributes(item, equip).Concat(EquipmentAffixes.Entries(item)))
-            {
-                if (id is >= 1 and <= 6) baseStats[id - 1] += v;
-                else Add(id, v);
-            }
+            foreach (var (id, v) in BaseAttributes(item, equip).Concat(EquipmentAffixes.Entries(item))) Give(id, v);
             // enchant stats are per instance; base stats also feed their derived conversions.
+            _attributeSource = "encantamento";
             foreach (var enchant in item.Enchantments.Values)
-                foreach (var (id, v) in enchant.Attr)
-                {
-                    if (id is >= 1 and <= 6) baseStats[id - 1] += v;
-                    else Add(id, v);
-                }
+                foreach (var (id, v) in enchant.Attr) Give(id, v);
+            _attributeSource = "equipe";
         }
-        foreach (var (id, value) in EquipmentStunts.FlatAttributes(session, data))
-        {
-            if (id is >= 1 and <= 6) baseStats[id - 1] += value;
-            else Add(id, value);
-        }
+        _attributeSource = "stunt";
+        foreach (var (id, value) in EquipmentStunts.FlatAttributes(session, data)) Give(id, value);
         // Grid levels: StrengthenTable / RefiningTable _kAttr are totals at a level, counted for a
         // worn grid (inferred); resonance (§5) adds the reached Strengthen/RefiningEffectTable row's _kEffect.
         foreach (var item in Equipped(session).Where(i => i.Grid <= EquipInfoSlots))
         {
-            foreach (var row in new[] { StrengthenRow(item.Grid, session.EquipLevels.Strength.GetValueOrDefault(item.Grid)), RefineRow(item.Grid, session.EquipLevels.Refine.GetValueOrDefault(item.Grid)) })
+            foreach (var (source, row) in new (string, JsonElement?)[]
+            {
+                ("forca", StrengthenRow(item.Grid, session.EquipLevels.Strength.GetValueOrDefault(item.Grid))),
+                ("refino", RefineRow(item.Grid, session.EquipLevels.Refine.GetValueOrDefault(item.Grid))),
+            })
                 if (row is { } r)
-                    foreach (var (id, v) in GameData.Pairs(r, "_kAttr")) Add(id, v);
+                {
+                    _attributeSource = source;
+                    foreach (var (id, v) in GameData.Pairs(r, "_kAttr")) Give(id, v);
+                }
         }
+        _attributeSource = "ressonancia";
         foreach (var table in new[] { "StrengthenEffectTable", "RefiningEffectTable" })
             if (ResonanceRow(session, table) is { } effect)
-                foreach (var (id, v) in GameData.Pairs(effect, "_kEffect")) Add(id, v);
+                foreach (var (id, v) in GameData.Pairs(effect, "_kEffect")) Give(id, v);
+        _attributeSource = "cartas";
         foreach (var card in session.Items.Where(i => i.Grid < 0))
         {
             int tier = (int)(card.Attrs?.GetValueOrDefault(AttrCardStar) ?? 0);
             int level = (int)(card.Attrs?.GetValueOrDefault(AttrCardLevel) ?? 0);
             if (CardRow(card.Entry, tier) is not { } cardRow) continue;
-            foreach (var (id, v) in GameData.Pairs(cardRow, "_kBasicAttribute"))
-            {
-                if (id is >= 1 and <= 6) baseStats[id - 1] += v;
-                else Add(id, v);
-            }
+            foreach (var (id, v) in GameData.Pairs(cardRow, "_kBasicAttribute")) Give(id, v);
             if (data.Row("ItemConfig", card.Entry) is { } itemRow)
             {
                 long part = GameData.Int(itemRow, "_iCardPart"), quality = GameData.Int(itemRow, "_iQuality");
                 if (CardUpgradeRow(level, part, quality) is { } upgrade)
-                    foreach (var (id, v) in GameData.Pairs(upgrade, "_iAttr"))
-                    {
-                        if (id is >= 1 and <= 6) baseStats[id - 1] += v;
-                        else Add(id, v);
-                    }
+                    foreach (var (id, v) in GameData.Pairs(upgrade, "_iAttr")) Give(id, v);
             }
         }
         // The active Soul Echo plan contributes raw attributes; applying the shared final-stat
         // pipeline is inferred because the original server aggregation order is not captured.
+        _attributeSource = "eco";
         foreach (var emblem in EmblemService.Worn(session))
-            foreach (var (id, value) in EmblemService.Attributes(emblem, data))
-            {
-                if (id is >= 1 and <= 6) baseStats[id - 1] += value;
-                else Add(id, value);
-            }
+            foreach (var (id, value) in EmblemService.Attributes(emblem, data)) Give(id, value);
         // LC_SeasonTalent's property overview reads the selected plan's target-level effect once.
         // Base stats 1..6 must feed conversion below; other attrs enter StatCalculator as raw contributions (inferred).
-        foreach (var (id, value) in TalentAttributes?.Invoke(session) ?? [])
-        {
-            if (id is >= 1 and <= 6) baseStats[id - 1] += value;
-            else Add(id, value);
-        }
+        _attributeSource = "talentos";
+        foreach (var (id, value) in TalentAttributes?.Invoke(session) ?? []) Give(id, value);
         foreach (var provider in ExtraAttributes)
-            foreach (var (id, value) in provider(session))
-            {
-                if (id is >= 1 and <= 6) baseStats[id - 1] += value;
-                else Add(id, value);
-            }
+        {
+            _attributeSource = "extra:" + (provider.Method.DeclaringType?.Name ?? "?");
+            foreach (var (id, value) in provider(session)) Give(id, value);
+        }
+        _attributeSource = "pontos";
         for (int i = 0; i < 6; i++) Add(i + 1, baseStats[i]);
+        _attributeSource = "buff";
         foreach (var buff in session.Buffs)
             foreach (var (id, v) in buff.Changes) Add(id, v);
+        _attributeSource = "nivel";
         if (BaseRow(p.Career, p.Level) is { } flat)
             foreach (var (id, v) in GameData.Pairs(flat, "_kAttri")) Add(id, v);
+        _attributeSource = "job";
         foreach (var (id, v) in data.JobAttributes(p.Career)) Add(id, v);
+        _attributeSource = "conversao";
         bool ranged = data.Row("JobConfig", p.Career) is { } job && GameData.Int(job, "_iDistanceType") == 2;
         for (int stat = 1; stat <= 6; stat++)
         {
             if (data.Row("AttributeConversionConfig", stat) is not { } conversion) continue;
             foreach (var (id, perPoint) in GameData.Pairs(conversion, ranged ? "_kAttribute2" : "_kAttribute1")) Add(id, perPoint * baseStats[stat - 1]);
         }
+        _attributeSource = "outros";
     }
 
     /// <summary>The self property list: the fixed set plus every member attribute the sheet carries (1031 ...).</summary>
