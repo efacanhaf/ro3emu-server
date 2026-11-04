@@ -284,9 +284,10 @@ public sealed class SkillGrowthTests : IAsyncLifetime
         }
         await using var again = await InWorld("Alice", create: false);
         var reloaded = await Next(again, SkillService.SkillDataSync, DBSkillDataIncrement.Parser);
-        Assert.True(!reloaded.SkillAssignPlans.All.Value[0].SkillAssigns.TryGetValue(13006, out var reset) || reset.SkillLevel == 0);
-        Assert.Equal(0, reloaded.SkillAssignPlans.All.Value[0].SkillQueue[0].SkillId);
-        Assert.DoesNotContain(reloaded.SkillWheel.All.WhellSkills.Values, slot => slot.SkillConfigId == 1300601);
+        // 13006 is a queue ("Geral") skill: the official reset has no effect on the general tab, so it keeps its level
+        // and its queue slot (Eduardo)
+        Assert.Equal(1, reloaded.SkillAssignPlans.All.Value[0].SkillAssigns[13006].SkillLevel);
+        Assert.Equal(13006, reloaded.SkillAssignPlans.All.Value[0].SkillQueue[0].SkillId);
     }
 
     [ClientDataFact]
@@ -374,6 +375,9 @@ public sealed class SkillGrowthTests : IAsyncLifetime
         return (await Next(bot, SkillService.SkillReset, SkillResetResp.Parser, m => m.Plan == plan)).Result;
     }
 
+    /// <summary>The "Geral" tab skills (SkillConfig._iQueue 1: Guard, Shield Reflect, Battle Chant...): the reset never touches them.</summary>
+    private static bool General(int group) => group is 11408 or 11410 or 11414 or 11415 or 11416 or 11503 or 11609;
+
     [ClientDataFact]
     public async Task ResetOfTheReplicatedShapeClearsEveryPlanAndStaysCleared()
     {
@@ -396,15 +400,15 @@ public sealed class SkillGrowthTests : IAsyncLifetime
             foreach (int plan in new[] { 0, 1, 2 })
                 Assert.Equal(0, await Reset(alice, plan));
             var cleared = await Next(alice, SkillService.SkillDataSync, DBSkillDataIncrement.Parser,
-                m => !m.SyncAllMark && m.SkillAssignPlans.Inc.Value[2].SkillAssigns.Values.All(v => (v.All?.SkillLevel ?? 0) <= 1));
-            Assert.All(cleared.SkillAssignPlans.Inc.Value[2].SkillAssigns.Values, v => Assert.True((v.All?.SkillLevel ?? 0) <= 1));
+                m => !m.SyncAllMark && m.SkillAssignPlans.Inc.Value[2].SkillAssigns.Where(p => !General(p.Key)).All(p => (p.Value.All?.SkillLevel ?? 0) <= 1));
+            Assert.All(cleared.SkillAssignPlans.Inc.Value[2].SkillAssigns.Where(p => !General(p.Key)), p => Assert.True((p.Value.All?.SkillLevel ?? 0) <= 1));
         }
 
         await using (var again = await InWorld("Alice", create: false))
         {
             var reloaded = await Next(again, SkillService.SkillDataSync, DBSkillDataIncrement.Parser);
             foreach (var plan in reloaded.SkillAssignPlans.All.Value)
-                Assert.All(plan.SkillAssigns, pair => Assert.True(pair.Value.SkillLevel <= 1,
+                Assert.All(plan.SkillAssigns.Where(p => !General(p.Key)), pair => Assert.True(pair.Value.SkillLevel <= 1,
                     $"plan {plan.Name} kept {pair.Key} at {pair.Value.SkillLevel}"));
         }
         using var db = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={Path.Combine(_dataDir, "ro3emu.db")}");
@@ -416,12 +420,12 @@ public sealed class SkillGrowthTests : IAsyncLifetime
         Assert.True(row.Read());
         var skills = (row.GetString(0) ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries)
             .Select(pair => pair.Split(':')).ToDictionary(pair => int.Parse(pair[0]), pair => int.Parse(pair[1]));
-        Assert.All(skills, pair => Assert.True(pair.Value <= 1, $"role.skills kept {pair.Key} at {pair.Value}"));
+        Assert.All(skills.Where(p => !General(p.Key)), pair => Assert.True(pair.Value <= 1, $"role.skills kept {pair.Key} at {pair.Value}"));
         row.Close();
         read.CommandText = "SELECT skill_plans FROM role WHERE id = $id";
         var durable = DBSkillData.Parser.ParseFrom((byte[])read.ExecuteScalar()!);
         foreach (var plan in durable.SkillAssignPlans)
-            Assert.All(plan.SkillAssigns, pair => Assert.True(pair.Value.SkillLevel <= 1,
+            Assert.All(plan.SkillAssigns.Where(p => !General(p.Key)), pair => Assert.True(pair.Value.SkillLevel <= 1,
                 $"skill_plans kept {pair.Key} at {pair.Value.SkillLevel}"));
     }
 }

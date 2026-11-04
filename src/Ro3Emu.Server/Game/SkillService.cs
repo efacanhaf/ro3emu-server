@@ -569,7 +569,7 @@ public sealed class SkillService
     }
 
     /// <summary>Build a role-progress candidate from an owned skill plan before a Build-window switch.</summary>
-    internal int StageSkillPlan(GameSession session, DBSkillData state, RoleProgress progress, int index)
+    internal int StageSkillPlan(GameSession session, DBSkillData state, RoleProgress progress, int index, bool reset = false)
     {
         if (index is < 0 or >= PlanCount || index >= state.SkillAssignPlans.Count || !state.SkillAssignPlans[index].IsUnlock)
             return ErrorCodes.Parameter;
@@ -588,17 +588,22 @@ public sealed class SkillService
         {
             bool normalAttack = normalAttacks.Contains(group);
             if (assignment.SkillLevel == 1 && normalAttack && group != currentAttack) continue;
+            // outside the tree is accepted only for a skill of THIS class or a general one (SkillConfig._iJob 0): a skill
+            // of another career is still refused (an obsolete plan from another career must fail the tree validation)
+            bool foraDaArvore = !tree.ContainsKey(group) && !normalAttack && assignment.SkillLevel > 0;
             if (assignment.SkillLevel < 0 || assignment.SkillLevel > MaxLevel(group)
-                // outside the tree only the innate level is allowed (the queue command 11600, the event passives
-                // 111641-3): a skill reset leaves them at it, and that must not read as "not in the tree"
-                || (!tree.ContainsKey(group) && !normalAttack && assignment.SkillLevel > Math.Max(0, Initial(progress, group)))) return ErrorCodes.SkillNotInTree;
+                || (foraDaArvore && !DaMinhaClasse(progress.Career, group))) return ErrorCodes.SkillNotInTree;
             if (assignment.SkillId != 0 && assignment.SkillId != group) return ErrorCodes.Parameter;
-            if (assignment.SkillLevel > Initial(progress, group)) progress.Skills[group] = assignment.SkillLevel;
+            // A group outside the career tree is GRANTED, never bought (the queue command 11600, the event passives
+            // 111641-3 that the official server grants): a plan may list it at its granted level - the official plans
+            // do, and the same class on the same client must accept them (Eduardo) - but it costs no point and is not
+            // recorded as a paid level (SkillPoints only walks the tree, so a paid entry would never be charged anyway).
+            if ((tree.ContainsKey(group) || normalAttack) && assignment.SkillLevel > Initial(progress, group)) progress.Skills[group] = assignment.SkillLevel;
         }
         var remaining = SkillPoints(progress);
         if (remaining.Values.Any(v => v < 0)) return ErrorCodes.SkillPointsShort;
         if (progress.Skills.Any(kv => RealId(kv.Key, kv.Value) == 0)) return ErrorCodes.SkillMaxLevel;
-        if (!PrerequisitesMet(progress)) return ErrorCodes.SkillPrerequisite;
+        if (!PrerequisitesMet(progress, reset)) return ErrorCodes.SkillPrerequisite;
         source.SkillPoints.Clear();
         foreach (var (rank, points) in remaining) source.SkillPoints[rank] = points;
         progress.SkillBar.Clear();
@@ -744,13 +749,16 @@ public sealed class SkillService
         .Sum(g => Math.Max(0, p.Skills.GetValueOrDefault(g) - Initial(p, g)));
 
     /// <summary>Evaluate desired-level row prerequisites, including the negative required-level sentinel.</summary>
-    private bool PrerequisitesMet(RoleProgress p)
+    private bool PrerequisitesMet(RoleProgress p, bool reset = false)
     {
         var tree = Tree(p.Career).Select(t => t.Group).ToHashSet();
         foreach (int group in tree)
         {
             int level = Level(p, group);
             if (level <= 0) continue;
+            // a reset leaves the general ("Geral") skills as they are, and their class prerequisites go back to zero:
+            // the reset itself does not charge those (a normal purchase still does)
+            if (reset && IsGeneral(group)) continue;
             if (_data.Row("SkillConfig", RealId(group, level)) is not { } row) return false;
             if (!row.TryGetProperty("_kPreSkillRequired", out var pre) || pre.ValueKind != JsonValueKind.Array) continue;
             foreach (var req in pre.EnumerateArray())
@@ -845,6 +853,13 @@ public sealed class SkillService
         await session.SendGameAsync(SkillLoad, new SkillLoadResp { Result = code, IsManual = req.IsManual });
     }
 
+    /// <summary>The skill belongs to the career chain (or is general, job 0): granted skills outside the tree, never another career's.</summary>
+    private bool DaMinhaClasse(int career, int group) => SkillConfig.Get(_data, RealId(group, 1)) is { } row
+        && (row.Job == 0 || CareerChain(career).Contains((int)row.Job));
+
+    /// <summary>A "Geral" (general) skill: the ones the client lists in the general tab and may queue (SkillConfig._iQueue 1).</summary>
+    private bool IsGeneral(int group) => SkillConfig.Get(_data, RealId(group, 1)) is { Queue: 1 };
+
     /// <summary>31156 sender was not recovered. (inferred) Clear this plan's paid allocations without a fee.</summary>
     public async Task ResetAsync(GameSession session, SkillResetReq req)
     {
@@ -859,10 +874,15 @@ public sealed class SkillService
             {
                 var selected = plans.SkillAssignPlans[req.Plan];
                 foreach (var (group, assigned) in selected.SkillAssigns)
+                {
+                    // The "Geral" tab (the queueable buffs: Guard, Shield Reflect, Battle Chant... = SkillConfig._iQueue 1)
+                    // has no reset on the official server: a reset leaves those levels as they are (Eduardo)
+                    if (IsGeneral(group)) continue;
                     assigned.SkillLevel = IsNormalGroup(session.Progress!, group) ? 1 : Initial(session.Progress!, group);
+                }
                 var progress = CharacterService.GenreCloneProgress(session.Progress!);
                 int oldIndex = plans.CurrentPlanIndex;
-                code = StageSkillPlan(session, plans, progress, req.Plan);
+                code = StageSkillPlan(session, plans, progress, req.Plan, reset: true);
                 plans.CurrentPlanIndex = oldIndex;
                 if (code == 0)
                 {
