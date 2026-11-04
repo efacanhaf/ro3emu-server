@@ -45,7 +45,8 @@ public static class RoleImportCli
         long firstGuid = NextItemGuid(options.Database);
         int basePoints = BaseStatPoints(options.DataDir ?? Path.GetDirectoryName(options.Database)!, (int)Number(
             snapshot.Message("ROLEBASEINFO"), "level"));
-        var plan = CharacterPlan.Build(snapshot, firstGuid, basePoints);
+        var commandSkills = CommandSkills(options.DataDir ?? Path.GetDirectoryName(options.Database)!);
+        var plan = CharacterPlan.Build(snapshot, firstGuid, basePoints, commandSkills);
 
         byte[]? hash = null, salt = null;
         if (options.ResetPassword is { Length: > 0 } account)
@@ -161,17 +162,55 @@ public static class RoleImportCli
         return starting;
     }
 
-    /// <summary>The exported game data: &lt;dir&gt;/config/BaseLvConfig.json, a data/ or config/ dir, or any ancestor holding it.</summary>
-    private static IEnumerable<string> ConfigCandidates(string directory)
+    /// <summary>
+    /// The skill groups the client shows without points: `SkillConfig._iSystemType` 6 with an initial level (the queue
+    /// command «Skill Bar», one per career line). Read from the exported game data; unavailable data means none.
+    /// </summary>
+    private static HashSet<int> CommandSkills(string dataDirectory)
     {
-        yield return Path.Combine(directory, "config", "BaseLvConfig.json");
-        yield return Path.Combine(directory, "BaseLvConfig.json");
+        var groups = new HashSet<int>();
+        foreach (string folder in ConfigFolders(dataDirectory))
+        {
+            string path = Path.Combine(folder, "SkillConfig.json");
+            if (!File.Exists(path)) continue;
+            try
+            {
+                using var document = JsonDocument.Parse(File.ReadAllBytes(path));
+                var root = document.RootElement;
+                var rows = root.ValueKind == JsonValueKind.Array
+                    ? root.EnumerateArray().ToArray()
+                    : root.EnumerateObject().Select(property => property.Value).ToArray();
+                foreach (var row in rows)
+                {
+                    if (Number(row, "_iSystemType") != 6 || Number(row, "_iInitialLevel") <= 0) continue;
+                    int group = (int)Number(row, "_iSkillID");
+                    if (group > 0) groups.Add(group);
+                }
+            }
+            catch (Exception error) when (error is IOException or JsonException)
+            {
+                Console.Error.WriteLine($"RoleImport: SkillConfig unreadable ({error.Message}); no system commands granted.");
+            }
+            return groups;
+        }
+        return groups;
+    }
+
+    /// <summary>The exported game data: &lt;dir&gt;/config, a data/ or config/ dir, or any ancestor holding one.</summary>
+    private static IEnumerable<string> ConfigFolders(string directory)
+    {
+        yield return Path.Combine(directory, "config");
+        yield return directory;
         for (var current = new DirectoryInfo(directory); current != null; current = current.Parent)
         {
-            yield return Path.Combine(current.FullName, "data", "config", "BaseLvConfig.json");
-            yield return Path.Combine(current.FullName, "config", "BaseLvConfig.json");
+            yield return Path.Combine(current.FullName, "data", "config");
+            yield return Path.Combine(current.FullName, "config");
         }
     }
+
+    /// <summary>The exported game data: &lt;dir&gt;/config/BaseLvConfig.json, a data/ or config/ dir, or any ancestor holding it.</summary>
+    private static IEnumerable<string> ConfigCandidates(string directory) =>
+        ConfigFolders(directory).Select(folder => Path.Combine(folder, "BaseLvConfig.json"));
 
     private static string String(JsonElement value, string field) =>
         value.ValueKind == JsonValueKind.Object && value.TryGetProperty(field, out var inner) && inner.ValueKind == JsonValueKind.String

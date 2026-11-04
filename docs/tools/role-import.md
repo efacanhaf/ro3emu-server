@@ -188,11 +188,14 @@ in the tool's output and dropped rather than pointed at a dangling guid.
 
 ## Learned skills, the "Fila" tab and the skill bar
 
-`role.skills` is the character's LEARNED set, not the active plan's assignments: the official
-`DBSkillData.skillList` lists 56 groups (the career tree plus things the tree does not hold — the queue
-command 11600 «Skill Bar» and the 111641-111643 event passives), each at the highest level it has in any
-plan, or level 1 for a learned command skill no plan assigns. The active plan's `skillAssigns` only
-covers 26-38 of them.
+`role.skills` is the character's LEARNED set: the **union of the five plans' assignments**, each group at
+its highest level (Escudada is 5 because the Tank plan assigns it, even when the DPS plan does not). The
+plans are loadouts of the same learned set, so a group no plan assigns is NOT learned — even though
+`DBSkillData.skillList` lists it (that list holds every skill that EXISTS for the character: the
+reference one lists 56 groups, of which 6 have no points anywhere in the plans and the client paints them
+"Não aprendida": 11003, 11403, 11404, 11414, 11415, 11501). Only the system/command groups the client
+shows without points are granted, at their `SkillConfig._iInitialLevel` (`_iSystemType` 6, the queue
+command 11600 «Skill Bar»).
 
 That was a real copy gap with a visible symptom: `lc_skillgrowthhelper:GetHasSkillQueue` shows the
 "Fila" (skill queue) tab only when the client's skill list contains 11600, and the client's list is the
@@ -208,7 +211,11 @@ sends it the way it already sends a card-granted skill:
 
 Both are projections of data the role owns; no combat rule changes. Verified live on the reference
 replica: the "Fila" tab appears, its queue shows Bloqueio Nv.5 / Escudo Reflexo Nv.1 / Canto Santo Nv.10
-(the official screenshot), and `skillWheel.whellSkills[7].skillConfigId = 1160001` like the official.
+(the official screenshot), Providência and Escudo Luz read "Não aprendida", the skill window keeps the
+tree levels the other plans gave (Escudada 5/5), and `skillWheel.whellSkills[7].skillConfigId = 1160001`
+like the official. One entry stays off by one state: Encolher shows Nv.1 because some plan assigns it at
+level 1 while the official client paints it unlearned — the character's own skill-point ledger is not in
+the export, so it cannot be derived from the snapshot.
 
 **Wheel modes (the enhanced skill variants).** `SkillConfig` holds the same skill in several `_iMode`
 rows: mode 0 is the base (1160710, damage 21000) and modes 1/5 are the enhanced variants the client puts

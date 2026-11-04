@@ -139,7 +139,7 @@ public sealed class RoleImportTests
         Assert.Equal(-48L, plan.Columns["bonus_points"]);
         Assert.Equal(72000006L, plan.Columns["hair"]);
         var skills = ((string)plan.Columns["skills"]!).Split(',');
-        Assert.Equal(56, skills.Length); // the learned set (official skillList), not just the active plan's assignments
+        Assert.Equal(50, skills.Length); // the union of the five plans' assignments (the learned set)
         Assert.Contains("11401:10", skills);
         Assert.Contains("11600:1", skills);
         Assert.Equal("1:11607,2:11602,3:11628,4:11604,6:11616,7:11600", plan.Columns["skill_bar"]);
@@ -214,19 +214,24 @@ public sealed class RoleImportTests
     }
 
     [Fact]
-    public void LearnedSkillsIncludeTheQueueCommandAndItsBarSlot()
+    public void LearnedSkillsAreThePlansUnionNotEveryListedSkill()
     {
         using var snapshot = Fixture();
         var plan = Build(snapshot);
         var skills = ((string)plan.Columns["skills"]!).Split(',')
             .Select(pair => pair.Split(':'))
             .ToDictionary(pair => int.Parse(pair[0], CultureInfo.InvariantCulture), pair => int.Parse(pair[1], CultureInfo.InvariantCulture));
-        // The client shows the "Fila" (skill queue) tab only when the learned list holds the queue command group 11600.
+        // The learned set is the union of the five plans' assignments (50 groups in the fixture): the client only paints
+        // a group it has a level in, and the plans are loadouts of the same learned set.
+        Assert.Equal(50, skills.Count);
+        Assert.Equal(5, skills[11616]);      // only the Tank plan assigns it
+        Assert.Equal(10, skills[11502]);
+        // The queue command is granted like the server grants a system skill, and keeps the "Fila" tab alive.
         Assert.Contains(11600, skills.Keys);
         Assert.Equal(1, skills[11600]);
-        Assert.Contains(111641, skills.Keys);
-        Assert.Equal(56, skills.Count);
-        // ...and the official wheel carries it on its own bar slot 7 (11607 at level 10 stays the highest for its group).
+        // A group `skillList` lists but no plan assigns is NOT learned (the official paints it "Não aprendida").
+        Assert.DoesNotContain(11003, skills.Keys);
+        Assert.DoesNotContain(11403, skills.Keys);
         Assert.Contains("7:11600", ((string)plan.Columns["skill_bar"]!).Split(','));
         Assert.Contains("1:11607", ((string)plan.Columns["skill_bar"]!).Split(','));
     }

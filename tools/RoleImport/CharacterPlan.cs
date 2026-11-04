@@ -61,15 +61,20 @@ public sealed class CharacterPlan
     public IReadOnlyList<string> Notes => _notes;
 
     /// <summary>Reads the snapshot into a complete import plan; <paramref name="firstGuid"/> is the first item guid to use.</summary>
-    public static CharacterPlan Build(SnapshotDocument snapshot, long firstGuid, int localBaseStatPoints)
+    public static CharacterPlan Build(SnapshotDocument snapshot, long firstGuid, int localBaseStatPoints,
+        IReadOnlySet<int>? commandSkills = null)
     {
         var plan = new CharacterPlan(snapshot, firstGuid);
+        plan._commandSkills = commandSkills ?? new HashSet<int>();
         plan.CollectGuids();
         plan.BuildItems();
         plan.BuildBlobs();
         plan.BuildColumns(localBaseStatPoints);
         return plan;
     }
+
+    /// <summary>Skill groups the client shows without points (SkillConfig._iSystemType 6, the queue command).</summary>
+    private IReadOnlySet<int> _commandSkills = new HashSet<int>();
 
     // ---- guids -------------------------------------------------------------------------------------
 
@@ -491,11 +496,12 @@ public sealed class CharacterPlan
     }
 
     /// <summary>
-    /// The LEARNED set is `DBSkillData.skillList` (56 groups on the reference character), not just the active plan's
-    /// assignments: the client builds its skill panel from it and `lc_skillgrowthhelper:GetHasSkillQueue` only shows the
-    /// "Fila" (skill queue) tab when it finds the queue command group 11600 in that list. Each learned group's level is
-    /// the highest level it has in ANY plan, and 1 for a learned command skill no plan assigns (11600 «Skill Bar»,
-    /// the 111641-111643 event passives). The bar still comes from the active plan's load list.
+    /// The LEARNED set is the level each group has in the official ACTIVE plan's assignments: a group without a level
+    /// there is NOT learned (the client paints it "Não aprendida", e.g. Providência, Escudo Luz, Encolher), even when it
+    /// appears in `DBSkillData.skillList` — that list also holds skills the character has no points in. The only
+    /// exceptions are the system/command groups the client shows without points (the queue command 11600 «Skill Bar»,
+    /// `SkillConfig._iSystemType` 6 with an initial level), which are granted at that initial level like the server does
+    /// for a fresh role. The bar still comes from the active plan's load list.
     /// </summary>
     private void BuildSkills()
     {
@@ -505,16 +511,18 @@ public sealed class CharacterPlan
         if (current < 0 || current >= data.SkillAssignPlans.Count)
             throw new InvalidDataException($"DBSKILLDATA has no active plan {current}.");
         var plan = data.SkillAssignPlans[current];
-        var levels = new SortedDictionary<int, int>();
-        foreach (var (group, assignment) in data.SkillAssignPlans.SelectMany(entry => entry.SkillAssigns))
-            if (assignment.SkillLevel > levels.GetValueOrDefault(group)) levels[group] = assignment.SkillLevel;
         var learned = new SortedDictionary<int, int>();
+        // The learned level of a group is the highest level ANY of the five plans assigns: the plans are loadouts of the
+        // same learned set (Escudada is 5 because the Tank plan assigns it, even when the DPS plan does not). A group no
+        // plan assigns is NOT learned (the client paints it "Não aprendida", e.g. Providência, Escudo Luz, Encolher),
+        // even though `DBSkillData.skillList` also lists skills the character has no points in.
+        foreach (var (group, assignment) in data.SkillAssignPlans.SelectMany(entry => entry.SkillAssigns))
+            if (assignment.SkillLevel > learned.GetValueOrDefault(group)) learned[group] = assignment.SkillLevel;
         foreach (int group in data.SkillList)
-            if (group > 0) learned[group] = Math.Max(1, levels.GetValueOrDefault(group));
-        foreach (var (group, level) in levels)
-            if (level > 0 && !learned.ContainsKey(group)) learned[group] = level;
+            if (_commandSkills.Contains(group) && learned.GetValueOrDefault(group) <= 0) learned[group] = 1;
         Columns["skills"] = string.Join(',', learned.Select(pair => $"{pair.Key}:{pair.Value}"));
-        _notes.Add($"skills: {learned.Count} learned groups (official skillList {data.SkillList.Count})");
+        _notes.Add($"skills: {learned.Count} learned groups (active plan {plan.SkillAssigns.Count}, " +
+            $"official skillList {data.SkillList.Count}, {_commandSkills.Count} system commands known)");
         var bar = new List<string>();
         for (int slot = 1; slot <= plan.ManualLoadSkill.Count; slot++)
         {
