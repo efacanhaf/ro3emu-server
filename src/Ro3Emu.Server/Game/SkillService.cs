@@ -849,6 +849,7 @@ public sealed class SkillService
     public async Task ResetAsync(GameSession session, SkillResetReq req)
     {
         bool changed = false;
+        int result = 0;
         {
             using var held = await CharacterService.Lock(session);
             var plans = Build(session);
@@ -877,7 +878,9 @@ public sealed class SkillService
                 }
             }
             await session.SendGameAsync(SkillReset, new SkillResetResp { Result = code, Plan = req.Plan });
+            result = code;
         }
+        _log.LogInformation("Skill reset {Name} plan {Plan}: {Result}", session.Role?.Name, req.Plan, result);
         if (changed) await OnActivePlanChangedAsync(session);
     }
 

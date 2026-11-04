@@ -354,4 +354,74 @@ public sealed class SkillGrowthTests : IAsyncLifetime
         Assert.Equal("Migrated", durable.SkillAssignPlans[1].Name);
         Assert.Equal(13006, durable.SkillAssignPlans[1].SkillQueue[0].SkillId);
     }
+
+    // The replicated official character: role.skills carries the paid levels, the plans carry them plus the innate
+    // outside-tree rows at level 1 (queue command 11600, Union 11614, King's Grace 11615, event passives). Eduardo's
+    // reset answered an error on the CURRENT preset while the others went through (Eduardo, 16:43).
+    private static readonly Dictionary<int, int> PaidLevels = new()
+    {
+        [11009] = 10, [11006] = 10, [11004] = 10, [11005] = 10, [11417] = 1, [11408] = 5, [11401] = 10, [11407] = 1,
+        [11411] = 10, [11409] = 3, [11412] = 5, [11418] = 3, [11413] = 1, [11410] = 1, [11506] = 10, [11503] = 10,
+        [11502] = 10, [11507] = 10,
+        // The innate outside-tree rows the plan blob carries (queue command, Union, King's Grace, event passives) and a
+        // paid level on one of them: the reset must keep the innate entry and drop the paid level.
+        [11600] = 1, [11614] = 1, [11615] = 1, [111641] = 2,
+    };
+
+    private async Task<int> Reset(BotClient bot, int plan)
+    {
+        await bot.SendGameAsync(SkillService.SkillReset, new SkillResetReq { Plan = plan });
+        return (await Next(bot, SkillService.SkillReset, SkillResetResp.Parser, m => m.Plan == plan)).Result;
+    }
+
+    [ClientDataFact]
+    public async Task ResetOfTheReplicatedShapeClearsEveryPlanAndStaysCleared()
+    {
+        long roleId;
+        await using (var alice = await InWorld("Alice"))
+        {
+            roleId = (long)alice.Self!.Uuid;
+            await Gm("alice", "!job 1410");
+            await Gm("alice", "!lvl 99");
+            await _app.Services.GetRequiredService<GameLoop>().InvokeAsync(async () =>
+            {
+                var session = _app.Services.GetRequiredService<SessionRegistry>().All().Single(s => s.Role?.Id == roleId);
+                session.Progress!.Skills.Clear();
+                foreach (var (group, level) in PaidLevels) session.Progress.Skills[group] = level;
+                await _app.Services.GetRequiredService<SkillService>().SyncAsync(session);
+                return 0;
+            });
+            await Next(alice, SkillService.SkillDataSync, DBSkillDataIncrement.Parser);
+
+            foreach (int plan in new[] { 0, 1, 2 })
+                Assert.Equal(0, await Reset(alice, plan));
+            var cleared = await Next(alice, SkillService.SkillDataSync, DBSkillDataIncrement.Parser,
+                m => !m.SyncAllMark && m.SkillAssignPlans.Inc.Value[2].SkillAssigns.Values.All(v => (v.All?.SkillLevel ?? 0) <= 1));
+            Assert.All(cleared.SkillAssignPlans.Inc.Value[2].SkillAssigns.Values, v => Assert.True((v.All?.SkillLevel ?? 0) <= 1));
+        }
+
+        await using (var again = await InWorld("Alice", create: false))
+        {
+            var reloaded = await Next(again, SkillService.SkillDataSync, DBSkillDataIncrement.Parser);
+            foreach (var plan in reloaded.SkillAssignPlans.All.Value)
+                Assert.All(plan.SkillAssigns, pair => Assert.True(pair.Value.SkillLevel <= 1,
+                    $"plan {plan.Name} kept {pair.Key} at {pair.Value.SkillLevel}"));
+        }
+        using var db = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={Path.Combine(_dataDir, "ro3emu.db")}");
+        db.Open();
+        using var read = db.CreateCommand();
+        read.CommandText = "SELECT skills, skill_plans FROM role WHERE id = $id";
+        read.Parameters.AddWithValue("$id", roleId);
+        using var row = read.ExecuteReader();
+        Assert.True(row.Read());
+        var skills = (row.GetString(0) ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries)
+            .Select(pair => pair.Split(':')).ToDictionary(pair => int.Parse(pair[0]), pair => int.Parse(pair[1]));
+        Assert.All(skills, pair => Assert.True(pair.Value <= 1, $"role.skills kept {pair.Key} at {pair.Value}"));
+        row.Close();
+        read.CommandText = "SELECT skill_plans FROM role WHERE id = $id";
+        var durable = DBSkillData.Parser.ParseFrom((byte[])read.ExecuteScalar()!);
+        foreach (var plan in durable.SkillAssignPlans)
+            Assert.All(plan.SkillAssigns, pair => Assert.True(pair.Value.SkillLevel <= 1,
+                $"skill_plans kept {pair.Key} at {pair.Value.SkillLevel}"));
+    }
 }

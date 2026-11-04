@@ -279,6 +279,14 @@ public sealed class GmCommands(IOptions<ServerOptions> options, GameData data, S
         ["job"] = ("<jobId>", (s, a) => Op(s, OpSetJob, a)),
         ["clearbag"] = ("", (s, a) => Op(s, OpClearPack, a)),
         ["client"] = ("<find name>", ClientDiagnostics),
+        ["skillreset"] = ("<plan> (test aid: sends the client's own 31156 skill reset for one plan; result in the server log)",
+            async (s, a) =>
+            {
+                if (a.Length != 1 || !int.TryParse(a[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out int plan))
+                    throw new ArgumentException("<plan>");
+                await services.GetRequiredService<SkillService>().ResetAsync(s, new SkillResetReq { Plan = plan });
+                await ReplyAsync(s, $"Skill reset plan {plan} sent; the result is in the server log.");
+            }),
         ["speed"] = ("<speed, 0 = normal>", async (s, a) => await ReplyAsync(s, await character.SetSpeedAsync(s, L(a[0])))),
         ["quest"] = ("[accept|finish|done <taskId> | reset]", async (s, a) => await ReplyAsync(s, a.Length == 0
             ? "Quests: " + tasks.Describe(s)
