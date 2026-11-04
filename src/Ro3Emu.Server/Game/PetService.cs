@@ -492,6 +492,8 @@ public sealed partial class PetService
     /// Static lineup/collection bonuses from PetStarConfig. Scaling each slot by PetSetLimitConfig's addition and
     /// summing active collection attributes is inferred. Reactive effects are separate from these attributes.
     /// </summary>
+    private static readonly string[] CampAttributeKeys = ["PetCampDestinyAttribute", "PetCampGrowAttribute", "PetCampOrderAttribute", "PetCampPerceptionAttribute"];
+
     private IEnumerable<(long Id, double Value)> Attributes(GameSession s)
     {
         if (s.Pets == null || !_functions.IsOpen(s, PetFunction)) yield break;
@@ -499,6 +501,16 @@ public sealed partial class PetService
             if (StarBaseRow(pet) is { } row)
                 foreach (var attr in GameData.Pairs(row, "_kCollectAttr")) yield return attr;
         if (s.Pets.SetupPlans.GetValueOrDefault(s.Pets.CurrentPlan) is not { } plan) yield break;
+        // Camp bonus: PetCampLimitNum fighting pets of one camp (PetBaseConfig._iCamp) activate that camp's
+        // PetCamp*Attribute once (measured: four camp-1 fighters give the official +1500 Life% exactly once).
+        var publicParams = _data.Table("PublicParamConfig");
+        long campLimit = publicParams.TryGetValue("PetCampLimitNum", out var lim) ? (GameData.Number(lim) is { } n ? (long)n : 3) : 3;
+        foreach (var camp in Slots(plan, 1).Where(x => SlotOpen(s, 1, x.Key) && s.Pets.ListPet.ContainsKey(x.Value))
+                     .Select(x => _data.Row("PetBaseConfig", x.Value) is { } r ? (int)GameData.Int(r, "_iCamp") : 0)
+                     .Where(c => c > 0).GroupBy(c => c).Where(g => g.Count() >= campLimit).Select(g => g.Key))
+            if (publicParams.TryGetValue(CampAttributeKeys[(camp - 1) % CampAttributeKeys.Length], out var campAttr) && campAttr.ValueKind == JsonValueKind.Array)
+                foreach (var pair in campAttr.EnumerateArray().Where(p => p.ValueKind == JsonValueKind.Array && p.GetArrayLength() >= 2))
+                    yield return ((long)(GameData.Number(pair[0]) ?? 0), GameData.Number(pair[1]) ?? 0);
         foreach (var source in new[] { 1, 2 })
             foreach (var (slot, id) in Slots(plan, source))
                 if (SlotOpen(s, source, slot) && s.Pets.ListPet.TryGetValue(id, out var pet)
