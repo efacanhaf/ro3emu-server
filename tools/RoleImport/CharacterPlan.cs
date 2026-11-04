@@ -213,7 +213,7 @@ public sealed class CharacterPlan
         Blob("stat_plans", "BASEATTRINFO", BaseAttrInfo.Descriptor);
         Blob("skill_plans", "DBSKILLDATA", DBSkillData.Descriptor);
         Blob("season_talent", "DBSEASONTALENT", DBSeasonTalent.Descriptor);
-        Blob("season_page", "DBSEASONPAGE", DBSeasonPage.Descriptor);
+        BuildSeasonTalent();        Blob("season_page", "DBSEASONPAGE", DBSeasonPage.Descriptor);
         Blob("season_refine", "DBSEASONREFINE", DBSeasonRefine.Descriptor);
         Blob("card_plans", "DBSTORAGEHOLEINFO", DBStorageHoleInfo.Descriptor);
         Blob("genre", "DBGENRE", DBGenre.Descriptor);
@@ -266,7 +266,44 @@ public sealed class CharacterPlan
         Blobs["equip_plans"] = plans.ToByteArray();
     }
 
-    /// <summary>Game.EquipLevels: strengthen, refine and refine luck per equipment grid (1..7).</summary>
+    /// <summary>
+    /// The talent levels are stored in two projections and the server reads the other one.
+    ///
+    /// Official: `talentNodes` (the top-level map) carries the BOUGHT level of every node (up to its max, 3-4 and 10
+    /// in the reference data) and the five `plan`s only SELECT nodes (level 1). The server's
+    /// `SeasonTalentService.TalentLevel` sums the ACTIVE PLAN's levels and compares that total with each tree's and
+    /// node's `_iNeedLevel` (the grade the panel shows), then it rebuilds `unlockedTrees`, `unlockedNode`, the global
+    /// map and `battleOathMaxLevel` from it on every login — so importing the two projections untouched landed a
+    /// grade of 15, one unlocked tree and an inert node set.
+    ///
+    /// This copies the bought level into every plan node (keeping a plan's own selection when the global map has
+    /// none), which is what makes the login recompute reproduce the official state: grade ≈ the official global sum,
+    /// six trees, the battle oath cap and the activated nodes.
+    /// </summary>
+    private void BuildSeasonTalent()
+    {
+        if (!_snapshot.TryMessage("DBSEASONTALENT", out var json)) { _notes.Add("season_talent: no DBSEASONTALENT in the snapshot"); return; }
+        var full = (DBSeasonTalent)ProtoJson.Parse(DBSeasonTalent.Descriptor, json);
+        long grade = 0;
+        foreach (var plan in full.Plan.Values)
+        {
+            foreach (var (id, bought) in full.TalentNodes)
+                plan.TalentNodes[id] = new DBSeasonTalentNode
+                {
+                    TalentId = id,
+                    CurrentLevel = Math.Max(plan.TalentNodes.GetValueOrDefault(id)?.CurrentLevel ?? 0, bought.CurrentLevel),
+                    IsActivated = bought.IsActivated,
+                };
+            grade = Math.Max(grade, plan.TalentNodes.Values.Sum(node => (long)node.CurrentLevel));
+        }
+        Blobs["season_talent"] = full.ToByteArray();
+        _notes.Add($"season_talent: bought levels copied into the plans (grade {grade}, {full.UnlockedTrees.Count} trees, " +
+            $"oath {full.BattleOathLevel}/{full.BattleOathMaxLevel} in the snapshot)");
+    }
+
+    /// <summary>
+    /// Game.EquipLevels: strengthen, refine and refine luck per equipment grid (1..7).
+    /// </summary>
     private void BuildEquipLevels()
     {
         if (!_snapshot.TryMessage("DBEQUIPINFO", out var json)) { _notes.Add("equip_levels: no DBEQUIPINFO in the snapshot"); return; }

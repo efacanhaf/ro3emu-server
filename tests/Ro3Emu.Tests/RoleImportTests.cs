@@ -190,6 +190,28 @@ public sealed class RoleImportTests
     }
 
     [Fact]
+    public void SeasonTalentBoughtLevelsReachThePlans()
+    {
+        using var snapshot = Fixture();
+        var plan = Build(snapshot);
+        var official = (DBSeasonTalent)ProtoJson.Parse(DBSeasonTalent.Descriptor, snapshot.Message("DBSEASONTALENT"));
+        var imported = DBSeasonTalent.Parser.ParseFrom(plan.Blobs["season_talent"]);
+        // The server reads the grade from the ACTIVE PLAN (SeasonTalentService.TalentLevel), the client keeps the
+        // bought level in the global map: every plan must carry the bought level, or the login rebuild lands one tree.
+        foreach (var (id, bought) in official.TalentNodes)
+            foreach (var (index, season) in imported.Plan)
+                Assert.True(season.TalentNodes[id].CurrentLevel >= bought.CurrentLevel,
+                    $"plan {index} lost node {id}: {season.TalentNodes[id].CurrentLevel} < {bought.CurrentLevel}");
+        // Its own selection survives where the global map has nothing.
+        foreach (var (id, selected) in official.Plan[official.CurPlanId].TalentNodes)
+            Assert.True(imported.Plan[official.CurPlanId].TalentNodes[id].CurrentLevel >= selected.CurrentLevel);
+        // The grade the plan now carries is the official global sum (the client's own total).
+        long grade = imported.Plan[official.CurPlanId].TalentNodes.Values.Sum(node => (long)node.CurrentLevel);
+        long global = official.TalentNodes.Values.Sum(node => (long)node.CurrentLevel);
+        Assert.True(grade >= global, $"grade {grade} < global {global}");
+    }
+
+    [Fact]
     public void MissingMessagesAreReportedNotInvented()
     {
         using var snapshot = SnapshotDocument.Load(Path.Combine(AppContext.BaseDirectory, "Fixtures", "snapshot-kaori.json"));

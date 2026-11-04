@@ -186,8 +186,41 @@ The import also never invents an item the account did not own: a reference to an
 does not carry (a shortcut-bar slot of a consumed item, a Soul Echo slot of a missing echo) is reported
 in the tool's output and dropped rather than pointed at a dangling guid.
 
-## Quests, guides and the functions they open
+## Season talents: the two projections
 
+`DBSEASONTALENT` stores the same progression twice and the client and the server read opposite copies:
+
+- the **global** `talentNodes` map is the BOUGHT level of every node (up to its max — 3-4 and 10 in the
+  reference character, 69 nonzero nodes, sum 598);
+- the five `plan`s only SELECT nodes (level 1, 15 in the DPS/Tank plans);
+- `unlockedTrees` (6), `unlockedNode` (134), `battleOathMaxLevel` (20) and each node's `isActivated` are
+  projections the client shows.
+
+`SeasonTalentService.TalentLevel` sums the **active plan** and compares that grade with every tree's and
+node's `_iNeedLevel`, then rebuilds the trees, the unlocked set, the global map (max across plans) and the
+oath cap on every login. Importing both projections untouched therefore landed a grade of 15, ONE unlocked
+tree and an inert node set — the talents existed but gave nothing (`Replica` lesson: the HP difference
+Eduardo noticed was mostly this).
+
+`CharacterPlan.BuildSeasonTalent` copies the bought level into every plan node (keeping a plan's own
+selection where the global map has none). The login recompute then reproduces the official state:
+six trees, the battle oath 4/20, the global map at the bought levels (max 10) and the activated set.
+Verified live on the reference replica:
+
+| point | official | local |
+|---|---|---|
+| unlocked trees | 6 (10101-10106) | 6 (10101-10106) |
+| battle oath (level / cap) | 4 / 20 | 4 / 20 |
+| global map (nodes / sum / max) | 167 / 598 / 10 | 232 / 619 / 10 |
+| activated nodes | 134 | 104 |
+
+The 232 vs 167 and 619 vs 598 come from the server's own normalisation: it seeds every configured node
+and adds the plan selections (15 nodes at level 1) on top of the bought map. The 30 nodes that stay
+inactive are all `_iType` 7 and have **no attribute rows**: they change the tree's look, not the stats.
+The derived numbers moved accordingly: HP 70 820 -> 113 691, ATK 2 320 -> 2 703, DEF 754 -> 891,
+MDEF 803 -> 940, MATK 1 375 -> 1 636, and ASPD/ASPD base/cast speed/res-crit now match the official.
+
+## Quests, guides and the functions they open
 Quest progress IS copied: `DBTASKINFO` goes into `role.tasks` and `DBGUIDEINFO` into `role.guides`. This
 is what makes the character's windows work, because a function opens by a condition, not by a flag:
 
@@ -278,20 +311,17 @@ second import behave like the first:
   official dump by construction even when the inputs are identical.
 - One instance occupies one equipment grid: the official client can list the same two-handed weapon in
   grids 1 and 2 of a plan, the server writes it in grid 1 and rebuilds the active plan on login.
-- **Derived numbers: still unexplained after the client update.** The local client was mirrored from the
-  official installation (`robocopy /MIR`), patched and re-exported into `data/` — the 517 config tables came
-  out byte-identical to the previous export, and the new client shows the same numbers, so neither the
-  client build nor the data version is the cause. What was ruled out with evidence: the stored character
-  data (items, cards, echo, talents, skills, stat plans — all equal), the client's own attribute formula
-  (`StatCalculator`, recomputed from the same tables: base row + job row + worn gear + cards + echo +
-  conversions), buffs (the official's buffs give +10 ATK/DEF/MDEF and a speed aura, and its HP moves
-  ~6% with them), passives (clearing every learned skill changed HP/SP not at all and ATK by 10) and the
-  equipment (the official now wears 5 pieces where the snapshot had 6, and its HP did not drop). The
-  attributes that depend only on the base level row and the gear (recovery, evade, speed) match exactly,
-  while `maxhp`, `maxsp`, `atk`, `matk`, `def`, `mdef`, `aspd` and cast speed are 1.6-5.6x higher on the
-  official server, so the missing part is a source the client's exported tables do not carry (server-side
-  values). Naming it needs one diagnostic dump of the server's raw attribute map, which is a code change
-  outside this tool's licence.
+- **Derived numbers: the talents were the big part, a residual remains.** After the client mirror, the data
+  re-export and the talent fix the stored data is equal and the talent effects land (see the table above):
+  HP 113 691 against 151 379, SP 1 359 against 7 579, ATK 2 703 against 3 652, MATK 1 636 / 2 373,
+  DEF 891 / 1 335, MDEF 940 / 1 383, while ASPD, ASPD base, cast speed and res-crit match. What was ruled
+  out with evidence: the client build and the data version (the mirrored client is byte-identical to the
+  official install and shows the same numbers), the stored character data (items, cards, echo, plans), the
+  client's own formula (recomputed from the same tables), buffs (the official's buffs give +10 ATK/DEF/MDEF),
+  passives (clearing every skill changed HP/SP not at all) and the 30 inactive echo-less talent nodes (no
+  attribute rows). The residual (about 25% of the HP, all of the SP, ~950 ATK) is a source the client's
+  exported tables do not carry; naming it needs one diagnostic dump of the server's raw attribute map,
+  which is a code change outside this tool's licence.
 - The local client installation may be older than the official launcher's (`C:\Games\ROO_PC` vs
   `C:\Program Files\Genesis Launcher\ROO_PC`). A dataset the local client does not know travels as an
   unknown field and is ignored by the client, not by the server.
