@@ -63,6 +63,8 @@ public sealed partial class CharacterService
     {
         var levels = table.StartsWith("Strengthen") ? session.EquipLevels.Strength : session.EquipLevels.Refine;
         var worn = Equipped(session).Where(i => i.Grid >= 1 && i.Grid <= EquipInfoSlots).Select(i => i.Grid).ToHashSet();
+        // A two-handed weapon occupies grid 2 as well (the official lists it in grids 1 and 2; this server keeps it in grid 1).
+        if (worn.Contains(1) && Equipped(session).Any(i => i.Grid == 1 && Ro3Emu.Server.Data.Config.ItemConfig.Get(data, i.Entry) is { EquipPart: 1 })) worn.Add(2);
         JsonElement? best = null;
         foreach (var (row, grids, level) in ResonanceRows(table))
         {
