@@ -108,7 +108,12 @@ public sealed partial class CombatService
                     await s.SendGameAsync(UseSkill, new CastSkillRsp { Result = 0, IsAutoCast = req.IsAutoCast });
                     return;
                 }
-                error = ErrorCodes.SkillBusy;
+                // The cooldown-free spam (a no-CD action such as Overbrand's 2350 ms loop) yields to any other skill: the
+                // official character's 602 consecutive casts show 152 starting inside the previous action, every one of them
+                // right after the spam and none after a cooldown skill's action (measured on the training dummy).
+                else if (GameData.Int(active.Row, "_iCD") != 0) error = ErrorCodes.SkillBusy;
+                else error = ValidateTarget(s, row.Value, req, origin, owned == null ? WalkSlack(s) : 0,
+                    _data.Row("SkillConfig", request.SkillId) is { } yieldRow ? Range(yieldRow) : 0);
             }
             else error = ValidateTarget(s, row.Value, req, origin, owned == null ? WalkSlack(s) : 0,
                 _data.Row("SkillConfig", request.SkillId) is { } askedRow ? Range(askedRow) : 0);
