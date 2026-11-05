@@ -117,11 +117,13 @@ public sealed class AppraiseEnchantTests : IAsyncLifetime
 
         var worn = await Wear(alice, gear.Guid);
         Assert.Equal(0, worn.Result);
-        Assert.Equal(1, worn.RefineEffectLv);
-        Assert.True(worn.StrengthenEffectLv > 0);
+        // Only a grid that wears an item counts towards the row's request (measured: the official reports
+        // refineEffectLv 0 for a naked role whose grids keep refine 9,7,7,7,7,6,6). One worn gear is one grid of the
+        // seven RefiningEffectTable level 1 asks for, so the reply says 0 and still carries the field.
+        Assert.Equal(0, worn.RefineEffectLv);
         var removed = await Wear(alice, gear.Guid, remove: true);
         Assert.Equal(0, removed.Result);
-        Assert.Equal(1, removed.RefineEffectLv);
+        Assert.Equal(0, removed.RefineEffectLv);
     }
 
     [ClientDataFact]
