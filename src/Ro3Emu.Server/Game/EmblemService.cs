@@ -44,6 +44,9 @@ public sealed partial class EmblemService
     private readonly RoleStore _roles;
     private readonly ILogger<EmblemService> _log;
 
+    /// <summary>The worn echoes changed (equip, plan switch, upgrade): the resonance stages may have changed, so the skills' modes too.</summary>
+    public List<Func<GameSession, Task>> Changed { get; } = [];
+
     /// <summary>After a committed 82424 upgrade: the levels it gained (quest target 317002). Listeners post their work.</summary>
     public List<Action<GameSession, int>> Upgraded { get; } = [];
 
@@ -342,6 +345,7 @@ public sealed partial class EmblemService
     {
         session.EmblemPower = PlanPower(session, Active(session)).SeasonPower;
         if (PublishPower != null) await PublishPower(session);
+        foreach (var handler in Changed) await handler(session);
     }
 
     /// <summary>One accepted change: 5009, 5005, final properties/AOI, power, then 5066 (packet order inferred).</summary>

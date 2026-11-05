@@ -29,6 +29,8 @@ public sealed class ActiveSkillCast
     public required int ActionMs { get; init; }
     public bool Cancelled { get; set; }
     public bool Resolved { get; set; }
+    /// <summary>A leap moved the caster when the skill started (the client lands it after the movement effect, before the hit point).</summary>
+    public bool CasterMoved { get; set; }
     public SkillObject? Operator { get; init; }
     /// <summary>Extra effects remain bound to their equipped source after asynchronous publication.</summary>
     internal Func<bool>? SourceEligible { get; init; }
@@ -713,6 +715,14 @@ public sealed partial class CombatService
         }, highLevel: GameData.Int(row, "_iSkillEffectLevel") > 0, extra: actor != null || req.IsExtraSkill);
         if (leadMs <= 0) await Timeline();
         else ScheduleRuntime(action.WorldScene, TimeSpan.FromMilliseconds(leadMs), () => Live(s, action) ? Timeline() : Task.CompletedTask);
+        // A leap (Twilight, Rift Impact) is a movement of the character that starts with the skill: the client plays it from the cast and lands
+        // before the hit point, then walks on. The server position changes with the skill, not at the hit point, or that walk is "too fast" from
+        // the start, the character is put back and then moved to the landing (the flick Eduardo saw).
+        if (actor == null && leadMs <= 0 && Displacement(row) is { Kind: DisplaceKind.CasterToPoint })
+        {
+            action.CasterMoved = true;
+            await MoveCasterAsync(s, action);
+        }
         var template = _data.SkillTemplate(GameData.Int(row, "_iScriptShow"));
         var points = template is { } t ? Numbers(t, "m_kAtkPoints") : [];
         double point = points.FirstOrDefault(0.2);

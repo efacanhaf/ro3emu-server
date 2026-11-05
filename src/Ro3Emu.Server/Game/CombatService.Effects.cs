@@ -702,6 +702,7 @@ public sealed partial class CombatService
 
     private async Task MoveCasterAsync(GameSession s, ActiveSkillCast action)
     {
+        if (action.CasterMoved && action.Resolved) return; // a leap already moved the caster when the skill started
         if (Displacement(action.Row) is { Kind: DisplaceKind.CasterForward or DisplaceKind.CasterBack or DisplaceKind.CasterToTarget or DisplaceKind.CasterToPoint } move
             && FarChargeHolds(s, action)) await MoveCasterAsync(s, action, move);
     }

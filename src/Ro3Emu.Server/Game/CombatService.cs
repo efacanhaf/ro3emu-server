@@ -263,6 +263,8 @@ public sealed partial class CombatService : IGameTicker
     internal Func<GameSession, JsonElement, int, JsonElement>? TargetCountRow { get; set; }
     /// <summary>May the caster's skill put this _kBuff1 buff on the recipient (TalentProcs: talent-gated buffs).</summary>
     internal Func<GameSession, GameSession, int, bool>? SkillBuffAllowed { get; set; }
+    /// <summary>The SkillConfig rows the worn echoes' reached resonance stages put in use (EmblemService.ResonanceSkills): their buffs select the skills' modes.</summary>
+    private readonly Func<GameSession, IEnumerable<int>> _resonanceSkills;
     public List<Func<GameSession, MonsterUnit, JsonElement, DamageHitResult, long, long>> DamageAdjusters { get; } = [];
     public List<Func<GameSession, MonsterUnit, JsonElement, long, long>> ExtraHitDamage { get; } = [];
     public List<Func<GameSession, MonsterUnit, JsonElement, long, Task>> DealtAsync { get; } = [];
@@ -306,8 +308,10 @@ public sealed partial class CombatService : IGameTicker
 
     public CombatService(World world, MonsterService monsters, CharacterService character, SkillService skills, SceneService scene, BuffService buffs,
         WorldData worldData, SessionRegistry sessions, GameData data, GameLoop loop, ILogger<CombatService> log, PetService pets,
-        SeasonTalentService talents)
+        SeasonTalentService talents, EmblemService emblems)
     {
+        _resonanceSkills = emblems.ResonanceSkills;
+        emblems.Changed.Add(RefreshSkillParametersAsync);
         this._world = world;
         this._monsters = monsters;
         this._character = character;

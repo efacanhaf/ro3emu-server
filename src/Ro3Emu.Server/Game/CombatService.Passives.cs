@@ -124,6 +124,10 @@ public sealed partial class CombatService
             if (MasteryBuff(skill) is { } mastery && MasteryWeapons.TryGetValue((int)skill.SkillId, out var weapons))
                 foreach (var modifier in SkillParameterRules.BuffModifiers(_data, (int)mastery.Id)) result.Add((weapons, modifier));
         }
+        // Echo Resonance: the stage skills (SpecialEffect op 6) are held while their stage is reached; each one's buff of the same id carries
+        // the skill tuples (type 15 selects the enhanced mode: Crescent Moon 11164501 -> mode 1, Blood Cross 11164401 -> mode 2, ...).
+        foreach (int skillRow in _resonanceSkills(session))
+            foreach (var modifier in SkillParameterRules.BuffModifiers(_data, skillRow)) result.Add(([], modifier));
         return result;
     }
 
