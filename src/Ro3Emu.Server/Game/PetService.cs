@@ -42,8 +42,8 @@ public sealed partial class PetService
         this._follower = follower;
         this._clock = clock;
         this._seasons = seasons;
-        _stars = data.Table("PetStarConfig").Values.ToDictionary(r => ((int)GameData.Int(r, "_iPetID"), (int)GameData.Int(r, "_iStar"), (int)GameData.Int(r, "_iStage")));
-        _levels = data.Table("PetExpConfig").Values.ToDictionary(r => ((int)GameData.Int(r, "_iQuality"), (int)GameData.Int(r, "_iLv")));
+        _stars = data.Table("PetStarConfig").Values.ToDictionary(r => ((int)new Ro3Emu.Server.Data.Config.PetStarConfig(r).PetId, (int)new Ro3Emu.Server.Data.Config.PetStarConfig(r).Star, (int)new Ro3Emu.Server.Data.Config.PetStarConfig(r).Stage));
+        _levels = data.Table("PetExpConfig").Values.ToDictionary(r => ((int)new Ro3Emu.Server.Data.Config.PetExpConfig(r).Quality, (int)new Ro3Emu.Server.Data.Config.PetExpConfig(r).Lv));
         character.ExtraAttributes.Add(Attributes);
         character.SpecialItemUse.Add(TryUseSelfChooseAsync);
         character.RegisterItemAction(AddIncubateRoomExpAction, UseRoomExpItemAsync);
