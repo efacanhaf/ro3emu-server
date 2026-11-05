@@ -48,8 +48,10 @@ public sealed partial class CardService
         _ => [],
     };
 
-    /// <summary>Grids 8-10 (the MVP/Sketch card sockets) open without a condition: the official plans use them.</summary>
-    private static bool OpenSketchGrid(int grid) => grid is >= 8 and <= 10;
+    /// <summary>Grid 10 (the Sketch/MVP mouth grid) opens without a condition: the official's card plan holds a part 9
+    /// card there (Eduardo's Kaori, 1440909 on grid 10 socket 1) and EquipGridConfig has no row for it. Grids 8 and 9 do
+    /// have one (_kSocketOpen1 4000007/4000008, base level 20) and keep it.</summary>
+    private static bool OpenSketchGrid(int grid) => grid == 10;
 
     private readonly GameData _data;
     private readonly CharacterService _character;
