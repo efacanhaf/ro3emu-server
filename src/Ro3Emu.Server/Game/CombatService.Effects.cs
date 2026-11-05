@@ -746,7 +746,14 @@ public sealed partial class CombatService
     {
         var to = action.Request.TargetPos ?? s.Position;
         float dx = to.X - s.Position.X, dz = to.Z - s.Position.Z, length = MathF.Sqrt(dx * dx + dz * dz), go = MathF.Min(length, reach);
-        return go < 0.5f ? null : WalkableEnd(s.SceneEntry, s.Position, dx / length * go, dz / length * go);
+        if (go < 0.5f) return null;
+        // A leap does not walk the way: the client lands the caster on the chosen point whatever lies in between, so the server lands it
+        // there too whenever that point is standable. Stopping at the first obstacle left the server at the start while the client was
+        // at the target: the next step snapped the character back (Twilight "salta, e ao andar volta para a posicao anterior").
+        float lx = s.Position.X + dx / length * go, lz = s.Position.Z + dz / length * go;
+        if (_worldData.Map(s.SceneEntry)?.Nav is { } nav && nav.WalkHeight(lx, lz, s.Position.Y) is { } landY && MathF.Abs(landY - s.Position.Y) <= 3f)
+            return new Vec3 { X = lx, Y = landY, Z = lz };
+        return WalkableEnd(s.SceneEntry, s.Position, dx / length * go, dz / length * go);
     }
 
     /// <summary>Where a target displacement starts from (the caster, or the area's centre) and whether it pushes; null for
