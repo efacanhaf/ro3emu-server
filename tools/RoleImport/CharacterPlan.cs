@@ -272,19 +272,27 @@ public sealed class CharacterPlan
     }
 
     /// <summary>
-    /// The official client's own DBSEASONTALENT is imported as-is. Its shape is the rule SeasonTalentService keeps:
-    /// <c>talentNodes</c> (the top-level map) carries the bought level of every ordinary node (types 1/2) and the battle
-    /// oath, while each of the five <c>plan</c>s holds only the profession-choice members (SkillPoint, Profession_L,
-    /// Profession_M). The server derives that split again on every login (Seed moves anything an older save put in the
-    /// other map), so the imported blob lands untouched.
+    /// The official client's own DBSEASONTALENT is imported, then rewritten into the shape this server's
+    /// SeasonTalentService reads: the bought level of a node lives in the ACTIVE plan's <c>talentNodes</c> map (Seed only
+    /// seeds the missing entries at zero, it moves nothing), while the official blob keeps the ordinary purchases in the
+    /// top-level map and only the profession choices per plan. Every global entry (ordinary nodes and the battle oath) is
+    /// therefore copied into every plan, and the plan's own choice level wins when it is higher.
     /// </summary>
     private void BuildSeasonTalent()
     {
         if (!_snapshot.TryMessage("DBSEASONTALENT", out var json)) { _notes.Add("season_talent: no DBSEASONTALENT in the snapshot"); return; }
         var full = (DBSeasonTalent)ProtoJson.Parse(DBSeasonTalent.Descriptor, json);
+        int copied = 0;
+        foreach (var plan in full.Plan.Values)
+            foreach (var (id, node) in full.TalentNodes)
+                if (!plan.TalentNodes.TryGetValue(id, out var existing) || existing.CurrentLevel < node.CurrentLevel)
+                {
+                    plan.TalentNodes[id] = new DBSeasonTalentNode { TalentId = id, CurrentLevel = node.CurrentLevel, IsActivated = node.IsActivated };
+                    copied++;
+                }
         Blobs["season_talent"] = full.ToByteArray();
-        _notes.Add($"season_talent: imported as-is ({full.TalentNodes.Count} global nodes, {full.Plan.Count} plans, " +
-            $"{full.UnlockedTrees.Count} trees, oath {full.BattleOathLevel}/{full.BattleOathMaxLevel})");
+        _notes.Add($"season_talent: {full.TalentNodes.Count} global nodes copied into the {full.Plan.Count} plans " +
+            $"({copied} plan entries), {full.UnlockedTrees.Count} trees, oath {full.BattleOathLevel}/{full.BattleOathMaxLevel}");
     }
 
     /// <summary>

@@ -192,20 +192,25 @@ public sealed class RoleImportTests
     }
 
     [Fact]
-    public void SeasonTalentImportsTheOfficialBlobUntouched()
+    public void SeasonTalentCopiesTheOfficialGlobalLevelsIntoEveryPlan()
     {
         using var snapshot = Fixture();
         var plan = Build(snapshot);
         var official = (DBSeasonTalent)ProtoJson.Parse(DBSeasonTalent.Descriptor, snapshot.Message("DBSEASONTALENT"));
         var imported = DBSeasonTalent.Parser.ParseFrom(plan.Blobs["season_talent"]);
-        // The official client's own save is the model SeasonTalentService rebuilds: bought levels (and the oath) in
-        // the global map, the profession choices in the plans. Nothing is translated on the way in.
-        Assert.Equal(official, imported);
-        Assert.All(imported.Plan, season => Assert.All(season.Value.TalentNodes.Keys,
-            id => Assert.True(id is not 10101001 and not 10100000, $"plan carries the bought node {id}")));
+        // SeasonTalentService keeps a node's bought level in the ACTIVE plan's map (Seed seeds zeros only), while the
+        // official save keeps the ordinary purchases in the top-level map: the importer copies every global entry into
+        // every plan so the character keeps its talents, and a plan's own choice level wins when it is higher.
+        Assert.Equal(official.TalentNodes.Count, imported.TalentNodes.Count);
+        Assert.All(imported.Plan, season => Assert.All(imported.TalentNodes,
+            global => Assert.True(season.Value.TalentNodes.TryGetValue(global.Key, out var node)
+                && node.CurrentLevel == global.Value.CurrentLevel,
+                $"plan misses the bought node {global.Key} at level {global.Value.CurrentLevel}")));
         Assert.Contains(10101001L, imported.TalentNodes.Keys);
         Assert.Contains(10100000L, imported.TalentNodes.Keys);
-        Assert.Contains(10102003L, imported.Plan[official.CurPlanId].TalentNodes.Keys); // a SkillPoint gate
+        Assert.Contains(10102003L, imported.Plan[official.CurPlanId].TalentNodes.Keys); // a SkillPoint gate stays a plan choice
+        Assert.Equal(official.Plan[official.CurPlanId].TalentNodes[10102003L].CurrentLevel,
+            imported.Plan[official.CurPlanId].TalentNodes[10102003L].CurrentLevel);
     }
 
     [Fact]
