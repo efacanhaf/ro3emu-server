@@ -63,7 +63,7 @@ public sealed partial class SkillCombatTests
     [InlineData(16305, 1630501, 1630505, 1f, true)]    // Heavy Axe Smash: in front of the target
     [InlineData(10032, 1003201, 1003205, 1f, true)]    // Warg Strike: more than 5 m away
     [InlineData(11301, 1130101, 1130109, 0f, false)]   // Rift Impact: onto the point
-    [InlineData(11607, 1160701, 1160707, 0f, false)]   // Twilight: onto the point
+    [InlineData(11607, 1160701, 1160707, 1f, false)]   // Twilight: onto the point, 1 m short when a monster stands there
     public async Task ACastersChargeEndsWhereItsTextSays(int group, int skill, int effect, float stopsShort, bool atTarget)
     {
         await using var alice = await InWorld("Alice");

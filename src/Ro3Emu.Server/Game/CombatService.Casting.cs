@@ -306,6 +306,9 @@ public sealed partial class CombatService
         var next = new SkillConfig(row);
         var running = new SkillConfig(active.Row);
         if (next.IsNormalAttack(_data) && running.IsNormalAttack(_data)) return next.CancelCast && !SwingInFlight(active, row, req);
+        // A key held down repeats the running skill before its hit point (the yield point is the show's interrupt time less the click
+        // jitter): cancelling it first lost every hit until the key was released. The repeat waits for the hit; the client resends.
+        if (!active.Resolved && running.Id == next.Id && active.Operator == null) return false;
         return CastYields(running.InterruptedType, running.Id == next.Id, Now - active.StartMs,
             SkillShow.InterruptOffset(_data.SkillTemplate(running.ScriptShow), active.ChantMs, active.ActionMs));
     }

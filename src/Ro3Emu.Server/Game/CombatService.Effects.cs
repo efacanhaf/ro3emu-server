@@ -766,6 +766,8 @@ public sealed partial class CombatService
     {
         var to = action.Request.TargetPos ?? s.Position;
         float dx = to.X - s.Position.X, dz = to.Z - s.Position.Z, length = MathF.Sqrt(dx * dx + dz * dz), go = MathF.Min(length, reach);
+        // Twilight aimed at a monster lands one metre short of it, not on its tile.
+        if (Script(action.Row).StartsWith("HesperusLit", StringComparison.Ordinal) && MonstersNear(s, new Vec3 { X = s.Position.X + dx / length * go, Y = s.Position.Y, Z = s.Position.Z + dz / length * go }, 1.5f).Count > 0) go -= 1f;
         if (go < 0.5f) return null;
         // A leap does not walk the way: the client lands the caster on the chosen point whatever lies in between, so the server lands it
         // there too whenever that point is standable. Stopping at the first obstacle left the server at the start while the client was
