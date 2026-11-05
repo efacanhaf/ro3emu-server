@@ -53,6 +53,13 @@ internal sealed class WalkAllowance
         if (until > _heldUntil) _heldUntil = until;
     }
 
+    /// <summary>Gives the walk <paramref name="metres"/> of credit (a leap's landing: the steps the client takes before the sync reaches it).</summary>
+    internal void Grant(DateTime now, double metresPerSecond, double metres)
+    {
+        Refill(now, metresPerSecond);
+        _metres = Math.Min(metresPerSecond * Tolerance * CapSeconds + FloorMetres, _metres + metres);
+    }
+
     /// <summary>The hold ends early (the cast was cancelled).</summary>
     internal void Release(DateTime now)
     {

@@ -746,6 +746,7 @@ public sealed partial class CombatService
                 if (s.Role == null || s.SceneLoading || s.WorldScene != action.WorldScene || s.SceneGeneration != action.SceneGeneration) return;
                 if (Distance(s.Position, end) > 0.5f) return; // moved on already (a later cast or a walk the server accepted)
                 s.WalkAllowance.Release(DateTime.UtcNow); // the client walks on from the landing: no walk credit is held back any more
+                s.WalkAllowance.Grant(DateTime.UtcNow, SceneService.WalkSpeed(s), 3); // and the steps it took before the sync reached it are not a cheat
                 await _scene.TeleportInMapAsync(s, new MapPoint(end.X, end.Y, end.Z, s.Face));
             });
     }
