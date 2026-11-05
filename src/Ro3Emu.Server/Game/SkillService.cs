@@ -80,7 +80,7 @@ public sealed partial class SkillService
 
     /// <summary>SkillConfig._iMaxLevel is the learnable cap.</summary>
     public int MaxLevel(int group) => _data.Row("SkillConfig", RealId(group, 1)) is { } row
-        ? (int)GameData.Int(row, "_iMaxLevel") : 0;
+        ? (int)new Ro3Emu.Server.Data.Config.SkillConfig(row).MaxLevel : 0;
 
     /// <summary>
     /// The career's normal attack: JobConfig._kSkillNormalID (a row id). (inferred) The Magician careers name 1200001, which has
@@ -102,13 +102,13 @@ public sealed partial class SkillService
 
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, int> _unnamedAttacks = new();
 
-    internal int Rank(int career) => (int)(_data.Row("JobConfig", career) is { } job ? Math.Max(1, GameData.Int(job, "_iJobRank")) : 1);
+    internal int Rank(int career) => (int)(_data.Row("JobConfig", career) is { } job ? Math.Max(1, new Ro3Emu.Server.Data.Config.JobConfig(job).JobRank) : 1);
 
     /// <summary>The career and its parents (JobConfig._iParentId), novice first.</summary>
     private List<int> CareerChain(int career)
     {
         var chain = new List<int>();
-        for (int c = career; c > 0 && chain.Count < 8 && _data.Row("JobConfig", c) is { } job; c = (int)GameData.Int(job, "_iParentId")) chain.Insert(0, c);
+        for (int c = career; c > 0 && chain.Count < 8 && _data.Row("JobConfig", c) is { } job; c = (int)new Ro3Emu.Server.Data.Config.JobConfig(job).ParentId) chain.Insert(0, c);
         return chain;
     }
 
