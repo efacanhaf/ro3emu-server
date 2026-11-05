@@ -718,6 +718,9 @@ public sealed partial class CombatService
         // The rest of the show plays where the charge ended: a stop reported there is no walk that interrupts the cast.
         if (move.Kind is DisplaceKind.CasterToTarget or DisplaceKind.CasterToPoint) action.Origin = end.Clone();
         var start = s.Position.Clone();
+        if (move.Kind == DisplaceKind.CasterToPoint)
+            _log.LogInformation("{Name} leap {Skill}: server position {From} -> {To} (asked {Target}, walking {Walking}, resolved {Resolved})", s.Role?.Name, action.Request.SkillId,
+                $"{start.X:F1},{start.Z:F1}", $"{end.X:F1},{end.Z:F1}", action.Request.TargetPos is { } t ? $"{t.X:F1},{t.Z:F1}" : "-", action.StartedWalking, action.Resolved);
         await ToPlayerAndViewersAsync(s, SkillMove, new SkillStartMoveNotify
         {
             EntityID = (ulong)s.Role!.Id, StartPos = start, EndPos = end, SkillConfigId = action.Request.SkillId,

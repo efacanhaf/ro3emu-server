@@ -718,10 +718,12 @@ public sealed partial class CombatService
         // A leap (Twilight, Rift Impact) is a movement of the character that starts with the skill: the client plays it from the cast and lands
         // before the hit point, then walks on. The server position changes with the skill, not at the hit point, or that walk is "too fast" from
         // the start, the character is put back and then moved to the landing (the flick Eduardo saw).
-        if (actor == null && leadMs <= 0 && Displacement(row) is { Kind: DisplaceKind.CasterToPoint })
+        if (actor == null && Displacement(row) is { Kind: DisplaceKind.CasterToPoint })
         {
             action.CasterMoved = true;
-            await MoveCasterAsync(s, action);
+            // The turn towards the point (leadMs) comes first: the client starts the leap when the skill starts.
+            if (leadMs <= 0) await MoveCasterAsync(s, action);
+            else ScheduleRuntime(action.WorldScene, TimeSpan.FromMilliseconds(leadMs), () => Live(s, action) ? MoveCasterAsync(s, action) : Task.CompletedTask);
         }
         var template = _data.SkillTemplate(GameData.Int(row, "_iScriptShow"));
         var points = template is { } t ? Numbers(t, "m_kAtkPoints") : [];
