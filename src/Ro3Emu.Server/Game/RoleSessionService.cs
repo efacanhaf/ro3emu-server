@@ -359,6 +359,9 @@ public sealed partial class RoleSessionService(RoleStore roles, Data.GameData da
             SceneService.HoldWalk(session, DateTime.UtcNow, walking: false);
             return;
         }
+        // A leap's launch point is still reported by the client for a moment (its stop at the cast, before the landing sync): stale, not a walk.
+        if (session.SkillCast is { LeapFrom: { } leapFrom } leap && MonsterService.NowMs < leap.LeapUntilMs
+            && MonsterService.Distance(walk.Pos.X, walk.Pos.Z, leapFrom.X, leapFrom.Z) < 1.5f) return;
         if (!await scene.AcceptWalkAsync(session, walk)) return;
         session.PreviousPosition = session.Position;
         session.Position = walk.Pos;

@@ -31,6 +31,9 @@ public sealed class ActiveSkillCast
     public bool Resolved { get; set; }
     /// <summary>A leap moved the caster when the skill started (the client lands it after the movement effect, before the hit point).</summary>
     public bool CasterMoved { get; set; }
+    /// <summary>Where a leap started and until when the client may still report that spot (its stop at the cast): such a walk is stale, not a cheat.</summary>
+    public Vec3? LeapFrom { get; set; }
+    public long LeapUntilMs { get; set; }
     public SkillObject? Operator { get; init; }
     /// <summary>Extra effects remain bound to their equipped source after asynchronous publication.</summary>
     internal Func<bool>? SourceEligible { get; init; }
