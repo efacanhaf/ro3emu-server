@@ -733,6 +733,15 @@ public sealed partial class CombatService
         s.LastWalkUtc = DateTime.UtcNow; // the dash ends the walk it interrupted (GameSession.WalkReportLag)
         s.Walking = false;
         await _world.MoveAsync(s, new WalkReq { Pos = end, Dir = s.Face, Face = s.Face, BStop = true }, forceTeleport: true);
+        // The client plays a leap on the model but keeps its own logical position at the start (measured: after every leap its next walk report
+        // starts back at the launch point, "too fast" from where the server put it). The mover is told where it landed, when the leap ends.
+        if (move.Kind == DisplaceKind.CasterToPoint)
+            ScheduleRuntime(action.WorldScene, TimeSpan.FromMilliseconds(Math.Max(move.Ms, 100) + 40), async () =>
+            {
+                if (s.Role == null || s.SceneLoading || s.WorldScene != action.WorldScene || s.SceneGeneration != action.SceneGeneration) return;
+                if (Distance(s.Position, end) > 0.5f) return; // moved on already (a later cast or a walk the server accepted)
+                await _scene.TeleportInMapAsync(s, new MapPoint(end.X, end.Y, end.Z, s.Face));
+            });
     }
 
     /// <summary>Where a charge at the cast's target ends: that far in front of where the target stands now, clipped to

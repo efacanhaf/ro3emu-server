@@ -108,6 +108,9 @@ public sealed partial class CombatService
     /// Mastery 1522001: "[Assassin Normal Attack] CRIT Chance increases by ${5}%, but its damage is reduced by ${6}%" is
     /// [15000, 10, +4000] and [15000, 29, -2000]) and a mastery row's (Mace Mastery's normal attack CRIT).
     /// </summary>
+    /// <summary>Resonance skill group -> the skill group whose enhanced mode it selects (see <see cref="PassiveModifiers"/>).</summary>
+    private static readonly Dictionary<int, (int Group, int Mode)> ResonanceModes = new() { [111641] = (11628, 1), [111642] = (11607, 1), [111643] = (11604, 5) };
+
     internal IReadOnlyList<(long[] Weapons, SkillParameterRules.Modifier Modifier)> PassiveModifiers(GameSession session)
     {
         var result = new List<(long[], SkillParameterRules.Modifier)>();
@@ -124,10 +127,13 @@ public sealed partial class CombatService
             if (MasteryBuff(skill) is { } mastery && MasteryWeapons.TryGetValue((int)skill.SkillId, out var weapons))
                 foreach (var modifier in SkillParameterRules.BuffModifiers(_data, (int)mastery.Id)) result.Add((weapons, modifier));
         }
-        // Echo Resonance: the stage skills (SpecialEffect op 6) are held while their stage is reached; each one's buff of the same id carries
-        // the skill tuples (type 15 selects the enhanced mode: Crescent Moon 11164501 -> mode 1, Blood Cross 11164401 -> mode 2, ...).
+        // Echo Resonance: the skills a reached stage puts in use (SpecialEffect op 6: 111641 Moonlit Echo, 111642 Radiant Bloom, 111643 Golden
+        // Moon Ring) have no row data of their own; their effect is the enhanced MODE of the skill they name. (inferred from the official character: its
+        // wheel holds Crescent Moon mode 1, Twilight mode 1 and Blood Cross mode 5 with exactly these three stages reached, and the resonance text
+        // numbers (6 s / +10%, 4 s / +60%, +4% / 20% slow) are those modes' rows.)
         foreach (int skillRow in _resonanceSkills(session))
-            foreach (var modifier in SkillParameterRules.BuffModifiers(_data, skillRow)) result.Add(([], modifier));
+            if (ResonanceModes.TryGetValue(skillRow / 100, out var target))
+                result.Add(([], new SkillParameterRules.Modifier(target.Group, 15, 2, target.Mode, 0)));
         return result;
     }
 

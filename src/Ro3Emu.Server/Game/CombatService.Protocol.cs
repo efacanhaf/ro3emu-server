@@ -84,7 +84,15 @@ public sealed partial class CombatService
     {
         if (session.Role == null || session.Progress == null) return;
         var passives = PassiveModifiers(session);
-        if (!passives.SequenceEqual(session.PassiveSkillModifiers)) session.PassiveSkillModifiers = passives;
+        if (!passives.SequenceEqual(session.PassiveSkillModifiers))
+        {
+            session.PassiveSkillModifiers = passives;
+            _log.LogInformation("{Name} skill parameters: resonance skills [{Skills}], passive modifiers {Count}, mode 11628={A} 11604={B} 11607={C}", session.Role.Name,
+                string.Join(',', _resonanceSkills(session)), passives.Count,
+                SkillParameterRules.Mode(11628, [], SkillParameterRules.Active(session, _data)),
+                SkillParameterRules.Mode(11604, [], SkillParameterRules.Active(session, _data)),
+                SkillParameterRules.Mode(11607, [], SkillParameterRules.Active(session, _data)));
+        }
         var mods = SkillParameterRules.Active(session, _data);
         var update = new SkillBeAffectedParamExNotify { IsAll = true, Uuid = session.Role.Id };
         // Scope 0 names its group; a scope-1 tag selector reaches every learned skill whose row carries its tags.
