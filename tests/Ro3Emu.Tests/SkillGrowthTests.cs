@@ -582,8 +582,9 @@ public sealed class SkillGrowthTests : IAsyncLifetime
         Assert.Equal(13006, durable.SkillAssignPlans[1].SkillQueue[0].SkillId);
     }
 
-    // The official's wheel carries the enhanced modes (1/0/1/5 for 1160720/1160205/1162815/1160455). They travel in the
-    // saved skill_plans blob; a login, a preset switch and a skill reset must keep them (Eduardo, msg-identico-7 item 1).
+    // The wheel is rebuilt at login from the bar with the enhanced mode the session's modifiers select (the community's
+    // rule after the revert; with no echo resonance the mode is 0), and a relog or a reset of another plan keeps it
+    // exactly as built (Eduardo, msg-identico-7 item 1, retargeted in round 11).
     [ClientDataFact]
     public async Task TheImportedWheelModesSurviveLoginPresetSwitchAndReset()
     {
@@ -606,7 +607,7 @@ public sealed class SkillGrowthTests : IAsyncLifetime
         plans.SkillAssignPlans.Add(plan);
         for (int index = 1; index < 5; index++) plans.SkillAssignPlans.Add(new SkillPlan { IsUnlock = true });
         var wheel = new SkillWheel { AtkSkillId = 1140001 };
-        foreach (var (slot, id, mode) in new[] { (1, 1160720, 1), (2, 1160205, 0), (3, 1162815, 1), (4, 1160455, 5) })
+        foreach (var (slot, id, mode) in new[] { (1, 1160710, 0), (2, 1160205, 0), (3, 1162805, 0), (4, 1160405, 0) })
             wheel.WhellSkills[slot] = new SkillWheelSlot { SkillConfigId = id, Enable = true, Mode = mode };
         plans.SkillWheel = wheel;
         plans.OriginSkillWheel = wheel.Clone();
