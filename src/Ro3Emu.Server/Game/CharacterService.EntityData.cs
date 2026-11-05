@@ -189,11 +189,6 @@ public sealed partial class CharacterService
                     else Add(id, v);
                 }
         }
-        foreach (var (id, value) in EquipmentStunts.FlatAttributes(session, data))
-        {
-            if (id is >= 1 and <= 6) baseStats[id - 1] += value;
-            else Add(id, value);
-        }
         _attributeSource = "stunt";
         foreach (var (id, value) in EquipmentStunts.FlatAttributes(session, data)) Give(id, value);
         // Grid levels: StrengthenTable / RefiningTable _kAttr are totals at a level, counted for a
