@@ -192,15 +192,18 @@ internal static class SkillParameterRules
         foreach (var mod in modifiers)
             if (mod.Type == 15 && Matches(mod, group, tags))
             {
-                // Blood Cross under Over Brand is mode 4 (OverBrand2); with the echo resonance's Golden Moon Ring (mode 5 held first) it is the season's
-                // Over Brand variant, mode 2 (OverBrands1: the official character's slot alternates 1160455 / 1160425, never 1160445). (inferred)
-                if (mod.Value == 5 && group == BloodCross) enhanced = true;
-                mode = enhanced && group == BloodCross && mod.Value == 4 ? 2 : Apply(mode, mod);
+                // Blood Cross: 0 normal, 4 = Over Brand active (the buff Over Brand sets it), 2 = normal with the echo resonance's Golden Moon Ring
+                // (the season variant, ResonanceMarker), 5 = Over Brand active with it (the row with the 20% slow). (SkillConfig rows 1160401/41/21/51)
+                if (group == BloodCross && mod.Index == ResonanceMarker) enhanced = true;
+                mode = enhanced && group == BloodCross && mod.Value == 4 ? 5 : Apply(mode, mod);
             }
         return (int)Math.Clamp(mode, 0, 99);
     }
 
     private const int BloodCross = 11604;
+
+    /// <summary>Modifier.Index of the tuples the echo resonance adds (CombatService.PassiveModifiers): they select the season's enhanced variant.</summary>
+    internal const int ResonanceMarker = 99;
 
     /// <summary>
     /// Type 10 tuples add a CRIT chance in basis points to their skills' hits: Advanced Katar Mastery's "[Assassin Normal

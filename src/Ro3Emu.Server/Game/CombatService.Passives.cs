@@ -109,7 +109,7 @@ public sealed partial class CombatService
     /// [15000, 10, +4000] and [15000, 29, -2000]) and a mastery row's (Mace Mastery's normal attack CRIT).
     /// </summary>
     /// <summary>Resonance skill group -> the skill group whose enhanced mode it selects (see <see cref="PassiveModifiers"/>).</summary>
-    private static readonly Dictionary<int, (int Group, int Mode)> ResonanceModes = new() { [111641] = (11628, 1), [111642] = (11607, 1), [111643] = (11604, 5) };
+    private static readonly Dictionary<int, (int Group, int Mode)> ResonanceModes = new() { [111641] = (11628, 1), [111642] = (11607, 1), [111643] = (11604, 2) };
 
     internal IReadOnlyList<(long[] Weapons, SkillParameterRules.Modifier Modifier)> PassiveModifiers(GameSession session)
     {
@@ -133,7 +133,7 @@ public sealed partial class CombatService
         // numbers (6 s / +10%, 4 s / +60%, +4% / 20% slow) are those modes' rows.)
         foreach (int skillRow in _resonanceSkills(session))
             if (ResonanceModes.TryGetValue(skillRow / 100, out var target))
-                result.Add(([], new SkillParameterRules.Modifier(target.Group, 15, 2, target.Mode, 0)));
+                result.Add(([], new SkillParameterRules.Modifier(target.Group, 15, 2, target.Mode, SkillParameterRules.ResonanceMarker)));
         return result;
     }
 

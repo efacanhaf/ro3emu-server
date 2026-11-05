@@ -70,7 +70,7 @@ public sealed partial class SkillCombatTests
         var modes = await ModesInUse(combat, session);
         Assert.Contains((11628, 1), modes); // 111641 - Crescent Moon's enhanced mode
         Assert.Contains((11607, 1), modes); // 111642 - Twilight's
-        Assert.Contains((11604, 5), modes); // 111643 - Blood Cross's
+        Assert.Contains((11604, 2), modes); // 111643 - Blood Cross's (mode 2 normal; Over Brand turns it into 5, see SkillParameterRules.Mode)
 
         // Under six lit marks of one id only stage 1 is reached (its effects are Attr1CountAddAttr2ForJob), so no mode
         // is put in use.
