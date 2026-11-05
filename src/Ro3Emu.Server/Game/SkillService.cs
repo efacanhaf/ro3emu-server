@@ -272,10 +272,46 @@ public sealed partial class SkillService
 
         var wheel = new SkillWheel { AtkSkillId = atk };
         foreach (var (slot, group) in Bar(p))
-            if (RealId(group, Level(p, group)) is var id and > 0) wheel.WhellSkills[slot] = new SkillWheelSlot { SkillConfigId = id, Enable = true };
+            if (WheelSlot(session, group, Level(p, group)) is { } filled) wheel.WhellSkills[slot] = filled;
         skillData.SkillWheel = wheel;
-        skillData.OriginSkillWheel = wheel.Clone();
+        skillData.OriginSkillWheel = PlainWheel(wheel);
         return skillData;
+    }
+
+    /// <summary>
+    /// One bar slot, carrying the row of the mode the session's live type-15 tuples select (Over Brand puts Blood Cross on
+    /// its 116044X row). The PC bar renders whellSkills, and that row's _kIcon and _iDescription are what the client shows;
+    /// the official character's own wheel holds the mode rows (1160455 mode 5 for Blood Cross).
+    /// </summary>
+    private SkillWheelSlot? WheelSlot(GameSession session, int group, int level)
+    {
+        int id = level > 0 ? RealId(group, level) : 0;
+        if (id <= 0 || _data.Row("SkillConfig", id) is not { } row) return null;
+        // A normal attack stays on its plain row: the career/mount attack already repaints that slot (ApplyCurrentAttack),
+        // and its own mode (13099 -> 1309911 with the same icon) would leak into originSkillWheel. (inferred)
+        bool normal = new SkillConfig(row).IsNormalAtk == 1
+            || session.Progress is { } progress && IsChainNormalGroup(progress, group);
+        int mode = normal ? 0
+            : SkillParameterRules.Mode(group, SkillParameterRules.CategoriesOf(_data, row), SkillParameterRules.Active(session, _data));
+        int modeId = mode == 0 ? 0 : RealId(group, level, mode);
+        return new SkillWheelSlot
+        {
+            SkillConfigId = modeId > 0 ? modeId : id, Enable = true, Mode = modeId > 0 ? mode : 0,
+        };
+    }
+
+    /// <summary>The wheel as the client keeps it for a restore: the same slots on their plain rows, no mode.</summary>
+    private SkillWheel PlainWheel(SkillWheel live)
+    {
+        var plain = live.Clone();
+        foreach (var slot in plain.WhellSkills.Values)
+            if (SkillConfig.Get(_data, slot.SkillConfigId) is { Mode: > 0 } row
+                && RealId((int)row.SkillId, (int)row.Level) is var id and > 0)
+            {
+                slot.SkillConfigId = id;
+                slot.Mode = 0;
+            }
+        return plain;
     }
 
     /// <summary>Load 5025 plans once per selected role, preserving the former single active progression plan.</summary>
@@ -511,9 +547,13 @@ public sealed partial class SkillService
         {
             state.SkillWheel.WhellSkills.Clear();
             for (int slot = 1; slot <= Math.Min(BarSlots, selected.ManualLoadSkill.Count); slot++)
-                if (selected.ManualLoadSkill[slot - 1] is { SkillId: > 0 } skill && BarGroup(session.Progress!, skill.SkillId) is var group and > 0
-                    && RealId(group, group == skill.SkillId ? skill.SkillLevel : Level(session.Progress!, group)) is var id and > 0)
-                    state.SkillWheel.WhellSkills[slot] = new SkillWheelSlot { SkillConfigId = id, Enable = true };
+            {
+                if (selected.ManualLoadSkill[slot - 1] is not { SkillId: > 0 } skill) continue;
+                int group = BarGroup(session.Progress!, skill.SkillId);
+                int level = group == skill.SkillId ? skill.SkillLevel : Level(session.Progress!, group);
+                if (group <= 0 || WheelSlot(session, group, level) is not { } filled) continue;
+                state.SkillWheel.WhellSkills[slot] = filled;
+            }
         }
         if (selected.SkillQueue.Values.Any(skill => skill.SkillId > 0) && QueueGroup(session.Progress!.Career) is > 0 and var lineup
             && RealId(lineup, 1) is var lineupId and > 0)
@@ -534,7 +574,8 @@ public sealed partial class SkillService
             && RealId(queueGroup, Math.Max(1, Level(session.Progress!, queueGroup))) is var queueId and > 0)
             state.SkillWheel.WhellSkills[(int)SkillWheelSlotType.SkillWheelSkillQueue] =
                 new SkillWheelSlot { SkillConfigId = queueId, Enable = true };
-        state.OriginSkillWheel = state.SkillWheel.Clone();
+        // The origin wheel is the client's restore copy: it keeps the plain rows, so a buff's mode never shows up there.
+        state.OriginSkillWheel = PlainWheel(state.SkillWheel);
         return state;
     }
 

@@ -149,6 +149,45 @@ public sealed class SkillProtocolTests : IAsyncLifetime
         Assert.Empty(boss.BossSkillCds);
     }
 
+    [ClientDataFact]
+    public async Task BloodCrossBarSlotSwitchesToTheOverBrandRowWhileTheBuffIsLive()
+    {
+        await using var alice = await InWorld("Alice");
+        var session = Session("alice");
+        var buffs = _app.Services.GetRequiredService<BuffService>();
+
+        await Run(() =>
+        {
+            session.Progress!.Skills[11604] = 5;
+            session.Progress.SkillBar[4] = 11604;
+            return Task.CompletedTask;
+        });
+
+        await Run(() => buffs.AddAsync(session, 1160101, 6000, session.Role!.Id));
+        var changed = await Next(alice, CombatService.SkillSlotModify, SkillSlotModifyNotify.Parser,
+            m => m.Slot == 4);
+        Assert.Equal(1, changed.Type);
+        Assert.Equal(1160405, changed.SourceSkillId);
+        Assert.Equal(1160445, changed.SkillId);
+        Assert.True(changed.Enable);
+        // The PC bar renders whellSkills: the 5025 increment must carry the same mode row and its icon/description.
+        var wheel = await Next(alice, SkillService.SkillDataSync, DBSkillDataIncrement.Parser, d =>
+            d.SkillWheel?.Inc?.WhellSkills.TryGetValue(4, out var s) == true
+            && (s.Inc?.SkillConfigId == 1160445 || s.All?.SkillConfigId == 1160445));
+        var slot = wheel.SkillWheel.Inc.WhellSkills[4];
+        Assert.Equal(4, slot.Inc?.Mode ?? slot.All?.Mode);
+
+        await Run(() => buffs.RemoveAsync(session, session.Buffs.Single(b => b.ConfigId == 1160101)));
+        var reverted = await Next(alice, CombatService.SkillSlotModify, SkillSlotModifyNotify.Parser,
+            m => m.Slot == 4);
+        Assert.Equal(1160405, reverted.SkillId);
+        var plain = await Next(alice, SkillService.SkillDataSync, DBSkillDataIncrement.Parser, d =>
+            d.SkillWheel?.Inc?.WhellSkills.TryGetValue(4, out var s) == true
+            && (s.Inc?.SkillConfigId == 1160405 || s.All?.SkillConfigId == 1160405));
+        var back = plain.SkillWheel.Inc.WhellSkills[4];
+        Assert.Equal(0, back.Inc?.Mode ?? back.All?.Mode);
+    }
+
     private static string RepoRoot()
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);

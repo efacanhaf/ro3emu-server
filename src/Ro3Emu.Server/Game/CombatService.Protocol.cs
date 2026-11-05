@@ -145,6 +145,7 @@ public sealed partial class CombatService
         var old = session.SkillProtocol.TemporarySlotRows;
         var plan = session.SkillPlans is { } state && state.CurrentPlanIndex >= 0 && state.CurrentPlanIndex < state.SkillAssignPlans.Count
             ? state.SkillAssignPlans[state.CurrentPlanIndex] : null;
+        bool changed = false;
         foreach (int slot in session.Progress!.SkillBar.Keys.Concat(old.Keys).Distinct().Order())
         {
             int group = session.Progress.SkillBar.GetValueOrDefault(slot);
@@ -166,7 +167,11 @@ public sealed partial class CombatService
                 });
             if (next == baseId) old.Remove(slot);
             else old[slot] = next;
+            changed = true;
         }
+        // The PC bar draws whellSkills, so the wheel carries the same mode rows: a 31027 alone left the icon and the
+        // description on the plain row (the client's wheel is the 5025 dataset, and Build now puts the live mode's row there).
+        if (changed) await _skills.SyncAsync(session);
     }
 
     /// <summary>One authoritative cast timeline. High-level routes share the same Lua handler, not another cast.</summary>
