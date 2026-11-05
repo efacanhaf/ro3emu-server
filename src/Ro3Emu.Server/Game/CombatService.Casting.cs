@@ -712,6 +712,8 @@ public sealed partial class CombatService
             // action's end made those first steps "too fast" and snapped the character back.
             int holdMs = _data.SkillTemplate(GameData.Int(row, "_iScriptShow")) is { } hold && hold.TryGetProperty("m_fInterruptTime_move", out var interrupt)
                 && GameData.Number(interrupt) is { } seconds && seconds > 0 ? Math.Min(action.ActionMs, (int)(seconds * 1000)) : action.ActionMs;
+            // A leap ends with its movement: the client walks on from the landing at once.
+            if (Displacement(row) is { Kind: DisplaceKind.CasterToPoint } leapMove) holdMs = Math.Min(holdMs, Math.Max(leapMove.Ms, 100) + 40);
             SceneService.HoldWalk(s, DateTime.UtcNow.AddMilliseconds(leadMs + action.ChantMs + holdMs), s.Walking);
         }
         s.WorldState.ResurrectionCastId = IsResurrection(row) ? id : 0;
