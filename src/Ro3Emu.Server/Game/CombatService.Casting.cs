@@ -707,7 +707,13 @@ public sealed partial class CombatService
         // that walks on without reporting it cannot claim the distance afterwards (SceneService.AcceptWalkAsync).
         // One pressed in mid-walk is the exception: the client walks on (PlayerMoved).
         if (actor == null && !s.Walking && new SkillConfig(row).Movement == 0)
-            SceneService.HoldWalk(s, DateTime.UtcNow.AddMilliseconds(leadMs + action.ChantMs + action.ActionMs), s.Walking);
+        {
+            // The client walks on from the template's m_fInterruptTime_move (Twilight 0.85 s of a 1.05 s action): crediting no walk until the
+            // action's end made those first steps "too fast" and snapped the character back.
+            int holdMs = _data.SkillTemplate(GameData.Int(row, "_iScriptShow")) is { } hold && hold.TryGetProperty("m_fInterruptTime_move", out var interrupt)
+                && GameData.Number(interrupt) is { } seconds && seconds > 0 ? Math.Min(action.ActionMs, (int)(seconds * 1000)) : action.ActionMs;
+            SceneService.HoldWalk(s, DateTime.UtcNow.AddMilliseconds(leadMs + action.ChantMs + holdMs), s.Walking);
+        }
         s.WorldState.ResurrectionCastId = IsResurrection(row) ? id : 0;
         s.Face = face;
         req.Face = face;
